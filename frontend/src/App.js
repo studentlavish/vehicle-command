@@ -1,56 +1,47 @@
-import { useEffect } from "react";
-import "@/App.css";
+import React from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
-import { HOME } from "@/constants/testIds";
+import { AuthProvider } from "@/context/AuthContext";
+import ProtectedRoute from "@/components/ProtectedRoute";
+import Layout from "@/components/Layout";
+import Login from "@/pages/Login";
+import Dashboard from "@/pages/Dashboard";
+import LiveMonitoring from "@/pages/LiveMonitoring";
+import VehicleRecords from "@/pages/VehicleRecords";
+import EntryHistory from "@/pages/EntryHistory";
+import ExitHistory from "@/pages/ExitHistory";
+import Reports from "@/pages/Reports";
+import Analytics from "@/pages/Analytics";
+import SettingsPage from "@/pages/Settings";
+import UsersPage from "@/pages/Users";
+import { Toaster } from "@/components/ui/sonner";
+import "@/App.css";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
-
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
+function Guarded({ children }) {
   return (
-    <div>
-      <header className="App-header">
-        <a
-          data-testid={HOME.emergentLink}
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
-};
-
-function App() {
-  return (
-    <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </div>
+    <ProtectedRoute>
+      <Layout>{children}</Layout>
+    </ProtectedRoute>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <AuthProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/" element={<Guarded><Dashboard /></Guarded>} />
+          <Route path="/live" element={<Guarded><LiveMonitoring /></Guarded>} />
+          <Route path="/vehicles" element={<Guarded><VehicleRecords /></Guarded>} />
+          <Route path="/entry-history" element={<Guarded><EntryHistory /></Guarded>} />
+          <Route path="/exit-history" element={<Guarded><ExitHistory /></Guarded>} />
+          <Route path="/reports" element={<Guarded><Reports /></Guarded>} />
+          <Route path="/analytics" element={<Guarded><Analytics /></Guarded>} />
+          <Route path="/settings" element={<Guarded><SettingsPage /></Guarded>} />
+          <Route path="/users" element={<Guarded><UsersPage /></Guarded>} />
+        </Routes>
+      </BrowserRouter>
+      <Toaster richColors position="top-right" theme="dark" />
+    </AuthProvider>
+  );
+}
