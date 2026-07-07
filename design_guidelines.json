@@ -1,0 +1,83 @@
+{
+  "theme": "dark",
+  "archetype": "5",
+  "domain": "Car Showroom Management Dashboard",
+  "colors": {
+    "primary": "#2563EB",
+    "primary_hover": "#1D4ED8",
+    "secondary": "#FFFFFF",
+    "background": "#0F172A",
+    "surface": "rgba(15, 23, 42, 0.6)",
+    "surface_hover": "rgba(30, 41, 59, 0.8)",
+    "border": "rgba(255, 255, 255, 0.1)",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#94A3B8",
+    "status": {
+      "success": "#22C55E",
+      "warning": "#EAB308",
+      "inactive": "#64748B",
+      "danger": "#EF4444"
+    }
+  },
+  "typography": {
+    "font_family": "Poppins, sans-serif",
+    "heading_strategy": "Poppins with tight tracking and medium to bold weights to exude a premium feel.",
+    "sizes": {
+      "h1": "text-4xl md:text-5xl font-bold tracking-tight",
+      "h2": "text-3xl font-semibold tracking-tight",
+      "h3": "text-xl md:text-2xl font-medium",
+      "body": "text-base",
+      "small": "text-sm text-slate-400"
+    }
+  },
+  "layout_and_spacing": {
+    "container_padding": "p-6 md:p-8",
+    "grid_strategy": "Bento-style Control Room Grid for dashboard: tight gaps (gap-6), varying column spans for metrics, tables, and camera feeds.",
+    "border_radius": "rounded-2xl"
+  },
+  "surfaces_and_effects": {
+    "glassmorphism": "backdrop-blur-xl bg-[#0F172A]/70 border border-white/10 shadow-[0_8px_32px_rgba(0,0,0,0.3)]",
+    "cards": "Use glassmorphism with subtle inner white border (1px solid rgba(255,255,255,0.05)) to create high-end optical clarity.",
+    "hover_state": "Slight vertical lift (-translate-y-1) and increased border opacity (border-white/20) with smooth transition.",
+    "buttons": "Primary buttons: solid #2563EB with text-white, rounded-lg, hover:bg-[#1D4ED8] transition-colors. Secondary: transparent with border-white/20 and hover:bg-white/5."
+  },
+  "motion": {
+    "library": "framer-motion",
+    "page_transition": { "initial": { "opacity": 0, "y": 20 }, "animate": { "opacity": 1, "y": 0 }, "transition": { "duration": 0.4 } },
+    "stagger_children": { "staggerChildren": 0.1 },
+    "hover_effects": "transition-all duration-300 ease-out"
+  },
+  "components": {
+    "navigation": {
+      "topbar": "Sticky glassmorphic top navigation with company logo, search bar, notification bell, and user profile.",
+      "sidebar": "Fixed left sidebar with glassmorphic background, containing active state highlights using primary color."
+    },
+    "cards": "Metric cards (Today's Entry, etc.) with Lucide icons (tinted primary), large stat numbers, and a small trend line or percentage change indicator.",
+    "tables": "Shadcn-based tables customized with dark glass backgrounds, no internal column borders, subtle bottom border per row (border-white/5). Status pills with solid background and high contrast text.",
+    "modals": "Vehicle Details popup using Shadcn Dialog, dark glass overlay, backdrop-blur-sm, containing detailed specs and imagery."
+  },
+  "media_and_icons": {
+    "icons": "lucide-react",
+    "images": {
+      "login_background": "https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NTJ8MHwxfHNlYXJjaHwyfHxsdXh1cnklMjBjYXIlMjBzaG93cm9vbSUyMGRhcmt8ZW58MHx8fHwxNzgzNDAyMDkwfDA&ixlib=rb-4.1.0&q=85",
+      "company_logo": "https://images.unsplash.com/photo-1588036873025-7261a5647adf?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDR8MHwxfHNlYXJjaHwxfHxoeXVuZGFpJTIwY2FyJTIwZGFya3xlbnwwfHx8fDE3ODM0MDIwOTB8MA&ixlib=rb-4.1.0&q=85",
+      "user_profile": "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwxfHxwcm9mZXNzaW9uYWwlMjB1c2VyJTIwcHJvZmlsZSUyMHBvcnRyYWl0fGVufDB8fHx8MTc4MzQwMjA5MHww&ixlib=rb-4.1.0&q=85",
+      "live_camera_placeholder": "https://images.unsplash.com/photo-1485291571150-772bcfc10da5?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NTJ8MHwxfHNlYXJjaHwxfHxsdXh1cnklMjBjYXIlMjBzaG93cm9vbSUyMGRhcmt8ZW58MHx8fHwxNzgzNDAyMDkwfDA&ixlib=rb-4.1.0&q=85"
+    }
+  },
+  "accessibility_and_testing": {
+    "contrast": "Ensure APCA contrast ratios are met. All primary action text on #2563EB must be white.",
+    "testing": "All interactive elements MUST have descriptive data-testid attributes."
+  },
+  "instructions_to_main_agent": [
+    "Use standard HTML/Tailwind for structural layout and Shadcn components for complex interactions (Tables, Modals, Forms).",
+    "Implement Recharts for Analytics dashboard trend graphs.",
+    "Login page must feature an animated background using the login_background image or a split layout with the login form on glassmorphic card over the background image.",
+    "Dashboard should follow a dense, data-rich layout (Control Room Grid).",
+    "Apply `data-testid` universally to all inputs, buttons, and navigation links.",
+    "Use 'framer-motion' for page transitions and card enter animations.",
+    "Footer text: '© 2026 hyundai Car Showroom Management System'.",
+    "Do NOT use pure #000000. Base background is strictly #0F172A.",
+    "You are working with .js and .jsx files. Do not create or expect .tsx files."
+  ]
+}
