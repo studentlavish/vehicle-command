@@ -495,7 +495,7 @@ async def get_vehicle_detail(vehicle_number: str, user: dict = Depends(get_curre
 
     # Analytics: avg / longest / shortest across last 180 days completed sessions
     ana_pipeline = [
-        {"$match": {"vehicle_number": vn, "status": "completed", "entry_time": {"$gte": horizon_180.isoformat()}}},
+        {"$match": {"vehicle_number": vn, "status": "completed", "entry_time": {"$gte": horizon_180.isoformat()}, "duration_seconds": {"$gt": 0}}},
         {"$group": {
             "_id": None,
             "avg": {"$avg": "$duration_seconds"},
@@ -797,7 +797,7 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
     # Stay-time aggregate
     horizon = (start_of_day(now_utc()) - timedelta(days=RETENTION_DAYS)).isoformat()
     stay_pipeline = [
-        {"$match": {"status": "completed", "entry_time": {"$gte": horizon}, "duration_seconds": {"$ne": None}}},
+        {"$match": {"status": "completed", "entry_time": {"$gte": horizon}, "duration_seconds": {"$gt": 0}}},
         {"$group": {
             "_id": None,
             "avg": {"$avg": "$duration_seconds"},
