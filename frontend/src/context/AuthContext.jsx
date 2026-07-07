@@ -24,7 +24,6 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password, rememberMe) => {
     const { data } = await api.post("/auth/login", { email, password, remember_me: rememberMe });
-    if (data?.token) localStorage.setItem("rdx_token", data.token);
     setUser(data);
     return data;
   };
@@ -32,8 +31,12 @@ export function AuthProvider({ children }) {
   const logout = async () => {
     try {
       await api.post("/auth/logout");
-    } catch (_e) { /* ignore */ }
-    localStorage.removeItem("rdx_token");
+    } catch (error) {
+      // Session may already be invalid; proceed with client-side clear.
+      if (process.env.NODE_ENV === "development") {
+        console.error("Logout error:", error);
+      }
+    }
     setUser(false);
   };
 

@@ -47,7 +47,9 @@ export default function Dashboard() {
         setStats(s.data);
         setRecent(v.data);
       } catch (e) {
-        console.error(e);
+        if (process.env.NODE_ENV === "development") {
+          console.error("Dashboard load error:", e);
+        }
       } finally {
         setLoading(false);
       }
@@ -80,7 +82,7 @@ export default function Dashboard() {
       {loading || !stats ? (
         <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-40 bg-white/5 rounded-2xl" />
+            <Skeleton key={`stat-skel-${i}`} className="h-40 bg-white/5 rounded-2xl" />
           ))}
         </div>
       ) : (
@@ -166,7 +168,7 @@ export default function Dashboard() {
 
           {loading ? (
             <div className="space-y-2">
-              {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-11 bg-white/5" />)}
+              {Array.from({ length: 6 }).map((_, i) => <Skeleton key={`recent-skel-${i}`} className="h-11 bg-white/5" />)}
             </div>
           ) : recent.length === 0 ? (
             <div className="text-center text-slate-400 py-10 text-sm">No vehicle records yet.</div>

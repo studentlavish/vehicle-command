@@ -3,19 +3,10 @@ import axios from "axios";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 export const API = `${BACKEND_URL}/api`;
 
+// Auth relies on httpOnly cookies set by the backend; no token is stored in JS.
 const api = axios.create({
   baseURL: API,
   withCredentials: true,
-});
-
-// Attach optional bearer token as fallback (login also sets httpOnly cookie)
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("rdx_token");
-  if (token) {
-    config.headers = config.headers || {};
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
 });
 
 export default api;

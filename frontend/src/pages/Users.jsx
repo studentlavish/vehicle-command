@@ -94,7 +94,7 @@ export default function UsersPage() {
             <tbody className="divide-y divide-white/5">
               {loading ? (
                 Array.from({ length: 4 }).map((_, i) => (
-                  <tr key={i}><td colSpan={6} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
+                  <tr key={`u-skel-${i}`}><td colSpan={6} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
                 ))
               ) : rows.map((u) => (
                 <tr key={u.id} className="hover:bg-white/[0.03]" data-testid={`user-row-${u.email}`}>

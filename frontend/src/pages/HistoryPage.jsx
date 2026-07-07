@@ -64,7 +64,7 @@ export default function HistoryPage({ mode = "entry" }) {
             <tbody className="divide-y divide-white/5">
               {loading ? (
                 Array.from({ length: 8 }).map((_, i) => (
-                  <tr key={i}><td colSpan={5} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
+                  <tr key={`h-skel-${i}`}><td colSpan={5} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
                 ))
               ) : rows.length === 0 ? (
                 <tr><td colSpan={5} className="text-center py-14 text-slate-400">No records yet.</td></tr>

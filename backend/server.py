@@ -380,14 +380,13 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
 # --------- Reports (CSV/Excel/PDF) ---------
 def _report_query(period: str):
     now = datetime.now(timezone.utc)
+    start = now - timedelta(days=365)  # default fallback
     if period == "daily":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     elif period == "weekly":
         start = now - timedelta(days=7)
     elif period == "monthly":
         start = now - timedelta(days=30)
-    else:
-        start = now - timedelta(days=365)
     return {"created_at": {"$gte": start.isoformat()}}
 
 

@@ -29,7 +29,7 @@ export default function Analytics() {
       <div className="space-y-4">
         <Skeleton className="h-16 w-64 bg-white/5" />
         <div className="grid gap-4 md:grid-cols-2">
-          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-72 bg-white/5" />)}
+          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={`an-skel-${i}`} className="h-72 bg-white/5" />)}
         </div>
       </div>
     );
@@ -94,7 +94,7 @@ export default function Analytics() {
           <ResponsiveContainer width="100%" height={260}>
             <PieChart>
               <Pie data={data.pie} cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={4} dataKey="value">
-                {data.pie.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                {data.pie.map((entry, i) => <Cell key={`cell-${entry.name}`} fill={COLORS[i % COLORS.length]} />)}
               </Pie>
               <Tooltip {...tooltipStyle} />
               <Legend wrapperStyle={{ color: "#94A3B8" }} />

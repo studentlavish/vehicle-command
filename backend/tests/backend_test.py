@@ -14,8 +14,8 @@ BASE_URL = os.environ.get("REACT_APP_BACKEND_URL") or "https://vehicle-command-1
 BASE_URL = BASE_URL.rstrip("/")
 API = f"{BASE_URL}/api"
 
-ADMIN_EMAIL = "admin@rdx.com"
-ADMIN_PASSWORD = "admin123"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@rdx.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
 # ---------------- Fixtures ----------------
