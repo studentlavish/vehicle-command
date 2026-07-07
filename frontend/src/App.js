@@ -13,6 +13,8 @@ import Reports from "@/pages/Reports";
 import Analytics from "@/pages/Analytics";
 import SettingsPage from "@/pages/Settings";
 import UsersPage from "@/pages/Users";
+import VehicleDetail from "@/pages/VehicleDetail";
+import SearchResults from "@/pages/SearchResults";
 import { Toaster } from "@/components/ui/sonner";
 import "@/App.css";
 
@@ -39,6 +41,8 @@ export default function App() {
           <Route path="/analytics" element={<Guarded><Analytics /></Guarded>} />
           <Route path="/settings" element={<Guarded><SettingsPage /></Guarded>} />
           <Route path="/users" element={<Guarded><UsersPage /></Guarded>} />
+          <Route path="/search" element={<Guarded><SearchResults /></Guarded>} />
+          <Route path="/vehicle/:vehicleNumber" element={<Guarded><VehicleDetail /></Guarded>} />
         </Routes>
       </BrowserRouter>
       <Toaster richColors position="top-right" theme="dark" />

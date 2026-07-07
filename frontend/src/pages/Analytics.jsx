@@ -6,7 +6,8 @@ import {
 } from "recharts";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { BarChart3 } from "lucide-react";
+import { BarChart3, Clock, TrendingUp, TrendingDown, Activity } from "lucide-react";
+import { formatDurationShort } from "@/lib/time";
 
 const COLORS = ["#3B82F6", "#0EA5E9", "#22C55E", "#EAB308"];
 
@@ -44,6 +45,15 @@ export default function Analytics() {
         <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">Analytics</h1>
         <p className="text-slate-400 mt-2 text-sm">Track showroom traffic patterns across days, weeks and months.</p>
       </div>
+
+      {data.stay_time ? (
+        <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
+          <StayCard label="Average Stay" value={formatDurationShort(data.stay_time.avg_seconds)} tone="blue" icon={Clock} testId="analytics-avg-stay" />
+          <StayCard label="Longest Stay" value={formatDurationShort(data.stay_time.longest_seconds)} tone="emerald" icon={TrendingUp} testId="analytics-longest-stay" />
+          <StayCard label="Shortest Stay" value={formatDurationShort(data.stay_time.shortest_seconds)} tone="amber" icon={TrendingDown} testId="analytics-shortest-stay" />
+          <StayCard label="Completed Sessions" value={data.stay_time.completed_sessions} tone="violet" icon={Activity} testId="analytics-completed" />
+        </div>
+      ) : null}
 
       <Tabs defaultValue="daily" className="w-full">
         <TabsList className="bg-white/5 border border-white/10 p-1">
@@ -113,6 +123,28 @@ export default function Analytics() {
               <Bar dataKey="exits" fill="#0EA5E9" radius={[6, 6, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StayCard({ label, value, tone, icon: Icon, testId }) {
+  const toneMap = {
+    blue: "text-blue-300",
+    emerald: "text-emerald-300",
+    amber: "text-amber-300",
+    violet: "text-violet-300",
+  };
+  return (
+    <div className="glass rounded-2xl p-4" data-testid={testId}>
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="text-[11px] uppercase tracking-widest text-slate-400">{label}</div>
+          <div className={`text-2xl font-bold mt-1 ${toneMap[tone]}`}>{value}</div>
+        </div>
+        <div className="h-9 w-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center">
+          <Icon className={`h-4 w-4 ${toneMap[tone]}`} />
         </div>
       </div>
     </div>

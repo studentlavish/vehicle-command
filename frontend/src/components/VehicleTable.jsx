@@ -1,4 +1,5 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,7 +19,15 @@ function formatTime(iso) {
 function Row({ v, onView, onEdit, onDelete }) {
   return (
     <tr className="hover:bg-white/[0.03]" data-testid={`row-${v.vehicle_number}`}>
-      <td className="px-5 py-3 font-mono text-white">{v.vehicle_number}</td>
+      <td className="px-5 py-3 font-mono">
+        <Link
+          to={`/vehicle/${encodeURIComponent(v.vehicle_number)}`}
+          className="text-white hover:text-blue-300 transition-colors"
+          data-testid={`goto-detail-${v.vehicle_number}`}
+        >
+          {v.vehicle_number}
+        </Link>
+      </td>
       <td className="px-5 py-3">
         <div className="text-white">{v.owner_name}</div>
         <div className="text-[11px] text-slate-500">{v.vehicle_model}</div>

@@ -23,6 +23,7 @@ import {
   Settings as SettingsIcon,
   Users as UsersIcon,
   Search,
+  Search as SearchIcon,
   Bell,
   User,
   LogOut as LogOutIcon,
@@ -32,6 +33,7 @@ import {
 
 const NAV = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true },
+  { to: "/search", icon: SearchIcon, label: "Search Vehicle" },
   { to: "/live", icon: Radio, label: "Live Monitoring" },
   { to: "/vehicles", icon: Car, label: "Vehicle Records" },
   { to: "/entry-history", icon: LogInIcon, label: "Entry History" },
@@ -51,7 +53,7 @@ export default function Layout({ children }) {
   const handleSearch = (e) => {
     e.preventDefault();
     if (search.trim()) {
-      navigate(`/vehicles?q=${encodeURIComponent(search.trim())}`);
+      navigate(`/search?q=${encodeURIComponent(search.trim())}`);
     }
   };
 

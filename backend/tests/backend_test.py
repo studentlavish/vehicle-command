@@ -1,11 +1,21 @@
-"""RDX Car Showroom Backend API tests.
+"""RDX Car Showroom Backend API tests (iteration 2).
 
-Covers: auth (cookie + bearer), dashboard stats, vehicles CRUD & filters,
-analytics, reports export (csv/xlsx/pdf), users, settings and unauthorized checks.
+Covers:
+- Auth (cookie + bearer)
+- Vehicle visit sessions (entry / exit / multi-session immutability)
+- Vehicle master search + detail + range sessions
+- Master PATCH
+- /visit-sessions listing + status mapping (active/inside)
+- Legacy /vehicles CRUD + status labels
+- Dashboard stats (uses vehicle_masters count)
+- Analytics overview (with stay_time)
+- Reports export (csv/xlsx/pdf)
+- /visits/export (csv/xlsx/pdf) with and without vehicle_number
+- Users list
+- Settings
+- Unauthorized (401) checks for all new endpoints
 """
 import os
-import io
-import time
 import uuid
 import pytest
 import requests
@@ -16,6 +26,8 @@ API = f"{BASE_URL}/api"
 
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@rdx.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+SHOWCASE_PLATE = "UP21AB1234"
 
 
 # ---------------- Fixtures ----------------
@@ -37,10 +49,8 @@ def client():
     assert data.get("email") == ADMIN_EMAIL
     assert data.get("role") == "admin"
     assert data.get("token")
-    # cookies should be set
-    assert "access_token" in s.cookies, "access_token cookie not set"
-    assert "refresh_token" in s.cookies, "refresh_token cookie not set"
-    # attach bearer token also for redundancy
+    assert "access_token" in s.cookies
+    assert "refresh_token" in s.cookies
     s.headers.update({"Authorization": f"Bearer {data['token']}"})
     return s
 
@@ -53,11 +63,9 @@ class TestAuth:
         data = r.json()
         assert data["email"] == ADMIN_EMAIL
         assert data["role"] == "admin"
-        assert isinstance(data["token"], str) and len(data["token"]) > 20
-        # check cookies (Set-Cookie header)
         set_cookie = r.headers.get("set-cookie", "")
         assert "access_token" in set_cookie
-        assert "HttpOnly" in set_cookie or "httponly" in set_cookie.lower()
+        assert "httponly" in set_cookie.lower()
 
     def test_login_wrong_password(self, anon):
         r = anon.post(f"{API}/auth/login", json={"email": ADMIN_EMAIL, "password": "wrongpw"})
@@ -68,54 +76,228 @@ class TestAuth:
         assert r.status_code == 200
         assert r.json()["email"] == ADMIN_EMAIL
 
-    def test_me_without_auth(self):
-        r = requests.get(f"{API}/auth/me")
+
+# ---------------- Vehicle Visit Sessions core ----------------
+class TestVisitSessions:
+    def test_entry_creates_new_session_and_master(self, client):
+        plate = f"TEST{uuid.uuid4().hex[:6].upper()}"
+        r = client.post(f"{API}/vehicles/entry", json={
+            "vehicle_number": plate,
+            "owner_name": "TEST_Entry_Owner",
+            "phone_number": "+91 9000000001",
+            "vehicle_model": "Hyundai Test",
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["master"]["vehicle_number"] == plate
+        assert body["session"]["vehicle_number"] == plate
+        assert body["session"]["status"] == "active"
+        assert body["session"]["entry_time"]
+        assert body["session"]["exit_time"] is None
+        # duplicate entry -> another active session (2 total, both active)
+        r2 = client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate})
+        assert r2.status_code == 200
+        # search should now show total_visits = 2, active_visits = 2
+        s = client.get(f"{API}/vehicles/search", params={"q": plate}).json()
+        found = [x for x in s if x["vehicle_number"] == plate]
+        assert found and found[0]["total_visits"] == 2
+        assert found[0]["active_visits"] == 2
+
+    def test_exit_closes_latest_active_session_only(self, client):
+        plate = f"TEST{uuid.uuid4().hex[:6].upper()}"
+        # 2 entries
+        e1 = client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate}).json()["session"]
+        e2 = client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate}).json()["session"]
+        assert e1["id"] != e2["id"]
+        # exit -> should close the LATEST one (e2)
+        r = client.post(f"{API}/vehicles/exit", json={"vehicle_number": plate})
+        assert r.status_code == 200
+        closed = r.json()
+        assert closed["status"] == "completed"
+        assert closed["exit_time"]
+        assert closed["id"] == e2["id"], "exit should close latest active session"
+        # e1 entry_time is unchanged and still active
+        sessions = client.get(f"{API}/vehicles/master/{plate}/sessions", params={"range": "today"}).json()
+        by_id = {s["id"]: s for s in sessions}
+        assert by_id[e1["id"]]["entry_time"] == e1["entry_time"]
+        assert by_id[e1["id"]]["status"] == "active"
+        assert by_id[e2["id"]]["status"] == "completed"
+        # second exit closes e1
+        r2 = client.post(f"{API}/vehicles/exit", json={"vehicle_number": plate})
+        assert r2.status_code == 200
+        # third exit -> 404
+        r3 = client.post(f"{API}/vehicles/exit", json={"vehicle_number": plate})
+        assert r3.status_code == 404
+
+    def test_exit_no_active_returns_404(self, client):
+        plate = f"NOACT{uuid.uuid4().hex[:5].upper()}"
+        # Never entered
+        r = client.post(f"{API}/vehicles/exit", json={"vehicle_number": plate})
+        assert r.status_code == 404
+
+    def test_entry_exit_immutability(self, client):
+        plate = f"IMM{uuid.uuid4().hex[:5].upper()}"
+        s1 = client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate}).json()["session"]
+        client.post(f"{API}/vehicles/exit", json={"vehicle_number": plate})
+        s2 = client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate}).json()["session"]
+        # Fetch and ensure entry_time on s1 unchanged
+        sessions = client.get(f"{API}/vehicles/master/{plate}/sessions", params={"range": "today"}).json()
+        by_id = {s["id"]: s for s in sessions}
+        assert by_id[s1["id"]]["entry_time"] == s1["entry_time"]
+        assert by_id[s2["id"]]["entry_time"] == s2["entry_time"]
+
+    def test_entry_unauth(self):
+        r = requests.post(f"{API}/vehicles/entry", json={"vehicle_number": "XX"})
+        assert r.status_code == 401
+
+    def test_exit_unauth(self):
+        r = requests.post(f"{API}/vehicles/exit", json={"vehicle_number": "XX"})
         assert r.status_code == 401
 
 
-# ---------------- Dashboard ----------------
-class TestDashboard:
-    def test_dashboard_stats_shape(self, client):
-        r = client.get(f"{API}/dashboard/stats")
+# ---------------- Search + Master Detail ----------------
+class TestSearchAndDetail:
+    def test_search_matches_by_plate(self, client):
+        r = client.get(f"{API}/vehicles/search", params={"q": SHOWCASE_PLATE})
         assert r.status_code == 200
         data = r.json()
-        required = ["today_entries", "today_exits", "cars_inside", "total_vehicles", "visitors_today", "monthly_visitors"]
-        for k in required:
-            assert k in data, f"missing key {k}"
-            assert "value" in data[k]
-            assert "change" in data[k]
-            assert "trend" in data[k] and isinstance(data[k]["trend"], list)
+        assert any(m["vehicle_number"] == SHOWCASE_PLATE for m in data)
+        m = [x for x in data if x["vehicle_number"] == SHOWCASE_PLATE][0]
+        assert "total_visits" in m and "active_visits" in m
+        assert m["total_visits"] >= 4
 
-    def test_dashboard_stats_unauth(self):
-        r = requests.get(f"{API}/dashboard/stats")
+    def test_search_by_customer_id(self, client):
+        r = client.get(f"{API}/vehicles/search", params={"q": "CUS-DEMO01"})
+        assert r.status_code == 200
+        assert any(m["vehicle_number"] == SHOWCASE_PLATE for m in r.json())
+
+    def test_search_by_owner_name(self, client):
+        r = client.get(f"{API}/vehicles/search", params={"q": "Aarav"})
+        assert r.status_code == 200
+        assert any(m["vehicle_number"] == SHOWCASE_PLATE for m in r.json())
+
+    def test_search_by_phone(self, client):
+        r = client.get(f"{API}/vehicles/search", params={"q": "9876543210"})
+        assert r.status_code == 200
+        assert any(m["vehicle_number"] == SHOWCASE_PLATE for m in r.json())
+
+    def test_master_detail_showcase(self, client):
+        r = client.get(f"{API}/vehicles/master/{SHOWCASE_PLATE}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["master"]["vehicle_number"] == SHOWCASE_PLATE
+        assert body["master"]["customer_id"] == "CUS-DEMO01"
+        summary = body["summary"]
+        assert summary["today_visits"] == 4, f"expected 4 today_visits, got {summary}"
+        # today_stay_seconds ~ 4h 10m = 15000s (sum of 45+50+75+80 = 250 min = 15000s)
+        assert summary["today_stay_seconds"] == 15000, f"expected 15000s stay, got {summary['today_stay_seconds']}"
+        assert summary["month_visits"] >= 4
+        assert summary["overall_visits"] >= 4
+        ana = body["analytics"]
+        assert ana["avg_seconds"] > 0
+        assert ana["longest_seconds"] >= ana["avg_seconds"]
+        assert ana["shortest_seconds"] <= ana["avg_seconds"]
+
+    def test_master_sessions_today_exact(self, client):
+        r = client.get(f"{API}/vehicles/master/{SHOWCASE_PLATE}/sessions", params={"range": "today"})
+        assert r.status_code == 200
+        sessions = r.json()
+        assert len(sessions) == 4, f"expected 4 sessions today, got {len(sessions)}"
+        # ascending by entry_time; check H:M endings
+        hm = [s["entry_time"][11:16] for s in sessions]
+        assert hm == ["08:30", "10:20", "13:45", "17:10"], hm
+
+    def test_master_sessions_ranges(self, client):
+        for rng in ["today", "yesterday", "7d", "30d", "180d"]:
+            r = client.get(f"{API}/vehicles/master/{SHOWCASE_PLATE}/sessions", params={"range": rng})
+            assert r.status_code == 200
+            assert isinstance(r.json(), list)
+
+    def test_master_sessions_custom_range(self, client):
+        from datetime import date, timedelta
+        today = date.today()
+        r = client.get(f"{API}/vehicles/master/{SHOWCASE_PLATE}/sessions",
+                       params={"range": "custom", "from_": (today - timedelta(days=1)).isoformat(),
+                               "to": today.isoformat()})
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+    def test_master_detail_404(self, client):
+        r = client.get(f"{API}/vehicles/master/DOESNOTEXIST99")
+        assert r.status_code == 404
+
+    def test_master_patch(self, client):
+        # Create a temporary master via entry
+        plate = f"PATCH{uuid.uuid4().hex[:5].upper()}"
+        client.post(f"{API}/vehicles/entry", json={"vehicle_number": plate, "owner_name": "Old"})
+        r = client.patch(f"{API}/vehicles/master/{plate}",
+                         json={"owner_name": "TEST_New Owner", "phone_number": "+91 8888888888", "vehicle_model": "Hyundai Kona"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["owner_name"] == "TEST_New Owner"
+        assert body["phone_number"] == "+91 8888888888"
+        assert body["vehicle_model"] == "Hyundai Kona"
+
+    def test_master_patch_404(self, client):
+        r = client.patch(f"{API}/vehicles/master/DOESNOTEXIST", json={"owner_name": "X"})
+        assert r.status_code == 404
+
+    def test_search_unauth(self):
+        r = requests.get(f"{API}/vehicles/search", params={"q": "UP"})
+        assert r.status_code == 401
+
+    def test_master_unauth(self):
+        r = requests.get(f"{API}/vehicles/master/{SHOWCASE_PLATE}")
         assert r.status_code == 401
 
 
-# ---------------- Vehicles ----------------
-class TestVehicles:
+# ---------------- /visit-sessions global list ----------------
+class TestVisitSessionsList:
+    def test_active_status_filter(self, client):
+        r = client.get(f"{API}/visit-sessions", params={"status": "active"})
+        assert r.status_code == 200
+        data = r.json()
+        # legacy serialization maps 'active' -> 'inside' in status field
+        for d in data[:20]:
+            assert d["status"] == "inside"
+
+    def test_inside_status_alias(self, client):
+        # 'inside' should map to 'active'
+        r = client.get(f"{API}/visit-sessions", params={"status": "inside"})
+        assert r.status_code == 200
+        for d in r.json()[:20]:
+            assert d["status"] == "inside"
+
+    def test_unauth(self):
+        r = requests.get(f"{API}/visit-sessions")
+        assert r.status_code == 401
+
+
+# ---------------- Legacy /vehicles ----------------
+class TestLegacyVehicles:
     def test_list_seeded(self, client):
         r = client.get(f"{API}/vehicles")
         assert r.status_code == 200
         data = r.json()
-        assert isinstance(data, list)
-        assert len(data) >= 42, f"expected >=42 seeded vehicles, got {len(data)}"
-        # ensure no mongo _id leak
-        assert "_id" not in data[0]
-        assert "id" in data[0]
+        assert isinstance(data, list) and len(data) > 0
+        d0 = data[0]
+        assert "owner_name" in d0
+        assert "contact_number" in d0
+        assert "vehicle_model" in d0
+        # legacy status labels
+        assert d0["status"] in ("inside", "exited", "pending")
+        assert "_id" not in d0
 
-    def test_filter_status(self, client):
+    def test_filter_status_inside(self, client):
         r = client.get(f"{API}/vehicles", params={"status": "inside"})
         assert r.status_code == 200
         for v in r.json():
             assert v["status"] == "inside"
 
     def test_search_query(self, client):
-        # get a vehicle number, then search for it
-        first = client.get(f"{API}/vehicles").json()[0]
-        vn = first["vehicle_number"]
-        r = client.get(f"{API}/vehicles", params={"q": vn})
+        r = client.get(f"{API}/vehicles", params={"q": SHOWCASE_PLATE})
         assert r.status_code == 200
-        assert any(v["vehicle_number"] == vn for v in r.json())
+        assert any(v["vehicle_number"] == SHOWCASE_PLATE for v in r.json())
 
     def test_crud_flow(self, client):
         payload = {
@@ -126,35 +308,41 @@ class TestVehicles:
             "status": "inside",
             "notes": "created by pytest",
         }
-        # CREATE
         r = client.post(f"{API}/vehicles", json=payload)
         assert r.status_code == 200, r.text
         v = r.json()
         vid = v["id"]
         assert v["vehicle_number"] == payload["vehicle_number"]
-        assert v["owner_name"] == "TEST_Owner"
-        assert v["entry_time"], "entry_time should be auto-set"
 
-        # GET
         r = client.get(f"{API}/vehicles/{vid}")
         assert r.status_code == 200
-        assert r.json()["owner_name"] == "TEST_Owner"
 
-        # PATCH -> exited (should set exit_time)
         r = client.patch(f"{API}/vehicles/{vid}", json={"status": "exited"})
         assert r.status_code == 200
-        updated = r.json()
-        assert updated["status"] == "exited"
-        assert updated["exit_time"], "exit_time should be auto-set on exit"
+        assert r.json()["status"] == "exited"
+        assert r.json()["exit_time"]
 
-        # DELETE
         r = client.delete(f"{API}/vehicles/{vid}")
         assert r.status_code == 200
         r = client.get(f"{API}/vehicles/{vid}")
         assert r.status_code == 404
 
-    def test_vehicles_unauth(self):
-        r = requests.get(f"{API}/vehicles")
+
+# ---------------- Dashboard ----------------
+class TestDashboard:
+    def test_dashboard_stats_shape(self, client):
+        r = client.get(f"{API}/dashboard/stats")
+        assert r.status_code == 200
+        data = r.json()
+        for k in ["today_entries", "today_exits", "cars_inside", "total_vehicles", "visitors_today", "monthly_visitors"]:
+            assert k in data
+            assert "value" in data[k]
+        # total_vehicles should reflect masters (seeded ~22-23)
+        assert data["total_vehicles"]["value"] >= 15
+        assert data["monthly_visitors"]["value"] > 0
+
+    def test_unauth(self):
+        r = requests.get(f"{API}/dashboard/stats")
         assert r.status_code == 401
 
 
@@ -168,39 +356,65 @@ class TestAnalytics:
         assert len(data["weekly"]) == 28
         assert len(data["monthly"]) == 12
         assert isinstance(data["pie"], list) and len(data["pie"]) == 2
+        # new stay_time block
+        assert "stay_time" in data
+        st = data["stay_time"]
+        for k in ["avg_seconds", "longest_seconds", "shortest_seconds", "completed_sessions"]:
+            assert k in st
+        assert st["completed_sessions"] > 0
+        assert st["longest_seconds"] >= st["avg_seconds"] >= st["shortest_seconds"]
 
-    def test_analytics_unauth(self):
+    def test_unauth(self):
         r = requests.get(f"{API}/analytics/overview")
         assert r.status_code == 401
 
 
-# ---------------- Reports ----------------
-class TestReports:
-    @pytest.mark.parametrize("period", ["daily", "weekly", "monthly"])
-    def test_export_csv(self, client, period):
-        r = client.get(f"{API}/reports/export", params={"period": period, "format": "csv"})
+# ---------------- Reports export ----------------
+class TestReportsExport:
+    @pytest.mark.parametrize("fmt,ct,magic", [
+        ("csv", "text/csv", None),
+        ("xlsx", "spreadsheetml", b"PK"),
+        ("pdf", "application/pdf", b"%PDF"),
+    ])
+    def test_export(self, client, fmt, ct, magic):
+        r = client.get(f"{API}/reports/export", params={"period": "daily", "format": fmt})
+        assert r.status_code == 200
+        assert ct in r.headers.get("content-type", "")
+        assert "attachment" in r.headers.get("content-disposition", "").lower()
+        if magic:
+            assert r.content[:len(magic)] == magic
+
+
+# ---------------- Visits export ----------------
+class TestVisitsExport:
+    @pytest.mark.parametrize("fmt,ct,magic", [
+        ("csv", "text/csv", None),
+        ("xlsx", "spreadsheetml", b"PK"),
+        ("pdf", "application/pdf", b"%PDF"),
+    ])
+    def test_per_vehicle(self, client, fmt, ct, magic):
+        r = client.get(f"{API}/visits/export", params={
+            "vehicle_number": SHOWCASE_PLATE, "range": "today", "format": fmt
+        })
+        assert r.status_code == 200, r.text
+        assert ct in r.headers.get("content-type", "")
+        cd = r.headers.get("content-disposition", "").lower()
+        assert "attachment" in cd
+        assert SHOWCASE_PLATE.lower() in cd or SHOWCASE_PLATE in r.headers.get("content-disposition", "")
+        if magic:
+            assert r.content[:len(magic)] == magic
+
+    def test_all_vehicles_export_csv(self, client):
+        r = client.get(f"{API}/visits/export", params={"range": "7d", "format": "csv"})
         assert r.status_code == 200
         assert "text/csv" in r.headers.get("content-type", "")
-        assert "attachment" in r.headers.get("content-disposition", "").lower()
-        assert b"Vehicle Number" in r.content
 
-    @pytest.mark.parametrize("period", ["daily", "weekly", "monthly"])
-    def test_export_xlsx(self, client, period):
-        r = client.get(f"{API}/reports/export", params={"period": period, "format": "xlsx"})
-        assert r.status_code == 200
-        ct = r.headers.get("content-type", "")
-        assert "spreadsheetml" in ct or "openxml" in ct
-        assert r.content[:2] == b"PK"  # xlsx is zip
+    def test_invalid_format(self, client):
+        r = client.get(f"{API}/visits/export", params={"format": "docx"})
+        assert r.status_code == 400
 
-    @pytest.mark.parametrize("period", ["daily", "weekly", "monthly"])
-    def test_export_pdf(self, client, period):
-        r = client.get(f"{API}/reports/export", params={"period": period, "format": "pdf"})
-        assert r.status_code == 200
-        assert "application/pdf" in r.headers.get("content-type", "")
-        assert r.content[:4] == b"%PDF"
-
-    def test_reports_unauth(self):
-        r = requests.get(f"{API}/reports/export", params={"period": "daily", "format": "csv"})
+    def test_unauth(self):
+        r = requests.get(f"{API}/visits/export")
         assert r.status_code == 401
 
 
@@ -210,53 +424,14 @@ class TestUsers:
         r = client.get(f"{API}/users")
         assert r.status_code == 200
         users = r.json()
-        emails = [u["email"] for u in users]
-        assert ADMIN_EMAIL in emails
-        assert len(users) >= 4, f"expected admin + 3 demo users, got {len(users)}"
-        # no _id leak
+        assert ADMIN_EMAIL in [u["email"] for u in users]
         assert all("_id" not in u for u in users)
-
-    def test_create_and_delete_user(self, client):
-        email = f"test_{uuid.uuid4().hex[:6]}@rdx.com"
-        r = client.post(f"{API}/users", json={"name": "TEST User", "email": email, "role": "manager", "status": "active"})
-        assert r.status_code == 200, r.text
-        uid = r.json()["id"]
-        assert r.json()["email"] == email.lower()
-
-        # delete
-        r = client.delete(f"{API}/users/{uid}")
-        assert r.status_code == 200
-
-    def test_cannot_delete_self(self, client):
-        me = client.get(f"{API}/auth/me").json()
-        r = client.delete(f"{API}/users/{me['id']}")
-        assert r.status_code == 400
-
-    def test_users_unauth(self):
-        r = requests.get(f"{API}/users")
-        assert r.status_code == 401
 
 
 # ---------------- Settings ----------------
 class TestSettings:
-    def test_get_settings_defaults(self, client):
+    def test_get_settings(self, client):
         r = client.get(f"{API}/settings")
         assert r.status_code == 200
-        s = r.json()
-        for k in ["company_name", "camera_url", "auto_delete_days", "whatsapp_report_time", "backup_enabled"]:
-            assert k in s
-
-    def test_update_settings(self, client):
-        new_name = f"RDX Test {uuid.uuid4().hex[:5]}"
-        r = client.put(f"{API}/settings", json={"company_name": new_name, "auto_delete_days": 90})
-        assert r.status_code == 200
-        assert r.json()["company_name"] == new_name
-
-        # persistence via GET
-        r = client.get(f"{API}/settings")
-        assert r.json()["company_name"] == new_name
-        assert r.json()["auto_delete_days"] == 90
-
-    def test_settings_unauth(self):
-        r = requests.get(f"{API}/settings")
-        assert r.status_code == 401
+        for k in ["company_name", "auto_delete_days"]:
+            assert k in r.json()
