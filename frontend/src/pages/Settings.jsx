@@ -4,9 +4,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import { toast } from "sonner";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Building2, Camera, Database, ShieldCheck, MessageSquare, HardDrive, Save } from "lucide-react";
+import { toast } from "sonner";import { Skeleton } from "@/components/ui/skeleton";
+import { Building2, Camera, Database, ShieldCheck, MessageSquare, HardDrive, Save, Send, Loader2 } from "lucide-react";
 
 export default function SettingsPage() {
   const [data, setData] = useState(null);
@@ -67,9 +66,13 @@ export default function SettingsPage() {
         <p className="text-[11px] text-slate-500">Records older than the configured retention window are automatically purged. Default: 180 days.</p>
       </Section>
 
-      <Section icon={MessageSquare} title="WhatsApp Report">
+      <Section icon={MessageSquare} title="WhatsApp Report (Twilio)">
+        <TextField label="Twilio Account SID" value={data.twilio_sid} onChange={(v) => update("twilio_sid", v)} test="setting-twilio-sid" placeholder="ACxxxxxxxxxxxxxx" />
+        <TextField label="Twilio Auth Token" value={data.twilio_token} onChange={(v) => update("twilio_token", v)} test="setting-twilio-token" placeholder="****" />
+        <TextField label="WhatsApp From" value={data.twilio_from} onChange={(v) => update("twilio_from", v)} test="setting-twilio-from" placeholder="whatsapp:+14155238886" />
+        <TextField label="Admin WhatsApp To" value={data.twilio_to} onChange={(v) => update("twilio_to", v)} test="setting-twilio-to" placeholder="whatsapp:+91XXXXXXXXXX" />
         <TextField label="Daily Report Time (HH:MM)" value={data.whatsapp_report_time} onChange={(v) => update("whatsapp_report_time", v)} test="setting-whatsapp-time" placeholder="09:00" />
-        <p className="text-[11px] text-slate-500">Twilio WhatsApp integration is scheduled for Phase 2.</p>
+        <WhatsAppTester />
       </Section>
 
       <Section icon={HardDrive} title="Backup">
@@ -118,6 +121,52 @@ function ToggleField({ label, checked, onChange, test }) {
     <div className="flex items-center justify-between rounded-xl bg-white/5 border border-white/10 px-4 py-3">
       <div className="text-sm">{label}</div>
       <Switch checked={checked} onCheckedChange={onChange} data-testid={test} className="data-[state=checked]:bg-blue-600" />
+    </div>
+  );
+}
+
+function WhatsAppTester() {
+  const [busy, setBusy] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+
+  const send = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const { data } = await api.post("/whatsapp/send-report", {});
+      setResult(data);
+      if (data.delivered) {
+        toast.success("WhatsApp sent", { description: `SID ${data.sid}` });
+      } else {
+        toast.info("Dry-run preview generated", { description: data.reason });
+      }
+    } catch (e) {
+      toast.error("Send failed", { description: e.response?.data?.detail || e.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="md:col-span-2 rounded-xl bg-white/5 border border-white/10 p-4 space-y-3" data-testid="whatsapp-tester">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium">Send Test Report Now</div>
+          <div className="text-[11px] text-slate-500">Save Twilio credentials first, or trigger a dry-run preview.</div>
+        </div>
+        <Button onClick={send} disabled={busy} className="bg-blue-600 hover:bg-blue-700" data-testid="whatsapp-send-btn">
+          {busy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Send className="h-4 w-4 mr-2" />} Send
+        </Button>
+      </div>
+      {result && (
+        <div className="rounded-lg bg-[#0F172A]/60 border border-white/10 p-3">
+          <div className="text-[10px] uppercase tracking-widest text-slate-400 mb-1">
+            {result.delivered ? "Delivered" : `Preview (${result.mode})`}
+          </div>
+          <pre className="text-xs text-slate-200 whitespace-pre-wrap font-mono">{result.preview?.body}</pre>
+          {result.reason && <div className="mt-2 text-[11px] text-amber-300">{result.reason}</div>}
+        </div>
+      )}
     </div>
   );
 }

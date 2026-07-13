@@ -32,16 +32,16 @@ import {
 } from "lucide-react";
 
 const NAV = [
-  { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true },
-  { to: "/search", icon: SearchIcon, label: "Search Vehicle" },
-  { to: "/live", icon: Radio, label: "Live Monitoring" },
-  { to: "/vehicles", icon: Car, label: "Vehicle Records" },
-  { to: "/entry-history", icon: LogInIcon, label: "Entry History" },
-  { to: "/exit-history", icon: LogOut, label: "Exit History" },
-  { to: "/reports", icon: FileBarChart, label: "Reports" },
-  { to: "/analytics", icon: BarChart3, label: "Analytics" },
-  { to: "/settings", icon: SettingsIcon, label: "Settings" },
-  { to: "/users", icon: UsersIcon, label: "Users" },
+  { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true, roles: ["admin", "manager", "security"] },
+  { to: "/search", icon: SearchIcon, label: "Search Vehicle", roles: ["admin", "manager", "security"] },
+  { to: "/live", icon: Radio, label: "Live Monitoring", roles: ["admin", "manager", "security"] },
+  { to: "/vehicles", icon: Car, label: "Vehicle Records", roles: ["admin", "manager", "security"] },
+  { to: "/entry-history", icon: LogInIcon, label: "Entry History", roles: ["admin", "manager"] },
+  { to: "/exit-history", icon: LogOut, label: "Exit History", roles: ["admin", "manager"] },
+  { to: "/reports", icon: FileBarChart, label: "Reports", roles: ["admin", "manager"] },
+  { to: "/analytics", icon: BarChart3, label: "Analytics", roles: ["admin", "manager"] },
+  { to: "/settings", icon: SettingsIcon, label: "Settings", roles: ["admin"] },
+  { to: "/users", icon: UsersIcon, label: "Users", roles: ["admin", "manager"] },
 ];
 
 export default function Layout({ children }) {
@@ -78,7 +78,7 @@ export default function Layout({ children }) {
           </div>
 
           <nav className="px-3 flex-1 space-y-1">
-            {NAV.map((item) => (
+            {NAV.filter((item) => item.roles.includes(user?.role || "admin")).map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
@@ -168,7 +168,7 @@ export default function Layout({ children }) {
           {/* Mobile nav */}
           <div className="md:hidden overflow-x-auto border-b border-white/10 bg-[#0F172A]/60 backdrop-blur-xl">
             <div className="flex px-3 py-2 gap-1">
-              {NAV.map((item) => (
+              {NAV.filter((item) => item.roles.includes(user?.role || "admin")).map((item) => (
                 <NavLink
                   key={item.to}
                   to={item.to}

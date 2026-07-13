@@ -2,6 +2,7 @@ import React from "react";
 import { motion } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import PlateScanCard from "@/components/PlateScanCard";
 import { Camera, RadioTower, ScanLine, RefreshCw, Sparkles } from "lucide-react";
 
 const CAMS = [
@@ -26,6 +27,8 @@ export default function LiveMonitoring() {
           <RefreshCw className="h-4 w-4 mr-2" /> Refresh Feed
         </Button>
       </div>
+
+      <PlateScanCard />
 
       <div className="grid gap-4 lg:grid-cols-2">
         {CAMS.map((c, i) => (
@@ -95,10 +98,10 @@ export default function LiveMonitoring() {
           <Sparkles className="h-5 w-5 text-blue-400" />
         </div>
         <div>
-          <h3 className="font-semibold">Phase 2 — AI Number Plate Recognition</h3>
+          <h3 className="font-semibold">RTSP / IP Camera Streaming — Phase 2</h3>
           <p className="text-sm text-slate-400 mt-1">
-            RTSP/HTTP camera feeds will be routed through an OCR pipeline (Gemini Vision / OpenALPR) to auto-log
-            entries and exits, with confidence-scored matches and WhatsApp / email alerts.
+            Live RTSP feeds will replace the placeholders above and pipe every frame through the AI plate scanner
+            for hands-free entry/exit logging.
           </p>
         </div>
       </div>

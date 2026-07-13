@@ -185,8 +185,10 @@ export default function Login() {
               )}
             </Button>
 
-            <div className="text-[11px] text-slate-500 text-center pt-2 border-t border-white/5">
-              Demo: <span className="text-slate-300">admin@rdx.com</span> / <span className="text-slate-300">admin123</span>
+            <div className="text-[11px] text-slate-500 text-center pt-2 border-t border-white/5 space-y-0.5">
+              <div>Admin — <span className="text-slate-300">admin@rdx.com</span> / <span className="text-slate-300">admin123</span></div>
+              <div>Manager — <span className="text-slate-300">manager@rdx.com</span> / <span className="text-slate-300">demo1234</span></div>
+              <div>Security — <span className="text-slate-300">security@rdx.com</span> / <span className="text-slate-300">demo1234</span></div>
             </div>
           </div>
         </motion.form>

@@ -23,6 +23,19 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
+# Optional integrations
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+    HAS_LLM = True
+except ImportError:
+    HAS_LLM = False
+
+try:
+    from twilio.rest import Client as TwilioClient
+    HAS_TWILIO = True
+except ImportError:
+    HAS_TWILIO = False
+
 # --------- Setup ---------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("rdx")
@@ -35,8 +48,18 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALG = "HS256"
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"].lower()
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
+TWILIO_TO_DEFAULT = os.environ.get("TWILIO_WHATSAPP_TO", "")
 
 RETENTION_DAYS = 180
+
+# Role permissions
+ROLE_ALL = ("admin", "manager", "security")
+ROLE_ADMIN_ONLY = ("admin",)
+ROLE_ADMIN_MANAGER = ("admin", "manager")
 
 app = FastAPI(title="RDX Car Showroom API")
 api = APIRouter(prefix="/api")
@@ -100,6 +123,15 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_roles(*allowed_roles):
+    """Dependency factory that ensures the current user has one of the given roles."""
+    async def _guard(user: dict = Depends(get_current_user)) -> dict:
+        if user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=403, detail=f"Requires role: {', '.join(allowed_roles)}")
+        return user
+    return _guard
 
 
 # ===================== Time helpers =====================
@@ -284,6 +316,10 @@ class SettingsIn(BaseModel):
     whatsapp_report_time: Optional[str] = None
     backup_enabled: Optional[bool] = None
     database_url_display: Optional[str] = None
+    twilio_sid: Optional[str] = None
+    twilio_token: Optional[str] = None
+    twilio_from: Optional[str] = None
+    twilio_to: Optional[str] = None
 
 
 # ===================== Auth Routes =====================
@@ -293,8 +329,10 @@ async def login(payload: LoginIn, response: Response):
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access only")
+    if user.get("status") == "inactive":
+        raise HTTPException(status_code=403, detail="Account is inactive")
+    if user.get("role") not in ROLE_ALL:
+        raise HTTPException(status_code=403, detail="Unknown role")
     uid = str(user["_id"])
     access = create_access_token(uid, email)
     refresh = create_refresh_token(uid)
@@ -303,8 +341,8 @@ async def login(payload: LoginIn, response: Response):
     return {
         "id": uid,
         "email": email,
-        "name": user.get("name", "Admin"),
-        "role": user.get("role", "admin"),
+        "name": user.get("name", "User"),
+        "role": user.get("role"),
         "token": access,
     }
 
@@ -976,7 +1014,7 @@ async def export_visits(
 
 # ===================== Users =====================
 @api.get("/users")
-async def list_users(user: dict = Depends(get_current_user)):
+async def list_users(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     docs = await db.users.find({}).sort("created_at", -1).to_list(200)
     return [
         {
@@ -993,7 +1031,7 @@ async def list_users(user: dict = Depends(get_current_user)):
 
 
 @api.post("/users")
-async def create_user(payload: UserIn, user: dict = Depends(get_current_user)):
+async def create_user(payload: UserIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     existing = await db.users.find_one({"email": payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="User with this email already exists")
@@ -1011,7 +1049,7 @@ async def create_user(payload: UserIn, user: dict = Depends(get_current_user)):
 
 
 @api.delete("/users/{uid}")
-async def delete_user(uid: str, user: dict = Depends(get_current_user)):
+async def delete_user(uid: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     if uid == user["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     result = await db.users.delete_one({"_id": ObjectId(uid)})
@@ -1031,6 +1069,10 @@ DEFAULT_SETTINGS = {
     "whatsapp_report_time": "09:00",
     "backup_enabled": True,
     "database_url_display": "mongodb://***",
+    "twilio_sid": "",
+    "twilio_token": "",
+    "twilio_from": "",
+    "twilio_to": "",
 }
 
 
@@ -1045,7 +1087,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
 
 
 @api.put("/settings")
-async def update_settings(payload: SettingsIn, user: dict = Depends(get_current_user)):
+async def update_settings(payload: SettingsIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
     await db.settings.update_one({"key": "app"}, {"$set": updates}, upsert=True)
     doc = await db.settings.find_one({"key": "app"})
@@ -1061,6 +1103,231 @@ async def purge_expired(user: dict = Depends(get_current_user)):
     cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
     r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
     return {"deleted": r.deleted_count, "cutoff": cutoff}
+
+
+# ===================== AI Number Plate Recognition =====================
+import re as _re
+import base64 as _base64
+
+_PLATE_RE = _re.compile(r"[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}")
+
+
+class PlateScanIn(BaseModel):
+    image_base64: str  # data URL or plain base64
+    auto_action: Optional[Literal["none", "entry", "exit"]] = "none"
+    camera: Optional[str] = None
+
+
+def _strip_data_url(b64: str) -> str:
+    if "," in b64 and b64.strip().startswith("data:"):
+        return b64.split(",", 1)[1]
+    return b64
+
+
+def _extract_plate(text: str) -> Optional[str]:
+    if not text:
+        return None
+    txt = text.upper().replace("-", "").replace(".", " ")
+    m = _PLATE_RE.search(txt)
+    if m:
+        return "".join(m.group(0).split())
+    # Fallback: pick first token of >=6 alphanumerics
+    for line in txt.splitlines():
+        cleaned = "".join(c for c in line if c.isalnum())
+        if 6 <= len(cleaned) <= 12 and any(c.isdigit() for c in cleaned) and any(c.isalpha() for c in cleaned):
+            return cleaned
+    return None
+
+
+@api.post("/vehicles/scan-plate")
+async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*ROLE_ALL))):
+    if not HAS_LLM or not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=503, detail="AI plate recognition is not configured. Set EMERGENT_LLM_KEY.")
+
+    b64 = _strip_data_url(payload.image_base64).strip()
+    if not b64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    prompt = (
+        "You are an OCR system for vehicle license plates. "
+        "Read ONLY the license plate text from this image. "
+        "Return ONLY the plate as continuous alphanumeric characters (no spaces, no dashes). "
+        "If no plate is visible or you are unsure, respond with the single word: UNKNOWN. "
+        "Do not add any explanation or extra words. Example valid output: UP21AB1234"
+    )
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"plate-{uuid.uuid4()}",
+            system_message="You are a precise OCR engine. Output only the requested text.",
+        ).with_model("gemini", "gemini-3-flash-preview")
+
+        image = ImageContent(image_base64=b64)
+        msg = UserMessage(text=prompt, file_contents=[image])
+        raw = ""
+        try:
+            resp = await chat.send_message(msg)
+            raw = resp if isinstance(resp, str) else str(resp)
+        except Exception:
+            # streaming fallback
+            from emergentintegrations.llm.chat import TextDelta, StreamDone
+            async for ev in chat.stream_message(msg):
+                if isinstance(ev, TextDelta):
+                    raw += ev.content
+                elif isinstance(ev, StreamDone):
+                    break
+
+        cleaned = (raw or "").strip().upper()
+        if cleaned == "UNKNOWN" or not cleaned:
+            return {"plate": None, "confidence": "low", "raw": raw, "action": None}
+
+        plate = _extract_plate(cleaned) or "".join(c for c in cleaned if c.isalnum())
+        if not plate or len(plate) < 5:
+            return {"plate": None, "confidence": "low", "raw": raw, "action": None}
+
+        # Optional auto entry/exit
+        action_result: Optional[Dict[str, Any]] = None
+        action = payload.auto_action or "none"
+        cam = payload.camera or "AI-CAM"
+        if action == "entry":
+            await upsert_master(vehicle_number=plate)
+            now = now_utc()
+            session = {
+                "id": str(uuid.uuid4()),
+                "vehicle_number": normalize_plate(plate),
+                "entry_time": now.isoformat(),
+                "exit_time": None,
+                "visit_date": now.strftime("%Y-%m-%d"),
+                "duration_seconds": None,
+                "entry_camera": cam,
+                "exit_camera": "",
+                "entry_image": "",
+                "exit_image": "",
+                "status": "active",
+                "created_at": now.isoformat(),
+            }
+            await db.visit_sessions.insert_one(session)
+            session.pop("_id", None)
+            action_result = {"type": "entry", "session": serialize_session(session)}
+        elif action == "exit":
+            vn = normalize_plate(plate)
+            sess = await db.visit_sessions.find_one({"vehicle_number": vn, "status": "active"}, sort=[("entry_time", -1)])
+            if sess:
+                now = now_utc()
+                entry_dt = datetime.fromisoformat(sess["entry_time"])
+                duration = int((now - entry_dt).total_seconds())
+                updates = {
+                    "exit_time": now.isoformat(),
+                    "duration_seconds": duration,
+                    "exit_camera": cam,
+                    "status": "completed",
+                }
+                await db.visit_sessions.update_one({"_id": sess["_id"]}, {"$set": updates})
+                sess.update(updates)
+                sess.pop("_id", None)
+                action_result = {"type": "exit", "session": serialize_session(sess)}
+            else:
+                action_result = {"type": "exit", "error": "No active session to close for this plate"}
+
+        return {"plate": plate, "confidence": "high", "raw": raw, "action": action_result}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Plate scan failed")
+        raise HTTPException(status_code=500, detail=f"AI scan failed: {e}")
+
+
+# ===================== WhatsApp Reports =====================
+class WhatsAppSendIn(BaseModel):
+    to: Optional[str] = None  # override recipient; default from settings/env
+    body: Optional[str] = None  # override body
+
+
+async def _build_daily_summary_text() -> str:
+    n = now_utc()
+    today = start_of_day(n)
+    end = today + timedelta(days=1)
+    entries = await db.visit_sessions.count_documents({"entry_time": {"$gte": today.isoformat(), "$lt": end.isoformat()}})
+    exits = await db.visit_sessions.count_documents({"exit_time": {"$gte": today.isoformat(), "$lt": end.isoformat()}})
+    inside = await db.visit_sessions.count_documents({"status": "active"})
+    total_masters = await db.vehicle_masters.count_documents({})
+
+    # Top 3 busiest vehicles today
+    pipe = [
+        {"$match": {"entry_time": {"$gte": today.isoformat(), "$lt": end.isoformat()}}},
+        {"$group": {"_id": "$vehicle_number", "visits": {"$sum": 1}}},
+        {"$sort": {"visits": -1}},
+        {"$limit": 3},
+    ]
+    top = await db.visit_sessions.aggregate(pipe).to_list(3)
+    top_lines = "\n".join(f"  • {t['_id']}: {t['visits']} visits" for t in top) or "  (none)"
+
+    return (
+        f"🚗 *RDX Car Showroom — Daily Report*\n"
+        f"📅 {today.strftime('%A, %d %b %Y')}\n\n"
+        f"• Entries today:  *{entries}*\n"
+        f"• Exits today:    *{exits}*\n"
+        f"• Cars inside:    *{inside}*\n"
+        f"• Total vehicles: *{total_masters}*\n\n"
+        f"Top visitors today:\n{top_lines}\n\n"
+        f"— sent by RDX AI"
+    )
+
+
+async def _twilio_config() -> Dict[str, str]:
+    """Load Twilio config from settings collection, falling back to env vars."""
+    doc = await db.settings.find_one({"key": "app"}) or {}
+    return {
+        "sid": doc.get("twilio_sid") or TWILIO_SID,
+        "token": doc.get("twilio_token") or TWILIO_TOKEN,
+        "from": doc.get("twilio_from") or TWILIO_FROM,
+        "to": doc.get("twilio_to") or TWILIO_TO_DEFAULT,
+    }
+
+
+@api.post("/whatsapp/send-report")
+async def send_whatsapp_report(payload: WhatsAppSendIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    cfg = await _twilio_config()
+    body = payload.body or await _build_daily_summary_text()
+    to = payload.to or cfg["to"]
+
+    if not (HAS_TWILIO and cfg["sid"] and cfg["token"] and cfg["from"] and to):
+        # Dry-run mode — return preview so the UI can display it
+        return {
+            "delivered": False,
+            "mode": "dry-run",
+            "reason": "Twilio credentials not configured (set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_WHATSAPP_FROM in .env, plus the recipient number).",
+            "preview": {"to": to or "(missing)", "body": body},
+        }
+
+    try:
+        cli = TwilioClient(cfg["sid"], cfg["token"])
+        message = cli.messages.create(from_=cfg["from"], to=to, body=body)
+        await db.whatsapp_log.insert_one({
+            "sid": message.sid,
+            "to": to,
+            "body": body,
+            "sent_at": now_utc().isoformat(),
+            "by": user["email"],
+        })
+        return {"delivered": True, "mode": "live", "sid": message.sid, "preview": {"to": to, "body": body}}
+    except Exception as e:
+        logger.exception("Twilio send failed")
+        raise HTTPException(status_code=500, detail=f"WhatsApp send failed: {e}")
+
+
+@api.get("/whatsapp/preview")
+async def whatsapp_preview(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    cfg = await _twilio_config()
+    body = await _build_daily_summary_text()
+    configured = bool(HAS_TWILIO and cfg["sid"] and cfg["token"] and cfg["from"] and cfg["to"])
+    return {
+        "configured": configured,
+        "to": cfg["to"] or "",
+        "from_": cfg["from"] or "",
+        "body": body,
+    }
 
 
 # ===================== Health =====================
@@ -1106,6 +1373,11 @@ async def seed_demo():
                 "created_at": now_utc().isoformat(),
                 "last_login": (now_utc() - timedelta(hours=random.randint(1, 200))).isoformat(),
             })
+        else:
+            # Ensure demo users always have the known 'demo1234' password (idempotent seed refresh)
+            existing = await db.users.find_one({"email": u["email"]})
+            if not verify_password("demo1234", existing["password_hash"]):
+                await db.users.update_one({"_id": existing["_id"]}, {"$set": {"password_hash": hash_password("demo1234")}})
 
     # Drop legacy 'vehicles' collection from initial MVP if present
     try:
