@@ -23,7 +23,9 @@ import base64
 import logging
 import os
 import re
+import secrets
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +35,14 @@ import numpy as np
 
 logger = logging.getLogger("rdx.plate_pipeline")
 logger.setLevel(logging.INFO)
+
+# Where automatic entry snapshots are written on disk. Served via /api/snapshots/<file>.
+SNAPSHOTS_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+
+# Minimum seconds between two entries for the same plate. Anything shorter is
+# treated as a duplicate detection and is NOT written to MongoDB.
+ENTRY_DEDUP_SECONDS = 30
 
 # COCO vehicle classes (car, motorcycle, bus, truck)
 VEHICLE_CLASS_IDS = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
@@ -211,15 +221,134 @@ def get_pipeline() -> Optional[PlatePipeline]:
     return _pipeline
 
 
-async def start_auto_detection_loop(camera_manager, interval_seconds: float = 3.0) -> None:
+async def _persist_entry(db, camera_id: str, plate: str, jpeg_frame: bytes) -> Dict[str, Any]:
+    """
+    Look up the vehicle master, dedup within ENTRY_DEDUP_SECONDS, and if it's a
+    fresh detection write a new visit_session with the snapshot.
+
+    Returns a dict describing what happened, always including `owner` (may be null
+    if the vehicle is new) and either a `session` block (persisted) or a `duplicate`
+    flag.
+    """
+    now = datetime.now(timezone.utc)
+    result: Dict[str, Any] = {"plate": plate, "camera_id": camera_id}
+
+    # 1. Master lookup
+    master = await db.vehicle_masters.find_one({"vehicle_number": plate})
+    if master:
+        result["owner_status"] = "existing"
+        result["owner"] = {
+            "owner_name": master.get("owner_name") or "Unknown Owner",
+            "phone_number": master.get("phone_number", ""),
+            "customer_id": master.get("customer_id", ""),
+            "vehicle_model": master.get("vehicle_model", ""),
+            "vehicle_image": master.get("vehicle_image", ""),
+        }
+    else:
+        result["owner_status"] = "new"
+        result["owner"] = None
+
+    # 2. Dedup: has this plate been recorded in the last ENTRY_DEDUP_SECONDS?
+    last = await db.visit_sessions.find_one(
+        {"vehicle_number": plate},
+        sort=[("entry_time", -1)],
+    )
+    if last and last.get("entry_time"):
+        try:
+            last_dt = datetime.fromisoformat(last["entry_time"])
+            if (now - last_dt).total_seconds() < ENTRY_DEDUP_SECONDS:
+                result["duplicate"] = True
+                result["duplicate_reason"] = f"already logged within {ENTRY_DEDUP_SECONDS}s"
+                result["last_session_id"] = last.get("id")
+                return result
+        except Exception:
+            pass
+
+    # 3. Auto-create master if this is a brand-new plate
+    if master is None:
+        new_master = {
+            "id": str(uuid.uuid4()),
+            "vehicle_number": plate,
+            "owner_name": "Unknown Owner",
+            "phone_number": "",
+            "vehicle_model": "",
+            "vehicle_image": "",
+            "customer_id": f"CUS-{secrets.token_hex(3).upper()}",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        try:
+            await db.vehicle_masters.insert_one(new_master)
+        except Exception:
+            # unique-index race: another worker inserted first
+            new_master = await db.vehicle_masters.find_one({"vehicle_number": plate}) or new_master
+        result["owner"] = {
+            "owner_name": new_master.get("owner_name", "Unknown Owner"),
+            "phone_number": new_master.get("phone_number", ""),
+            "customer_id": new_master.get("customer_id", ""),
+            "vehicle_model": new_master.get("vehicle_model", ""),
+            "vehicle_image": new_master.get("vehicle_image", ""),
+        }
+
+    # 4. Save snapshot JPEG to disk (served by /api/snapshots/<file>)
+    snap_name = f"{uuid.uuid4().hex}.jpg"
+    snap_path = os.path.join(SNAPSHOTS_DIR, snap_name)
+    try:
+        with open(snap_path, "wb") as f:
+            f.write(jpeg_frame)
+        snapshot_url = f"/api/snapshots/{snap_name}"
+    except Exception as e:
+        logger.warning("Could not persist snapshot for %s: %s", plate, e)
+        snapshot_url = ""
+
+    # 5. Insert the visit session
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "vehicle_number": plate,
+        "entry_time": now.isoformat(),
+        "exit_time": None,
+        "visit_date": now.strftime("%Y-%m-%d"),
+        "duration_seconds": None,
+        "entry_camera": camera_id,
+        "exit_camera": "",
+        "entry_image": snapshot_url,
+        "exit_image": "",
+        "status": "active",
+        "notes": "",
+        "created_at": now.isoformat(),
+        "detected_by": "yolo_auto",
+    }
+    await db.visit_sessions.insert_one(session_doc)
+    session_doc.pop("_id", None)
+
+    result["duplicate"] = False
+    result["session"] = {
+        "id": session_doc["id"],
+        "entry_time": session_doc["entry_time"],
+        "entry_camera": session_doc["entry_camera"],
+        "entry_image": snapshot_url,
+        "status": session_doc["status"],
+        "visit_date": session_doc["visit_date"],
+        "detected_by": "yolo_auto",
+    }
+    return result
+
+
+async def start_auto_detection_loop(camera_manager, db=None, interval_seconds: float = 3.0) -> None:
     """Background task: for every camera that is online, run the pipeline every N seconds
     and stash the result on `state.latest_plate` so the websocket layer can broadcast it.
+
+    If `db` (an AsyncIOMotorDatabase) is provided, each fresh detection is also written
+    to the visit_sessions collection (with owner enrichment + 30-second dedup).
     """
     pipeline = get_pipeline()
     if pipeline is None:
         logger.error("Auto-detection loop cannot start — pipeline unavailable")
         return
-    logger.info("Auto-detection loop started (interval=%.1fs)", interval_seconds)
+    logger.info(
+        "Auto-detection loop started (interval=%.1fs, dedup=%ds, persistence=%s)",
+        interval_seconds, ENTRY_DEDUP_SECONDS, "on" if db is not None else "off",
+    )
 
     last_run: Dict[str, float] = {}
     while True:
@@ -237,16 +366,13 @@ async def start_auto_detection_loop(camera_manager, interval_seconds: float = 3.
                 frame_no = state.frames_captured
                 last_run[cam_id] = time.time()
 
-                # Decode JPEG → np.ndarray in a thread to avoid blocking event loop
                 def _decode(buf: bytes) -> Optional[np.ndarray]:
                     arr = np.frombuffer(buf, dtype=np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    return img
+                    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
                 frame = await asyncio.to_thread(_decode, jpeg)
                 if frame is None:
                     continue
-                # YOLO detection is CPU heavy → offload to thread
                 detections = await asyncio.to_thread(pipeline.detect_vehicles, frame)
                 if not detections:
                     continue
@@ -257,7 +383,7 @@ async def start_auto_detection_loop(camera_manager, interval_seconds: float = 3.
                     continue
                 plate, conf, _raw = read
 
-                latest = {
+                latest: Dict[str, Any] = {
                     "plate": plate,
                     "confidence": conf,
                     "bbox": list(top["bbox"]),
@@ -268,8 +394,22 @@ async def start_auto_detection_loop(camera_manager, interval_seconds: float = 3.
                     "camera_id": cam_id,
                 }
 
+                # Persist entry + owner enrichment
+                if db is not None:
+                    try:
+                        persistence = await _persist_entry(db, cam_id, plate, jpeg)
+                        latest["owner"] = persistence.get("owner")
+                        latest["owner_status"] = persistence.get("owner_status")
+                        latest["duplicate"] = persistence.get("duplicate", False)
+                        if persistence.get("duplicate"):
+                            latest["duplicate_reason"] = persistence.get("duplicate_reason")
+                            latest["last_session_id"] = persistence.get("last_session_id")
+                        if persistence.get("session"):
+                            latest["session"] = persistence["session"]
+                    except Exception:
+                        logger.exception("Persistence step failed for plate=%s", plate)
+
                 prev = getattr(state, "latest_plate", None)
-                # Only broadcast if plate changed or > 30s since last identical broadcast
                 is_new = (
                     prev is None
                     or prev.get("plate") != plate
@@ -278,11 +418,14 @@ async def start_auto_detection_loop(camera_manager, interval_seconds: float = 3.
                         - datetime.fromisoformat(prev["detected_at"]).timestamp()
                     ) > 30
                 )
-                state.latest_plate = latest  # always keep freshest
+                state.latest_plate = latest
                 state.latest_plate_is_new = is_new
                 logger.info(
-                    "[camera %s] AUTO plate=%s conf=%s vehicle=%s(%.2f) new=%s",
-                    cam_id, plate, conf, top["cls_name"], top["conf"], is_new,
+                    "[camera %s] AUTO plate=%s conf=%s vehicle=%s(%.2f) owner=%s dup=%s session=%s",
+                    cam_id, plate, conf, top["cls_name"], top["conf"],
+                    (latest.get("owner") or {}).get("owner_name", "—"),
+                    latest.get("duplicate", False),
+                    (latest.get("session") or {}).get("id", "—")[:8] if latest.get("session") else "—",
                 )
         except Exception as e:
             logger.exception("Auto-detection loop error: %s", e)

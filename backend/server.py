@@ -1466,6 +1466,21 @@ async def root():
     return {"service": "RDX Car Showroom API", "ok": True}
 
 
+# ---------- Auto-detection snapshots ----------
+from fastapi.responses import FileResponse
+from plate_pipeline import SNAPSHOTS_DIR as _SNAPSHOTS_DIR
+
+
+@api.get("/snapshots/{filename}")
+async def get_snapshot(filename: str, user: dict = Depends(require_roles(*ROLE_ALL))):
+    # basic path-traversal guard
+    safe = os.path.basename(filename)
+    fp = os.path.join(_SNAPSHOTS_DIR, safe)
+    if not os.path.isfile(fp):
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+    return FileResponse(fp, media_type="image/jpeg")
+
+
 # ===================== Startup =====================
 async def seed_admin():
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
@@ -1664,7 +1679,7 @@ async def startup():
     await seed_admin()
     await seed_demo()
     # Kick off automatic YOLO+OCR pipeline in the background
-    asyncio.create_task(start_auto_detection_loop(camera_manager, interval_seconds=3.0))
+    asyncio.create_task(start_auto_detection_loop(camera_manager, db=db, interval_seconds=3.0))
 
 
 @app.on_event("shutdown")
