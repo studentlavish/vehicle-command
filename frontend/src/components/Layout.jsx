@@ -69,11 +69,11 @@ export default function Layout({ children }) {
         <aside className="hidden md:flex w-64 flex-col glass border-r border-white/10 sticky top-0 h-screen" data-testid="sidebar">
           <div className="px-6 pt-6 pb-8 flex items-center gap-3">
             <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center shadow-lg shadow-blue-900/40">
-              <span className="text-white font-bold tracking-tight">R</span>
+              <span className="text-white font-bold tracking-tight">V</span>
             </div>
             <div className="leading-tight">
-              <div className="text-sm font-semibold tracking-wide">RDX</div>
-              <div className="text-[11px] text-slate-400">Car Showroom</div>
+              <div className="text-sm font-semibold tracking-wide">Vashu Hyundai</div>
+              <div className="text-[11px] text-slate-400">AI Vehicle Management</div>
             </div>
           </div>
 
@@ -116,7 +116,7 @@ export default function Layout({ children }) {
           <header className="glass sticky top-0 z-40 border-b border-white/10" data-testid="topbar">
             <div className="flex items-center gap-3 px-4 md:px-8 h-16">
               <div className="md:hidden h-9 w-9 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
-                <span className="text-white text-sm font-bold">R</span>
+                <span className="text-white text-sm font-bold">V</span>
               </div>
 
               <form onSubmit={handleSearch} className="hidden sm:flex items-center flex-1 max-w-xl">
@@ -201,8 +201,8 @@ export default function Layout({ children }) {
           </main>
 
           <footer className="border-t border-white/10 px-4 md:px-8 py-5 text-center text-xs text-slate-500">
-            © 2026 hyundai Car Showroom Management System
-            <span className="hidden md:inline"> • <span className="text-slate-400">RDX</span> Premium Enterprise</span>
+            © 2026 Vashu Hyundai AI Vehicle Management System
+            <span className="hidden md:inline"> • <span className="text-slate-400">Vashu</span> Premium Enterprise</span>
           </footer>
         </div>
       </div>
