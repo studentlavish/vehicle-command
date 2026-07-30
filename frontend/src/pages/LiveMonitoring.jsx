@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import PlateScanCard from "@/components/PlateScanCard";
+import CameraGrid from "@/components/CameraGrid";
 import { Camera, RadioTower, ScanLine, RefreshCw, Sparkles } from "lucide-react";
 
 const CAMS = [
@@ -29,6 +30,8 @@ export default function LiveMonitoring() {
       </div>
 
       <PlateScanCard />
+
+      <CameraGrid />
 
       <div className="grid gap-4 lg:grid-cols-2">
         {CAMS.map((c, i) => (

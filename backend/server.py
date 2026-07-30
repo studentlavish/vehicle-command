@@ -10,6 +10,7 @@ import csv
 import uuid
 import logging
 import random
+import asyncio
 import secrets as pysecrets
 from datetime import datetime, timezone, timedelta, date as ddate
 from typing import List, Optional, Literal, Dict, Any, Tuple
@@ -17,11 +18,13 @@ from typing import List, Optional, Literal, Dict, Any, Tuple
 import bcrypt
 import jwt
 from bson import ObjectId
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
+
+from camera_manager import camera_manager
 
 # Optional integrations
 try:
@@ -1331,6 +1334,120 @@ async def whatsapp_preview(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGE
 
 
 # ===================== Health =====================
+# ---------- Cameras (USB / IP Webcam / RTSP) ----------
+class CameraConnectIn(BaseModel):
+    camera_id: str
+    source: str  # int-as-string for USB, or http/rtsp URL
+    label: Optional[str] = ""
+
+
+@api.get("/cameras")
+async def list_cameras(user: dict = Depends(require_roles(*ROLE_ALL))):
+    return camera_manager.list()
+
+
+@api.get("/cameras/{camera_id}")
+async def get_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE_ALL))):
+    state = camera_manager.get(camera_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return state.public()
+
+
+@api.post("/cameras/connect")
+async def connect_camera(payload: CameraConnectIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    try:
+        info = camera_manager.connect(payload.camera_id, payload.source, payload.label or "")
+        return info
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Camera connect failed: {e}")
+
+
+@api.post("/cameras/{camera_id}/disconnect")
+async def disconnect_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    if not camera_manager.disconnect(camera_id):
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return {"ok": True, "camera_id": camera_id}
+
+
+def _authorize_ws(token: Optional[str]) -> Optional[dict]:
+    """Verify a token passed via ?token=... query string on the WebSocket."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        if payload.get("type") != "access":
+            return None
+        return payload
+    except jwt.PyJWTError:
+        return None
+
+
+@app.websocket("/api/ws/camera/{camera_id}")
+async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] = Query(default=None)):
+    # Accept then authenticate via cookie or ?token=
+    await websocket.accept()
+
+    # Try cookie first
+    cookie_token = websocket.cookies.get("access_token")
+    payload = _authorize_ws(cookie_token) or _authorize_ws(token)
+    if payload is None:
+        await websocket.send_json({"type": "error", "message": "unauthorized"})
+        await websocket.close(code=4401)
+        return
+
+    if camera_manager.get(camera_id) is None:
+        await websocket.send_json({"type": "error", "message": f"camera '{camera_id}' not connected. Call /api/cameras/connect first."})
+        await websocket.close(code=4404)
+        return
+
+    logger.info("[ws camera %s] client connected user=%s", camera_id, payload.get("email"))
+
+    # Push initial status
+    state = camera_manager.get(camera_id)
+    if state:
+        try:
+            await websocket.send_json({"type": "status", "camera": state.public()})
+        except Exception:
+            return
+
+    connected = {"v": True}
+
+    def is_connected() -> bool:
+        return connected["v"]
+
+    async def send_bytes(data: bytes) -> None:
+        try:
+            await websocket.send_bytes(data)
+        except Exception:
+            connected["v"] = False
+
+    # Status heartbeat every 2s
+    async def heartbeat():
+        while connected["v"]:
+            await asyncio.sleep(2)
+            st = camera_manager.get(camera_id)
+            if st is None:
+                break
+            try:
+                await websocket.send_json({"type": "status", "camera": st.public()})
+            except Exception:
+                connected["v"] = False
+                break
+
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        await camera_manager.stream(camera_id, send_bytes, is_connected, fps=15)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        connected["v"] = False
+        hb_task.cancel()
+        logger.info("[ws camera %s] client disconnected", camera_id)
+
+
 @api.get("/")
 async def root():
     return {"service": "RDX Car Showroom API", "ok": True}
