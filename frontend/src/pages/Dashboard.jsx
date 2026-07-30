@@ -56,6 +56,65 @@ export default function Dashboard() {
     })();
   }, []);
 
+  // Live updates: subscribe to /api/ws/events and reactively update stats + recent
+  useEffect(() => {
+    const base = process.env.REACT_APP_BACKEND_URL;
+    if (!base) return;
+    const wsUrl = base.replace(/^http/, "ws") + "/api/ws/events";
+    let ws;
+    let closed = false;
+
+    const open = () => {
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type !== "entry.recorded") return;
+
+        const s = msg.session || {};
+        const owner = msg.owner || {};
+
+        // 1. Prepend to Recent Vehicles table (keep 8)
+        setRecent((prev) => {
+          const row = {
+            id: s.id,
+            vehicle_number: msg.vehicle_number,
+            owner_name: owner.owner_name || "Unknown Owner",
+            contact_number: owner.phone_number || "",
+            vehicle_model: owner.vehicle_model || "",
+            entry_time: s.entry_time,
+            exit_time: null,
+            status: "inside",
+            visit_date: s.visit_date,
+            entry_image: s.entry_image,
+            live: true,
+          };
+          const deduped = (prev || []).filter((r) => r.id !== row.id);
+          return [row, ...deduped].slice(0, 8);
+        });
+
+        // 2. Bump counters in-place without a full refetch
+        setStats((prev) => {
+          if (!prev) return prev;
+          const bump = (k) => ({ ...prev[k], value: (prev[k]?.value || 0) + 1 });
+          return {
+            ...prev,
+            today_entries: bump("today_entries"),
+            visitors_today: bump("visitors_today"),
+            monthly_visitors: bump("monthly_visitors"),
+            cars_inside: bump("cars_inside"),
+            total_vehicles:
+              msg.owner_status === "new" ? bump("total_vehicles") : prev.total_vehicles,
+          };
+        });
+      };
+      ws.onclose = () => { if (!closed) setTimeout(open, 3000); };
+      ws.onerror = () => { try { ws.close(); } catch (_e) { /* ignore */ } };
+    };
+    open();
+    return () => { closed = true; try { ws && ws.close(); } catch (_e) { /* ignore */ } };
+  }, []);
+
   return (
     <div className="space-y-8" data-testid="dashboard-root">
       {/* Header */}

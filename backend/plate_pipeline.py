@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from event_bus import event_bus
+
 logger = logging.getLogger("rdx.plate_pipeline")
 logger.setLevel(logging.INFO)
 
@@ -331,6 +333,27 @@ async def _persist_entry(db, camera_id: str, plate: str, jpeg_frame: bytes) -> D
         "visit_date": session_doc["visit_date"],
         "detected_by": "yolo_auto",
     }
+
+    # Broadcast to any live-dashboard subscribers
+    event_bus.publish({
+        "type": "entry.recorded",
+        "camera_id": camera_id,
+        "vehicle_number": plate,
+        "owner_status": result["owner_status"],
+        "owner": result["owner"],
+        "session": {
+            "id": session_doc["id"],
+            "vehicle_number": plate,
+            "entry_time": session_doc["entry_time"],
+            "exit_time": None,
+            "entry_camera": camera_id,
+            "entry_image": snapshot_url,
+            "status": "active",
+            "visit_date": session_doc["visit_date"],
+            "detected_by": "yolo_auto",
+        },
+        "recorded_at": now.isoformat(),
+    })
     return result
 
 

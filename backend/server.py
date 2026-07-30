@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, EmailStr
 
 from camera_manager import camera_manager
 from plate_pipeline import start_auto_detection_loop
+from event_bus import event_bus
 
 # Optional integrations
 try:
@@ -1384,6 +1385,35 @@ def _authorize_ws(token: Optional[str]) -> Optional[dict]:
         return payload
     except jwt.PyJWTError:
         return None
+
+
+@app.websocket("/api/ws/events")
+async def ws_events(websocket: WebSocket, token: Optional[str] = Query(default=None)):
+    """Broadcast channel for the live Dashboard — receives entry.recorded events
+    published by the auto-detection pipeline."""
+    await websocket.accept()
+    cookie_token = websocket.cookies.get("access_token")
+    payload = _authorize_ws(cookie_token) or _authorize_ws(token)
+    if payload is None:
+        await websocket.send_json({"type": "error", "message": "unauthorized"})
+        await websocket.close(code=4401)
+        return
+
+    q = event_bus.subscribe()
+    try:
+        await websocket.send_json({"type": "hello", "user": payload.get("email")})
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=20)
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.info("[ws events] disconnect: %s", e)
+    finally:
+        event_bus.unsubscribe(q)
 
 
 @app.websocket("/api/ws/camera/{camera_id}")
