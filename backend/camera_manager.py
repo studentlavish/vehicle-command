@@ -61,6 +61,9 @@ class CameraState:
     frames_captured: int = 0
     error: Optional[str] = None
     subscribers: int = 0
+    # Automatic plate detection (populated by plate_pipeline.start_auto_detection_loop)
+    latest_plate: Optional[Dict[str, Any]] = None
+    latest_plate_is_new: bool = False
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -75,6 +78,7 @@ class CameraState:
             "frames_captured": self.frames_captured,
             "error": self.error,
             "subscribers": self.subscribers,
+            "latest_plate": self.latest_plate,
         }
 
 

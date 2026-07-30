@@ -25,6 +25,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 from camera_manager import camera_manager
+from plate_pipeline import start_auto_detection_loop
 
 # Optional integrations
 try:
@@ -1424,8 +1425,9 @@ async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] =
         except Exception:
             connected["v"] = False
 
-    # Status heartbeat every 2s
+    # Status heartbeat every 2s + broadcast detected plates
     async def heartbeat():
+        last_plate_sig = None
         while connected["v"]:
             await asyncio.sleep(2)
             st = camera_manager.get(camera_id)
@@ -1436,6 +1438,17 @@ async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] =
             except Exception:
                 connected["v"] = False
                 break
+            # Broadcast new plate detections through the same WebSocket
+            plate = getattr(st, "latest_plate", None)
+            if plate:
+                sig = (plate.get("plate"), plate.get("detected_at"))
+                if sig != last_plate_sig:
+                    last_plate_sig = sig
+                    try:
+                        await websocket.send_json({"type": "plate", **plate})
+                    except Exception:
+                        connected["v"] = False
+                        break
 
     hb_task = asyncio.create_task(heartbeat())
     try:
@@ -1650,6 +1663,8 @@ async def startup():
     await ensure_indexes()
     await seed_admin()
     await seed_demo()
+    # Kick off automatic YOLO+OCR pipeline in the background
+    asyncio.create_task(start_auto_detection_loop(camera_manager, interval_seconds=3.0))
 
 
 @app.on_event("shutdown")
