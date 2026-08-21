@@ -98,6 +98,46 @@ class CameraManager:
         with self._lock:
             return self._cams.get(camera_id)
 
+    # ---------- agent-fed cameras (no local capture thread) ----------
+    def register_agent_camera(self, camera_id: str, label: str = "", agent_id: str = "") -> Dict[str, Any]:
+        """Register a camera whose frames are pushed from an external Local Agent.
+        No cv2 capture thread is started — frames arrive via push_frame()."""
+        with self._lock:
+            existing = self._cams.get(camera_id)
+            if existing and existing._thread and existing._thread.is_alive():
+                logger.info("[camera %s] already has local capture — agent register skipped", camera_id)
+                return existing.public()
+            state = existing or CameraState(camera_id=camera_id, source=f"agent:{agent_id or 'unknown'}", label=label or camera_id)
+            state.source = f"agent:{agent_id or 'unknown'}"
+            state.label = label or state.label or camera_id
+            state.status = "online"
+            state.connected_at = datetime.now(timezone.utc).isoformat()
+            state.error = None
+            self._cams[camera_id] = state
+        logger.info("[camera %s] registered as agent-fed (agent=%s)", camera_id, agent_id or "?")
+        return state.public()
+
+    def push_frame(self, camera_id: str, jpeg: bytes) -> bool:
+        with self._lock:
+            state = self._cams.get(camera_id)
+        if state is None:
+            return False
+        state.last_frame_jpeg = jpeg
+        state.last_frame_at = datetime.now(timezone.utc).isoformat()
+        state.frames_captured += 1
+        if state.status != "online":
+            state.status = "online"
+        return True
+
+    def mark_agent_offline(self, camera_id: str, reason: str = "") -> None:
+        with self._lock:
+            state = self._cams.get(camera_id)
+        if state is None:
+            return
+        state.status = "offline"
+        state.error = reason or "agent disconnected"
+        logger.info("[camera %s] marked offline (%s)", camera_id, reason or "agent disconnected")
+
     def connect(self, camera_id: str, source: Union[str, int], label: str = "") -> Dict[str, Any]:
         """Start a capture thread for this camera. Idempotent per camera_id."""
         parsed = _parse_source(source)

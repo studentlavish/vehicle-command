@@ -7,6 +7,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import io
 import csv
+import json
 import uuid
 import logging
 import random
@@ -1385,6 +1386,151 @@ def _authorize_ws(token: Optional[str]) -> Optional[dict]:
         return payload
     except jwt.PyJWTError:
         return None
+
+
+# ---------- Local Agent (outbound WSS from private-network showroom PCs) ----------
+class AgentRegisterIn(BaseModel):
+    agent_id: str
+    hostname: Optional[str] = ""
+    platform: Optional[str] = "windows"
+    version: Optional[str] = "1.0.0"
+
+
+VASHU_AGENT_SECRET = os.environ.get("VASHU_AGENT_SECRET", "")
+
+
+def _authorize_agent(secret: Optional[str]) -> bool:
+    if not VASHU_AGENT_SECRET:
+        return False
+    return bool(secret) and secret == VASHU_AGENT_SECRET
+
+
+@api.get("/agent/status")
+async def agent_status(user: dict = Depends(require_roles(*ROLE_ALL))):
+    docs = await db.agents.find({}).to_list(200)
+    return [{
+        "agent_id": d.get("agent_id"),
+        "hostname": d.get("hostname", ""),
+        "platform": d.get("platform", ""),
+        "version": d.get("version", ""),
+        "status": d.get("status", "offline"),
+        "last_heartbeat": d.get("last_heartbeat"),
+        "connected_at": d.get("connected_at"),
+        "cameras": d.get("cameras", []),
+    } for d in docs]
+
+
+@api.post("/agent/register")
+async def agent_register_http(payload: AgentRegisterIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    now_iso = now_utc().isoformat()
+    await db.agents.update_one({"agent_id": payload.agent_id}, {"$set": {
+        "agent_id": payload.agent_id, "hostname": payload.hostname, "platform": payload.platform,
+        "version": payload.version, "created_at": now_iso, "status": "offline",
+    }}, upsert=True)
+    return {"ok": True, "agent_id": payload.agent_id}
+
+
+@api.post("/agent/{agent_id}/disconnect")
+async def agent_disconnect_http(agent_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    await db.agents.update_one({"agent_id": agent_id}, {"$set": {"status": "offline"}})
+    doc = await db.agents.find_one({"agent_id": agent_id}) or {}
+    for cam_id in doc.get("cameras", []):
+        camera_manager.mark_agent_offline(cam_id, "agent disconnect requested")
+    return {"ok": True}
+
+
+@app.websocket("/api/agent/ws")
+async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default=None), secret: Optional[str] = Query(default=None)):
+    """Outbound WSS endpoint for the Windows Local Camera Agent."""
+    await websocket.accept()
+    hdr_secret = websocket.headers.get("x-agent-secret", "")
+    if not _authorize_agent(secret or hdr_secret):
+        await websocket.send_json({"type": "error", "message": "unauthorized"})
+        await websocket.close(code=4401)
+        return
+
+    active_agent_id: Optional[str] = agent_id
+    cameras_registered: set = set()
+    if active_agent_id:
+        await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
+            "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
+        }}, upsert=True)
+
+    await websocket.send_json({"type": "hello", "ok": True})
+    logger.info("[agent %s] connected", active_agent_id or "?")
+
+    import base64 as _b64
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw) if raw else {}
+            except Exception:
+                await websocket.send_json({"type": "error", "message": "bad json"})
+                continue
+            mtype = msg.get("type")
+
+            if mtype == "agent_register":
+                active_agent_id = msg.get("agent_id") or active_agent_id
+                if not active_agent_id:
+                    await websocket.send_json({"type": "error", "message": "agent_id required"})
+                    continue
+                await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
+                    "agent_id": active_agent_id, "hostname": msg.get("hostname", ""),
+                    "platform": msg.get("platform", "windows"), "version": msg.get("version", "1.0.0"),
+                    "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
+                }}, upsert=True)
+                await websocket.send_json({"type": "registered", "agent_id": active_agent_id})
+
+            elif mtype == "camera_status":
+                cam_id = msg.get("camera_id")
+                if not cam_id:
+                    continue
+                name = msg.get("name", cam_id)
+                status = msg.get("status", "online")
+                if status == "online":
+                    camera_manager.register_agent_camera(cam_id, label=name, agent_id=active_agent_id or "")
+                else:
+                    camera_manager.mark_agent_offline(cam_id, msg.get("error", "agent reported offline"))
+                cameras_registered.add(cam_id)
+                if active_agent_id:
+                    await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
+                        "cameras": list(cameras_registered), "last_heartbeat": now_utc().isoformat(),
+                    }}, upsert=True)
+
+            elif mtype == "heartbeat":
+                if active_agent_id:
+                    await db.agents.update_one({"agent_id": active_agent_id},
+                                               {"$set": {"last_heartbeat": now_utc().isoformat(), "status": "online"}})
+
+            elif mtype == "frame":
+                cam_id = msg.get("camera_id")
+                b64 = msg.get("jpeg_b64", "")
+                if not cam_id or not b64:
+                    continue
+                try:
+                    jpeg = _b64.b64decode(b64)
+                except Exception:
+                    continue
+                if cam_id not in cameras_registered:
+                    camera_manager.register_agent_camera(cam_id, label=msg.get("name", cam_id), agent_id=active_agent_id or "")
+                    cameras_registered.add(cam_id)
+                camera_manager.push_frame(cam_id, jpeg)
+
+            else:
+                await websocket.send_json({"type": "error", "message": f"unknown type: {mtype}"})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.info("[agent %s] ws error: %s", active_agent_id or "?", e)
+    finally:
+        if active_agent_id:
+            await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {"status": "offline"}})
+        for cam_id in cameras_registered:
+            camera_manager.mark_agent_offline(cam_id, "agent disconnected")
+        logger.info("[agent %s] disconnected", active_agent_id or "?")
+
 
 
 @app.websocket("/api/ws/events")
