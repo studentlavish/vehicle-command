@@ -171,6 +171,7 @@ class PlatePipeline:
             session_id=f"auto-plate-{int(time.time()*1000)}",
             system_message="You are a precise OCR engine. Output only the requested text.",
         ).with_model("gemini", "gemini-3-flash-preview")
+        raw: str = ""  # ensure defined on all paths
         try:
             resp = await chat.send_message(UserMessage(text=prompt, file_contents=[ImageContent(image_base64=b64)]))
             raw = resp if isinstance(resp, str) else str(resp)

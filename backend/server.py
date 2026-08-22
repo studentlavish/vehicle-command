@@ -950,14 +950,13 @@ def _fmt_duration(seconds):
 
 def _report_query(period: str) -> Dict[str, Any]:
     n = now_utc()
+    start = n - timedelta(days=365)  # explicit default so `start` is always defined
     if period == "daily":
         start = start_of_day(n)
     elif period == "weekly":
         start = n - timedelta(days=7)
     elif period == "monthly":
         start = n - timedelta(days=30)
-    else:
-        start = n - timedelta(days=365)
     return {"entry_time": {"$gte": start.isoformat()}}
 
 

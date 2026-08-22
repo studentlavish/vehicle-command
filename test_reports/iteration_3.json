@@ -1,0 +1,31 @@
+{
+  "summary": "Verified the 4 code-review fixes + regression smoke. All 13 new backend tests pass in /app/backend/tests/test_fixes_iter3.py (22.7s). FIX 1 (server.py _report_query): period=daily/weekly/monthly + period='unknown' + period='quarterly_v2' all return 200 with correct content-type and PDF/XLSX magic bytes — no NameError. FIX 2 (plate_pipeline read_plate 'raw' init): connected camera to /app/backend/fixtures/live_dash.mp4, waited 15s for auto-detection loop, backend logs show ZERO NameError / traceback / 500; /api/vehicles/search returns cleanly. FIX 3 (CameraGrid.jsx no localStorage/token): grep confirms no localStorage.getItem or '?token=' in CameraGrid.jsx or Dashboard.jsx; browser test confirms localStorage.getItem('rdx_token')===null after login; captured WebSocket URLs are ['wss://.../api/ws/events','wss://.../api/ws/camera/{id}'] with NO ?token= query param — auth via httpOnly cookies works (101 upgrade succeeded, camera frames streamed). FIX 4 (empty catch blocks): browser console now shows dev-only errors '[events ws] error Event' and '[camera ws] error Event' instead of being silent — Dashboard renders, /live renders, CameraGrid renders. Regression smoke: /api/cameras/connect->online transition OK, WS /api/ws/camera/{id} streams binary JPEG (0xFFD8) + status frames, WS /api/ws/events emits {type:hello,user}, unauth WS closes with 4401, /api/agent/ws rejects wrong secret with close 4401 and accepts VASHU_AGENT_SECRET with {type:hello,ok:true}.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fixes_iter3.py",
+    "/app/test_reports/pytest/pytest_fixes_iter3.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "FIX 1 correctly initialises `start = n - timedelta(days=365)` before the if/elif chain so unknown periods fall through cleanly. Consider validating `period` via Enum/Literal in FastAPI signature to reject unknown values with 422 explicitly (cleaner API contract) — currently silently defaults to 365d.",
+    "FIX 2 initialises `raw: str = ''` before the try block; return path uses `return plate, conf, raw` so raw is always defined. Good.",
+    "FIX 3 CameraGrid.jsx line 111 now builds ws URL without any token append: `toWsUrl('/api/ws/camera/${id}')`. Auth relies solely on httpOnly access_token cookie server-side (server.py line 1570 reads websocket.cookies.get('access_token')). Confirmed via network capture — no ?token= present.",
+    "FIX 4 empty catch blocks in CameraGrid onerror/close and Dashboard WS handlers now log via `if (process.env.NODE_ENV === 'development') console.error(...)`. Production builds stay silent as intended. Verified visible in dev console.",
+    "Server-side /api/ws/camera and /api/ws/events still ACCEPT the socket BEFORE authentication (server.py 1567, 1539). This is intentional to allow sending a JSON error, but note that unauthenticated clients briefly hold an accepted socket. Not a fix regression — pre-existing pattern."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fixes_iter3.py (new — 13 tests for the 4 fixes + WS smoke)"
+  ],
+  "success_rate": {"backend": "100% (13/13 new + prior 44/44 unchanged)", "frontend": "100% (login, dashboard, /live, WS auth via cookies)"},
+  "test_credentials": "admin@rdx.com / admin123 verified; VASHU_AGENT_SECRET=vashu-agent-secret-change-me-2026 verified",
+  "seed_data_creation": "Created 2 ephemeral cameras (test-fix-*, pipe-fix-*) — disconnected during teardown. Deleted 2 auto-detected visit_sessions (detected_by='yolo_auto') + 2 vehicle_masters (owner_name='Unknown Owner') per instructions.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "backend_test.py (iter2 44 tests) + test_fixes_iter3.py (iter3 13 tests) = 57 regression tests total, all pass. WS auth flows exclusively via httpOnly cookies for camera/events endpoints; ?token= query param still accepted server-side as fallback but frontend no longer sends it. Camera fixture at /app/backend/fixtures/live_dash.mp4 works reliably; auto-detection produces yolo_auto sessions within ~15s — remember to clean up between tests.",
+  "rca of the issue": "No new issues. All 4 code-review fixes correctly applied and verified. No regressions."
+}

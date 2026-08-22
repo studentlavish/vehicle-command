@@ -107,9 +107,8 @@ function CameraTile({ state, onDisconnect }) {
   }, [state]);
 
   useEffect(() => {
-    const token = localStorage.getItem("rdx_token") || "";
-    // token may be empty because we removed localStorage; we still send cookies via WS
-    const url = toWsUrl(`/api/ws/camera/${encodeURIComponent(state.camera_id)}${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+    // Auth flows through httpOnly cookies — no token in localStorage.
+    const url = toWsUrl(`/api/ws/camera/${encodeURIComponent(state.camera_id)}`);
     let ws;
     let closed = false;
     const open = () => {
@@ -121,20 +120,26 @@ function CameraTile({ state, onDisconnect }) {
         setConnected(false);
         if (!closed) setTimeout(open, 3000); // auto-reconnect WS
       };
-      ws.onerror = () => { try { ws.close(); } catch (_e) { /* ignore */ } };
+      ws.onerror = (err) => {
+        if (process.env.NODE_ENV === "development") console.error("[camera ws] error", err);
+        try { ws.close(); } catch (e) {
+          if (process.env.NODE_ENV === "development") console.error("[camera ws] close after error failed", e);
+        }
+      };
       ws.onmessage = (ev) => {
         if (typeof ev.data === "string") {
           try {
             const msg = JSON.parse(ev.data);
             if (msg.type === "status" && msg.camera) setLiveStatus(msg.camera);
             if (msg.type === "error") toast.error(msg.message);
-          } catch (_e) { /* ignore */ }
+          } catch (e) {
+            if (process.env.NODE_ENV === "development") console.error("[camera ws] bad json", e);
+          }
           return;
         }
         const blob = new Blob([ev.data], { type: "image/jpeg" });
         const url = URL.createObjectURL(blob);
         if (imgRef.current) imgRef.current.src = url;
-        // Revoke the previous URL after the browser has painted the new one
         const prev = objectUrlRef.current;
         objectUrlRef.current = url;
         if (prev) setTimeout(() => URL.revokeObjectURL(prev), 100);
@@ -144,7 +149,9 @@ function CameraTile({ state, onDisconnect }) {
     open();
     return () => {
       closed = true;
-      try { ws && ws.close(); } catch (_e) { /* ignore */ }
+      try { ws && ws.close(); } catch (e) {
+        if (process.env.NODE_ENV === "development") console.error("[camera ws] close on unmount failed", e);
+      }
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     };
   }, [state.camera_id]);

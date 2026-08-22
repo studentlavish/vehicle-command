@@ -109,10 +109,17 @@ export default function Dashboard() {
         });
       };
       ws.onclose = () => { if (!closed) setTimeout(open, 3000); };
-      ws.onerror = () => { try { ws.close(); } catch (_e) { /* ignore */ } };
+      ws.onerror = (err) => {
+        if (process.env.NODE_ENV === "development") console.error("[events ws] error", err);
+        try { ws.close(); } catch (e) {
+          if (process.env.NODE_ENV === "development") console.error("[events ws] close after error failed", e);
+        }
+      };
     };
     open();
-    return () => { closed = true; try { ws && ws.close(); } catch (_e) { /* ignore */ } };
+    return () => { closed = true; try { ws && ws.close(); } catch (e) {
+      if (process.env.NODE_ENV === "development") console.error("[events ws] close on unmount failed", e);
+    } };
   }, []);
 
   return (
