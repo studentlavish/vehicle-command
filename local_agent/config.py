@@ -39,8 +39,8 @@ class AgentConfig:
             camera_id=os.environ.get("CAMERA_ID", "CAM-01"),
             camera_name=os.environ.get("CAMERA_NAME", "Phone Camera"),
             camera_source=req("CAMERA_SOURCE"),
-            fps=int(os.environ.get("AGENT_FPS", "10")),
-            jpeg_quality=int(os.environ.get("JPEG_QUALITY", "70")),
-            frame_width=int(os.environ.get("FRAME_WIDTH", "1280")),
-            frame_height=int(os.environ.get("FRAME_HEIGHT", "720")),
+            fps=int(os.environ.get("AGENT_FPS", "8")),
+            jpeg_quality=int(os.environ.get("JPEG_QUALITY", "55")),
+            frame_width=int(os.environ.get("FRAME_WIDTH", "960")),
+            frame_height=int(os.environ.get("FRAME_HEIGHT", "540")),
         )

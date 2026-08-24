@@ -47,6 +47,17 @@ Premium AI-powered Car Showroom Vehicle Management System for a modern automobil
 - Company-wide multi-branch tenancy.
 - Advanced dashboard filters (branch, vehicle model, dwell time).
 - Excel automation for vehicle imports.
+- Add `type: "entry_saved"` companion event on `/api/ws/events` so Live Monitoring pops a toast per plate capture.
+
+## What's Been Implemented (2026-02-08)
+- **Cloudflare-safe Local Camera Agent transport**:
+  - Local Agent (`/app/local_agent/`) now sends camera frames as **binary WebSocket frames** with a length-prefixed JSON header, avoiding Cloudflare's large text-frame limits that were dropping the connection with HTTP 520 / WS 1006 on production.
+  - Backend `/api/agent/ws` accepts both binary (preferred) and legacy base64 JSON (backward-compatible) frame paths.
+  - Added application-level ping/pong (~10s) on top of websockets `ping_interval=15` to keep idle Cloudflare proxies from killing the socket.
+  - Default agent config lowered to 960×540 @ JPEG q55 @ 8 fps for safer proxy compatibility.
+  - Failed `safe_send` now closes the socket to trigger the built-in reconnect backoff instead of silently swallowing the error.
+- Verified with a python WS client against the preview URL: binary frame ingest, legacy base64 frame ingest, ping→pong, 12-frame burst, heartbeat, and clean disconnect — all pass.
+- **Production redeploy required** to push this fix live.
 
 ## Test Credentials
 See `/app/memory/test_credentials.md`.

@@ -1440,7 +1440,13 @@ async def agent_disconnect_http(agent_id: str, user: dict = Depends(require_role
 
 @app.websocket("/api/agent/ws")
 async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default=None), secret: Optional[str] = Query(default=None)):
-    """Outbound WSS endpoint for the Windows Local Camera Agent."""
+    """Outbound WSS endpoint for the Windows Local Camera Agent.
+
+    Accepts two frame delivery modes for Cloudflare-compatibility:
+      1. Legacy JSON text frame:  {"type":"frame","camera_id":..,"jpeg_b64":".."}
+      2. Binary frame (preferred): [4-byte BE header-len][utf-8 JSON header][raw JPEG]
+         header must include {"type":"frame","camera_id":..,"name":..,"seq":..,"ts":..}
+    """
     await websocket.accept()
     hdr_secret = websocket.headers.get("x-agent-secret", "")
     if not _authorize_agent(secret or hdr_secret):
@@ -1459,9 +1465,45 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
     logger.info("[agent %s] connected", active_agent_id or "?")
 
     import base64 as _b64
+    import struct as _struct
+
+    async def _handle_frame(cam_id: str, jpeg: bytes, name: str) -> None:
+        if not cam_id or not jpeg:
+            return
+        if cam_id not in cameras_registered:
+            camera_manager.register_agent_camera(cam_id, label=name or cam_id, agent_id=active_agent_id or "")
+            cameras_registered.add(cam_id)
+        camera_manager.push_frame(cam_id, jpeg)
+
     try:
         while True:
-            raw = await websocket.receive_text()
+            event = await websocket.receive()
+            # WebSocket disconnected
+            if event.get("type") == "websocket.disconnect":
+                break
+
+            # ---- Binary path (preferred) ----
+            if "bytes" in event and event["bytes"] is not None:
+                data: bytes = event["bytes"]
+                if len(data) < 4:
+                    continue
+                try:
+                    (hlen,) = _struct.unpack(">I", data[:4])
+                    if hlen <= 0 or hlen > len(data) - 4 or hlen > 8192:
+                        continue
+                    header = json.loads(data[4:4 + hlen].decode("utf-8"))
+                    jpeg = data[4 + hlen:]
+                except Exception:
+                    continue
+                if header.get("type") != "frame":
+                    continue
+                await _handle_frame(header.get("camera_id", ""), jpeg, header.get("name", ""))
+                continue
+
+            # ---- Text path (control + legacy frames) ----
+            raw = event.get("text")
+            if raw is None:
+                continue
             try:
                 msg = json.loads(raw) if raw else {}
             except Exception:
@@ -1502,7 +1544,15 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     await db.agents.update_one({"agent_id": active_agent_id},
                                                {"$set": {"last_heartbeat": now_utc().isoformat(), "status": "online"}})
 
+            elif mtype == "ping":
+                # App-level keep-alive from the agent — reply so the proxy sees traffic
+                try:
+                    await websocket.send_json({"type": "pong", "ts": msg.get("ts")})
+                except Exception:
+                    pass
+
             elif mtype == "frame":
+                # Legacy base64 JSON path (backward compat)
                 cam_id = msg.get("camera_id")
                 b64 = msg.get("jpeg_b64", "")
                 if not cam_id or not b64:
@@ -1511,10 +1561,7 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     jpeg = _b64.b64decode(b64)
                 except Exception:
                     continue
-                if cam_id not in cameras_registered:
-                    camera_manager.register_agent_camera(cam_id, label=msg.get("name", cam_id), agent_id=active_agent_id or "")
-                    cameras_registered.add(cam_id)
-                camera_manager.push_frame(cam_id, jpeg)
+                await _handle_frame(cam_id, jpeg, msg.get("name", ""))
 
             else:
                 await websocket.send_json({"type": "error", "message": f"unknown type: {mtype}"})

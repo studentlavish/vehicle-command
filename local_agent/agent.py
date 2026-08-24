@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import platform
@@ -18,7 +17,7 @@ from typing import Optional
 
 from config import AgentConfig
 from camera import CameraCapture
-from connection import CloudConnection
+from connection import CloudConnection, pack_binary_frame
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +47,7 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
         seq = 0
         last_status: Optional[str] = None
         last_heartbeat = 0.0
+        last_app_ping = 0.0
         while not stop_evt.is_set():
             t0 = time.time()
             frame_jpeg = None
@@ -68,17 +68,16 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
                     })
                     last_status = "online"
                 seq += 1
-                b64 = base64.b64encode(frame_jpeg).decode("ascii")
-                await conn.safe_send({
+                header = {
                     "type": "frame",
                     "camera_id": cfg.camera_id,
                     "name": cfg.camera_name,
                     "seq": seq,
                     "ts": now,
-                    "jpeg_b64": b64,
-                })
+                }
+                await conn.safe_send_binary(pack_binary_frame(header, frame_jpeg))
                 if seq % (cfg.fps * 5 or 1) == 0:
-                    log.info("[STREAM] %s frames=%d", cfg.camera_id, seq)
+                    log.info("[STREAM] %s frames=%d bytes=%d", cfg.camera_id, seq, len(frame_jpeg))
             else:
                 if last_status != "offline":
                     log.warning("[CAMERA] %s offline", cfg.camera_id)
@@ -96,6 +95,11 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
                 await conn.safe_send({"type": "heartbeat", "agent_id": cfg.agent_id})
                 last_heartbeat = now
                 log.debug("[HEARTBEAT] OK")
+
+            # App-level ping every ~10s keeps Cloudflare from killing idle WS
+            if now - last_app_ping >= 10:
+                await conn.safe_send({"type": "ping", "ts": now})
+                last_app_ping = now
 
             delay = interval - (time.time() - t0)
             if delay > 0:

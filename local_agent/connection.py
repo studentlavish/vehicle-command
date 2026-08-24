@@ -5,11 +5,24 @@ import asyncio
 import base64
 import json
 import logging
+import struct
 from typing import Any, Dict, Optional
 
 import websockets
 
 log = logging.getLogger("vashu_agent.connection")
+
+# Binary frame wire format:
+#   [4 bytes big-endian uint32 = header length]
+#   [utf-8 JSON header bytes]
+#   [raw JPEG bytes]
+# Header MUST contain: {"type":"frame","camera_id":..., "name":..., "seq":..., "ts":...}
+BINARY_HEADER_STRUCT = struct.Struct(">I")
+
+
+def pack_binary_frame(header: Dict[str, Any], jpeg: bytes) -> bytes:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return BINARY_HEADER_STRUCT.pack(len(header_bytes)) + header_bytes + jpeg
 
 
 class CloudConnection:
@@ -35,13 +48,23 @@ class CloudConnection:
 
     async def connect_and_run(self, hello_payload: Dict[str, Any]) -> None:
         log.info("[AGENT] connecting to cloud")
-        async with websockets.connect(self.url, max_size=20 * 1024 * 1024, ping_interval=20, ping_timeout=20) as ws:
+        # ping_interval=15 keeps Cloudflare from killing idle WS
+        async with websockets.connect(
+            self.url,
+            max_size=20 * 1024 * 1024,
+            ping_interval=15,
+            ping_timeout=20,
+            close_timeout=5,
+        ) as ws:
             self._ws = ws
             self._reset_backoff()
             log.info("[AGENT] Connected to cloud")
             await self._send_raw(hello_payload)
             try:
                 async for raw in ws:
+                    # Ignore binary messages from server (none expected)
+                    if isinstance(raw, (bytes, bytearray)):
+                        continue
                     try:
                         msg = json.loads(raw)
                     except Exception:
@@ -55,19 +78,45 @@ class CloudConnection:
                             raise PermissionError("cloud rejected agent credentials")
                     elif mtype == "registered":
                         log.info("[AGENT] registered agent_id=%s", msg.get("agent_id"))
+                    elif mtype == "pong":
+                        log.debug("[PONG] app-level")
             finally:
                 self._ws = None
                 log.info("[AGENT] Disconnected")
 
-    async def safe_send(self, payload: Dict[str, Any]) -> None:
+    async def safe_send(self, payload: Dict[str, Any]) -> bool:
         ws = self._ws
         if ws is None:
-            return
+            return False
         async with self._send_lock:
             try:
                 await ws.send(json.dumps(payload))
+                return True
             except Exception as e:
-                log.warning("[AGENT] send failed: %s", e)
+                log.warning("[AGENT] send failed: %s — closing to trigger reconnect", e)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                return False
+
+    async def safe_send_binary(self, data: bytes) -> bool:
+        ws = self._ws
+        if ws is None:
+            return False
+        async with self._send_lock:
+            try:
+                await ws.send(data)
+                return True
+            except Exception as e:
+                log.warning("[AGENT] binary send failed: %s — closing to trigger reconnect", e)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+                return False
 
     async def _send_raw(self, payload: Dict[str, Any]) -> None:
         if self._ws is None:
@@ -93,7 +142,6 @@ class CloudConnection:
                 "hostname": "probe", "platform": "windows", "version": "1.0.0",
             }))
             await ws.send(json.dumps({"type": "heartbeat", "agent_id": agent_id}))
-            # give the server a moment to ack
             try:
                 await asyncio.wait_for(ws.recv(), timeout=2)
             except asyncio.TimeoutError:
@@ -108,7 +156,8 @@ class CloudConnection:
             await ws.send(json.dumps({
                 "type": "camera_status", "camera_id": camera_id, "name": camera_name, "status": "online",
             }))
-            await ws.send(json.dumps({
+            # Send as binary frame
+            header = {
                 "type": "frame", "camera_id": camera_id, "name": camera_name, "seq": 1, "ts": 0,
-                "jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
-            }))
+            }
+            await ws.send(pack_binary_frame(header, jpeg))
