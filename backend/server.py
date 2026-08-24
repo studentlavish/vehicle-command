@@ -326,6 +326,7 @@ class SettingsIn(BaseModel):
     twilio_token: Optional[str] = None
     twilio_from: Optional[str] = None
     twilio_to: Optional[str] = None
+    digest_extra_emails: Optional[List[str]] = None
 
 
 # ===================== Auth Routes =====================
@@ -1078,6 +1079,7 @@ DEFAULT_SETTINGS = {
     "twilio_token": "",
     "twilio_from": "",
     "twilio_to": "",
+    "digest_extra_emails": [],
 }
 
 
@@ -1945,6 +1947,179 @@ async def startup():
     asyncio.create_task(start_auto_detection_loop(camera_manager, db=db, interval_seconds=3.0))
     # 180-day retention cleanup — runs immediately + every 24h
     asyncio.create_task(_retention_loop(interval_hours=24.0))
+
+
+# ===================== Daily Digest Email (cron) =====================
+from email_utils import send_email as _send_email  # noqa: E402
+
+WEBHOOK_CRON_SECRET = os.environ.get("WEBHOOK_CRON_SECRET", "")
+_digest_seen_run_ids: set[str] = set()
+
+
+def _fmt_hms(seconds: Optional[float]) -> str:
+    if not seconds or seconds <= 0:
+        return "0m"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+async def _collect_digest_stats() -> dict:
+    """Compute yesterday's showroom summary in Asia/Kolkata."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Asia/Kolkata")
+    now_ist = datetime.now(tz)
+    yday = (now_ist - timedelta(days=1)).date()
+    day_start = datetime.combine(yday, datetime.min.time(), tzinfo=tz).astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    lo, hi = day_start.isoformat(), day_end.isoformat()
+
+    entries = await db.visit_sessions.count_documents({"entry_time": {"$gte": lo, "$lt": hi}})
+    exits = await db.visit_sessions.count_documents({"exit_time": {"$gte": lo, "$lt": hi}})
+    unique = len(await db.visit_sessions.distinct("vehicle_number", {"entry_time": {"$gte": lo, "$lt": hi}}))
+    # Avg dwell time (completed sessions with entry yesterday)
+    pipeline = [
+        {"$match": {"entry_time": {"$gte": lo, "$lt": hi}, "status": "completed", "duration_seconds": {"$gt": 0}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$duration_seconds"}, "max": {"$max": "$duration_seconds"}}},
+    ]
+    dwell = await db.visit_sessions.aggregate(pipeline).to_list(1)
+    avg_dwell = dwell[0]["avg"] if dwell else 0
+    max_dwell = dwell[0]["max"] if dwell else 0
+    # Busiest camera by entries
+    cam_pipeline = [
+        {"$match": {"entry_time": {"$gte": lo, "$lt": hi}, "entry_camera": {"$ne": ""}}},
+        {"$group": {"_id": "$entry_camera", "n": {"$sum": 1}}},
+        {"$sort": {"n": -1}}, {"$limit": 1},
+    ]
+    busiest = await db.visit_sessions.aggregate(cam_pipeline).to_list(1)
+    return {
+        "date": yday.isoformat(),
+        "entries": entries,
+        "exits": exits,
+        "unique_vehicles": unique,
+        "avg_dwell": _fmt_hms(avg_dwell),
+        "max_dwell": _fmt_hms(max_dwell),
+        "busiest_camera": busiest[0]["_id"] if busiest else "—",
+        "busiest_camera_count": busiest[0]["n"] if busiest else 0,
+    }
+
+
+def _render_digest_html(s: dict) -> str:
+    from html import escape as _esc
+    date_str = _esc(s["date"])
+    busiest = f"{s['busiest_camera']} ({s['busiest_camera_count']})"
+    return (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="background:#0f172a;font-family:Arial,sans-serif;color:#e2e8f0">'
+        '<tr><td align="center" style="padding:32px 12px">'
+        '<table role="presentation" width="560" cellpadding="0" cellspacing="0" '
+        'style="max-width:560px;background:#111827;border:1px solid #1f2937;border-radius:14px">'
+        '<tr><td style="padding:24px 24px 8px 24px">'
+        '<div style="font-size:11px;letter-spacing:2px;color:#60a5fa;text-transform:uppercase">'
+        'Vashu Hyundai &middot; Daily Digest</div>'
+        f'<h1 style="margin:8px 0 4px 0;font-size:22px;color:#f8fafc">{date_str} &middot; Showroom Recap</h1>'
+        '<p style="margin:0;color:#94a3b8;font-size:13px">Yesterday\'s vehicle traffic at a glance.</p>'
+        '</td></tr>'
+        '<tr><td style="padding:16px 24px">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+        + _metric_cell("Entries", s["entries"]) + _metric_cell("Exits", s["exits"])
+        + '</table>'
+        + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
+        + _metric_cell("Unique Vehicles", s["unique_vehicles"]) + _metric_cell("Avg Dwell", s["avg_dwell"])
+        + '</table>'
+        + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
+        + _metric_cell("Longest Dwell", s["max_dwell"]) + _metric_cell("Busiest Camera", busiest)
+        + '</table>'
+        + '</td></tr>'
+        + '<tr><td style="padding:8px 24px 24px 24px;color:#64748b;font-size:11px;line-height:1.5">'
+        + 'Sent by Vashu Hyundai &middot; AI Vehicle Management System. We never ask for your password or payment details by email.'
+        + '</td></tr>'
+        + '</table></td></tr></table>'
+    )
+
+
+def _metric_cell(label: str, value) -> str:
+    from html import escape as _esc
+    return (
+        '<td width="50%" style="padding:6px" valign="top">'
+        '<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:14px">'
+        f'<div style="font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1.5px">{_esc(label)}</div>'
+        f'<div style="font-size:22px;color:#f8fafc;font-weight:700;margin-top:4px">{_esc(str(value))}</div>'
+        '</div></td>'
+    )
+
+
+async def _digest_recipients() -> List[str]:
+    """Union of admin/manager user emails + settings.digest_extra_emails."""
+    emails: set[str] = set()
+    async for u in db.users.find({"role": {"$in": ["admin", "manager"]}, "status": {"$ne": "inactive"}}, {"email": 1}):
+        e = (u.get("email") or "").strip().lower()
+        if e:
+            emails.add(e)
+    doc = await db.settings.find_one({"key": "app"}) or {}
+    for e in (doc.get("digest_extra_emails") or []):
+        e = str(e or "").strip().lower()
+        if e:
+            emails.add(e)
+    return sorted(emails)
+
+
+async def _run_digest_send(run_id: str) -> None:
+    try:
+        stats = await _collect_digest_stats()
+        recipients = await _digest_recipients()
+        if not recipients:
+            logger.info("[digest %s] no recipients — skipped", run_id)
+            return
+        html = _render_digest_html(stats)
+        subject = f"Vashu Hyundai · Daily Digest — {stats['date']}"
+        sent = 0
+        for to_addr in recipients:
+            try:
+                await _send_email(to=to_addr, subject=subject, html=html)
+                sent += 1
+            except Exception as e:
+                logger.warning("[digest %s] send to %s failed: %s", run_id, to_addr, e)
+        logger.info("[digest %s] sent %d/%d for %s", run_id, sent, len(recipients), stats["date"])
+    except Exception:
+        logger.exception("[digest %s] failed", run_id)
+
+
+@app.post("/api/cron/digest")
+async def cron_digest(request: Request):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    auth = request.headers.get("authorization", "")
+    if not WEBHOOK_CRON_SECRET or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = auth.split(" ", 1)[1].strip()
+    if not pysecrets.compare_digest(token, WEBHOOK_CRON_SECRET):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        env = await request.json()
+    except Exception:
+        env = {}
+    run_id = request.headers.get("x-webhook-id") or (env.get("run_id") if isinstance(env, dict) else "") or str(uuid.uuid4())
+    # Idempotency
+    if run_id in _digest_seen_run_ids:
+        return {"ok": True, "duplicate": True, "run_id": run_id}
+    _digest_seen_run_ids.add(run_id)
+    if len(_digest_seen_run_ids) > 500:
+        # avoid unbounded growth
+        _digest_seen_run_ids.clear()
+        _digest_seen_run_ids.add(run_id)
+    asyncio.create_task(_run_digest_send(run_id))
+    return {"ok": True, "queued": True, "run_id": run_id}
+
+
+@app.post("/api/cron/digest/preview")
+async def cron_digest_preview(user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """Admin-only manual trigger for testing the digest without waiting for the cron."""
+    stats = await _collect_digest_stats()
+    recipients = await _digest_recipients()
+    return {"stats": stats, "recipients": recipients}
 
 
 @app.on_event("shutdown")

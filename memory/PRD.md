@@ -47,11 +47,17 @@ Premium AI-powered Car Showroom Vehicle Management System for a modern automobil
 - Advanced dashboard filters (branch, vehicle model, dwell time).
 - Excel automation for vehicle imports.
 
-## What's Been Implemented (2026-02-08 · Session +1)
-- **Multi-Camera Local Agent**: `AGENT_CAMERAS_JSON` / `AGENT_CAMERAS_FILE` env lets one Windows agent stream N cameras (USB / RTSP / MJPEG) over a single WSS connection. Each entry supports its own `id`, `name`, `source`, `width/height/fps/jpeg_quality`; legacy `CAMERA_ID/NAME/SOURCE` single-camera env is preserved.
-- **Entry Toast Event**: Live Monitoring page subscribes to `/api/ws/events` and pops a sonner toast (plate + owner + entry camera) the moment the auto-detection pipeline saves an entry.
-- **Agent Health Card**: New `AgentHealthCard.jsx` on the Dashboard polls `/api/agent/status` every 15s and lists each connected local agent with hostname, camera count, last-heartbeat ("Ns ago"/"Nm ago"/"Nd ago") and Online/Offline pill.
-- **180-day Retention Worker**: `_retention_loop` runs on startup and every 24h — deletes `visit_sessions.entry_time < now-180d` and unlinks the associated `/api/snapshots/*.jpg` files. Verified: purged 58 stale sessions on boot.
+## What's Been Implemented (2026-02-08 · Session +2)
+- **Auto Master Enrichment**: When YOLO+Gemini records an entry for a brand-new plate, Live Monitoring now pops a modal (`AutoMasterEnrichModal.jsx`) with the plate + entry snapshot and prompts the operator for Owner Name / Phone / Model. Saved via existing `PATCH /api/vehicles/master/{vn}`. New plates arriving in bursts are queued so the operator handles them one at a time.
+- **Camera Snapshots Gallery**: `VehicleDetail.jsx` now shows a horizontal strip of the latest entry snapshots (`/api/snapshots/*.jpg`) with click-to-enlarge lightbox for quick visual audit. Auto-hides when a vehicle has none.
+- **Daily Digest Email** (Emergent-managed Resend):
+  - `backend/email_utils.py` — playbook-compliant guardrail gate (G2/G3), `EMAIL_FROM_NAME="Vashu Hyundai"` from env.
+  - `POST /api/cron/digest` — Bearer-auth (`WEBHOOK_CRON_SECRET`), idempotent by run_id, immediately acks 2xx and queues the send.
+  - `POST /api/cron/digest/preview` — admin-only manual trigger (returns stats + recipients).
+  - `.emergent/crons.yml` — cadence `0 9 * * *` Asia/Kolkata.
+  - Recipients = admin+manager users in DB ∪ `settings.digest_extra_emails` (editable via existing `PUT /api/settings`).
+  - HTML template: yesterday's Entries · Exits · Unique Vehicles · Avg Dwell · Longest Dwell · Busiest Camera.
+- **Live Occupancy Chart**: New `LiveOccupancyChart.jsx` on the Dashboard shows a rolling 2-hour sparkline of cars inside; polls `/api/dashboard/stats` every 30s and pushes an immediate sample whenever an entry.recorded event bumps `stats.cars_inside.value`.
 
 ## Test Credentials
 See `/app/memory/test_credentials.md`.

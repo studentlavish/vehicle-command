@@ -1,0 +1,9 @@
+crons:
+  - name: daily-digest
+    description: "Sends Vashu Hyundai managers a morning digest of yesterday's showroom traffic at 9:00 IST"
+    cron: "0 9 * * *"
+    timezone: "Asia/Kolkata"
+    endpoint: "{{BASE_URL}}/api/cron/digest"
+    method: POST
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    enabled: true

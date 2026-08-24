@@ -183,6 +183,9 @@ export default function VehicleDetail() {
         <MetricPill label="Total Sessions" value={s.overall_visits} testId="metric-total" />
       </div>
 
+      {/* Latest entry snapshots gallery */}
+      <SnapshotStrip sessions={sessions} vehicleNumber={m.vehicle_number} />
+
       {/* Range filters + Export */}
       <div className="flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
         <RangeFilters value={range} onChange={setRange} customFrom={customFrom} customTo={customTo} onCustom={(f, t) => { setCustomFrom(f); setCustomTo(t); setRange("custom"); }} />
@@ -264,6 +267,55 @@ function MetricPill({ label, value, testId }) {
     <div className="glass rounded-xl p-4" data-testid={testId}>
       <div className="text-[11px] uppercase tracking-widest text-slate-400">{label}</div>
       <div className="text-xl font-bold mt-1">{value}</div>
+    </div>
+  );
+}
+
+function SnapshotStrip({ sessions, vehicleNumber }) {
+  const base = process.env.REACT_APP_BACKEND_URL || "";
+  const [preview, setPreview] = React.useState(null);
+  const shots = (sessions || [])
+    .filter((s) => s.entry_image && String(s.entry_image).startsWith("/api/snapshots/"))
+    .slice(0, 8);
+  if (shots.length === 0) return null;
+  return (
+    <div className="glass rounded-2xl p-5" data-testid="snapshot-strip">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <CameraIcon className="h-4 w-4 text-blue-400" />
+          <h3 className="font-semibold">Latest Entry Snapshots</h3>
+        </div>
+        <div className="text-[11px] text-slate-400">{shots.length} of {sessions.length}</div>
+      </div>
+      <div className="flex gap-3 overflow-x-auto pb-1">
+        {shots.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => setPreview(`${base}${s.entry_image}`)}
+            className="shrink-0 w-40 group"
+            data-testid={`snap-${s.id}`}
+          >
+            <div className="rounded-xl overflow-hidden border border-white/10 aspect-video bg-black/30 group-hover:border-blue-500/40 transition-colors">
+              <img
+                src={`${base}${s.entry_image}`}
+                alt={`${vehicleNumber} entry`}
+                className="w-full h-full object-cover"
+                loading="lazy"
+              />
+            </div>
+            <div className="text-[11px] text-slate-400 mt-1 font-mono truncate">{formatTime(s.entry_time)}</div>
+          </button>
+        ))}
+      </div>
+      {preview ? (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6"
+          onClick={() => setPreview(null)}
+          data-testid="snap-preview-overlay"
+        >
+          <img src={preview} alt="snapshot preview" className="max-w-[92vw] max-h-[88vh] rounded-xl border border-white/10" />
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -4,6 +4,7 @@ import api from "@/lib/api";
 import StatCard from "@/components/StatCard";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
 import AgentHealthCard from "@/components/AgentHealthCard";
+import LiveOccupancyChart from "@/components/LiveOccupancyChart";
 import {
   LogIn as LogInIcon,
   LogOut,
@@ -285,8 +286,11 @@ export default function Dashboard() {
 
       <VehicleDetailsDialog vehicle={selected} open={open} onOpenChange={setOpen} />
 
-      {/* Local Windows Camera Agents — health snapshot */}
-      <AgentHealthCard />
+      {/* Live occupancy sparkline + Local Windows Camera Agents */}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <LiveOccupancyChart liveValue={stats?.cars_inside?.value} />
+        <AgentHealthCard />
+      </div>
     </div>
   );
 }

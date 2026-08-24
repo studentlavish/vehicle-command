@@ -1,10 +1,11 @@
-import React from "react";
+import React, { useState } from "react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import PlateScanCard from "@/components/PlateScanCard";
 import CameraGrid from "@/components/CameraGrid";
+import AutoMasterEnrichModal from "@/components/AutoMasterEnrichModal";
 import { Camera, RadioTower, ScanLine, RefreshCw, Sparkles, CarFront } from "lucide-react";
 
 const CAMS = [
@@ -15,6 +16,13 @@ const CAMS = [
 ];
 
 export default function LiveMonitoring() {
+  // Queue of brand-new plates awaiting owner enrichment
+  const [pendingEnrich, setPendingEnrich] = useState([]);
+
+  const resolveEnrich = (vehicleNumber) => {
+    setPendingEnrich((prev) => prev.filter((p) => p.vehicle_number !== vehicleNumber));
+  };
+
   // Subscribe to the event bus and show a toast the moment a plate is auto-recorded
   React.useEffect(() => {
     const base = process.env.REACT_APP_BACKEND_URL;
@@ -38,6 +46,17 @@ export default function LiveMonitoring() {
           </div>,
           { icon: <CarFront className="h-4 w-4 text-emerald-400" />, duration: 4500 }
         );
+
+        // If this is a brand-new plate, queue it for operator enrichment
+        if (msg.owner_status === "new" && plate && plate !== "—") {
+          const snapshot = (msg.session && msg.session.entry_image)
+            ? `${process.env.REACT_APP_BACKEND_URL}${msg.session.entry_image}`
+            : "";
+          setPendingEnrich((prev) => {
+            if (prev.some((p) => p.vehicle_number === plate)) return prev;
+            return [...prev, { vehicle_number: plate, snapshot }];
+          });
+        }
       };
       ws.onclose = () => { if (!closed) setTimeout(open, 3000); };
       ws.onerror = () => { try { ws.close(); } catch (e) { /* ignore */ } };
@@ -48,6 +67,7 @@ export default function LiveMonitoring() {
 
   return (
     <div className="space-y-6" data-testid="live-page">
+      <AutoMasterEnrichModal pending={pendingEnrich} onResolved={resolveEnrich} />
       <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
         <div>
           <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.25em] text-blue-400/80">
