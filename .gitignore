@@ -93,3 +93,6 @@ frontend/node_modules/.cache/default-development/5.pack
 frontend/node_modules/.cache/default-development/5.pack
 frontend/node_modules/.cache/default-development/0.pack
 frontend/node_modules/.cache/default-development/1.pack
+.env
+.env.*
+*.env
