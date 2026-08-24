@@ -43,21 +43,15 @@ Premium AI-powered Car Showroom Vehicle Management System for a modern automobil
 - Role-based login for manager/security accounts.
 
 ## P2 Backlog
-- Real-time push (SSE/WebSocket) to update dashboard stats.
 - Company-wide multi-branch tenancy.
 - Advanced dashboard filters (branch, vehicle model, dwell time).
 - Excel automation for vehicle imports.
-- Add `type: "entry_saved"` companion event on `/api/ws/events` so Live Monitoring pops a toast per plate capture.
 
-## What's Been Implemented (2026-02-08)
-- **Cloudflare-safe Local Camera Agent transport**:
-  - Local Agent (`/app/local_agent/`) now sends camera frames as **binary WebSocket frames** with a length-prefixed JSON header, avoiding Cloudflare's large text-frame limits that were dropping the connection with HTTP 520 / WS 1006 on production.
-  - Backend `/api/agent/ws` accepts both binary (preferred) and legacy base64 JSON (backward-compatible) frame paths.
-  - Added application-level ping/pong (~10s) on top of websockets `ping_interval=15` to keep idle Cloudflare proxies from killing the socket.
-  - Default agent config lowered to 960×540 @ JPEG q55 @ 8 fps for safer proxy compatibility.
-  - Failed `safe_send` now closes the socket to trigger the built-in reconnect backoff instead of silently swallowing the error.
-- Verified with a python WS client against the preview URL: binary frame ingest, legacy base64 frame ingest, ping→pong, 12-frame burst, heartbeat, and clean disconnect — all pass.
-- **Production redeploy required** to push this fix live.
+## What's Been Implemented (2026-02-08 · Session +1)
+- **Multi-Camera Local Agent**: `AGENT_CAMERAS_JSON` / `AGENT_CAMERAS_FILE` env lets one Windows agent stream N cameras (USB / RTSP / MJPEG) over a single WSS connection. Each entry supports its own `id`, `name`, `source`, `width/height/fps/jpeg_quality`; legacy `CAMERA_ID/NAME/SOURCE` single-camera env is preserved.
+- **Entry Toast Event**: Live Monitoring page subscribes to `/api/ws/events` and pops a sonner toast (plate + owner + entry camera) the moment the auto-detection pipeline saves an entry.
+- **Agent Health Card**: New `AgentHealthCard.jsx` on the Dashboard polls `/api/agent/status` every 15s and lists each connected local agent with hostname, camera count, last-heartbeat ("Ns ago"/"Nm ago"/"Nd ago") and Online/Offline pill.
+- **180-day Retention Worker**: `_retention_loop` runs on startup and every 24h — deletes `visit_sessions.entry_time < now-180d` and unlinks the associated `/api/snapshots/*.jpg` files. Verified: purged 58 stale sessions on boot.
 
 ## Test Credentials
 See `/app/memory/test_credentials.md`.

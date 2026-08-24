@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import api from "@/lib/api";
 import StatCard from "@/components/StatCard";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
+import AgentHealthCard from "@/components/AgentHealthCard";
 import {
   LogIn as LogInIcon,
   LogOut,
@@ -283,6 +284,9 @@ export default function Dashboard() {
       </div>
 
       <VehicleDetailsDialog vehicle={selected} open={open} onOpenChange={setOpen} />
+
+      {/* Local Windows Camera Agents — health snapshot */}
+      <AgentHealthCard />
     </div>
   );
 }

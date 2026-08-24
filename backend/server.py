@@ -1102,6 +1102,47 @@ async def update_settings(payload: SettingsIn, user: dict = Depends(require_role
 
 
 # ===================== Retention purge =====================
+async def _retention_loop(interval_hours: float = 24.0) -> None:
+    """Background job: prune visit_sessions older than RETENTION_DAYS (180d).
+
+    Runs once immediately on startup, then every `interval_hours` hours.
+    Also removes the corresponding snapshot files from disk.
+    """
+    while True:
+        try:
+            cutoff_dt = now_utc() - timedelta(days=RETENTION_DAYS)
+            cutoff = cutoff_dt.isoformat()
+            # Collect snapshot file names first so we can unlink from disk after DB purge.
+            snapshots_to_delete: list[str] = []
+            async for doc in db.visit_sessions.find(
+                {"entry_time": {"$lt": cutoff}},
+                {"entry_image": 1, "exit_image": 1},
+            ):
+                for k in ("entry_image", "exit_image"):
+                    url = (doc.get(k) or "").strip()
+                    if url.startswith("/api/snapshots/"):
+                        snapshots_to_delete.append(url.rsplit("/", 1)[-1])
+            r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
+            removed_files = 0
+            snap_dir = os.path.join(os.path.dirname(__file__), "snapshots")
+            for name in snapshots_to_delete:
+                fpath = os.path.join(snap_dir, name)
+                try:
+                    if os.path.isfile(fpath):
+                        os.remove(fpath)
+                        removed_files += 1
+                except Exception:
+                    pass
+            if r.deleted_count or removed_files:
+                logger.info(
+                    "[retention] purged %d visit_sessions and %d snapshot files older than %sd",
+                    r.deleted_count, removed_files, RETENTION_DAYS,
+                )
+        except Exception:
+            logger.exception("[retention] loop error")
+        await asyncio.sleep(interval_hours * 3600)
+
+
 @api.post("/maintenance/purge-expired")
 async def purge_expired(user: dict = Depends(get_current_user)):
     """Delete visit sessions older than RETENTION_DAYS."""
@@ -1902,6 +1943,8 @@ async def startup():
     await seed_demo()
     # Kick off automatic YOLO+OCR pipeline in the background
     asyncio.create_task(start_auto_detection_loop(camera_manager, db=db, interval_seconds=3.0))
+    # 180-day retention cleanup — runs immediately + every 24h
+    asyncio.create_task(_retention_loop(interval_hours=24.0))
 
 
 @app.on_event("shutdown")

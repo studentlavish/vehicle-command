@@ -1,10 +1,11 @@
 import React from "react";
 import { motion } from "framer-motion";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import PlateScanCard from "@/components/PlateScanCard";
 import CameraGrid from "@/components/CameraGrid";
-import { Camera, RadioTower, ScanLine, RefreshCw, Sparkles } from "lucide-react";
+import { Camera, RadioTower, ScanLine, RefreshCw, Sparkles, CarFront } from "lucide-react";
 
 const CAMS = [
   { id: 1, name: "Entrance Gate", status: "online", location: "Main Gate" },
@@ -14,6 +15,37 @@ const CAMS = [
 ];
 
 export default function LiveMonitoring() {
+  // Subscribe to the event bus and show a toast the moment a plate is auto-recorded
+  React.useEffect(() => {
+    const base = process.env.REACT_APP_BACKEND_URL;
+    if (!base) return;
+    const wsUrl = base.replace(/^http/, "ws") + "/api/ws/events";
+    let ws;
+    let closed = false;
+    const open = () => {
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type !== "entry.recorded") return;
+        const plate = msg.vehicle_number || "—";
+        const owner = (msg.owner && msg.owner.owner_name) || (msg.owner_status === "new" ? "New visitor" : "Unknown Owner");
+        const cam = msg.camera_id || (msg.session && msg.session.entry_camera) || "";
+        toast.success(
+          <div className="flex flex-col" data-testid="entry-toast">
+            <div className="font-mono font-semibold tracking-wider">{plate}</div>
+            <div className="text-xs text-slate-300">{owner} · Entry recorded{cam ? ` · ${cam}` : ""}</div>
+          </div>,
+          { icon: <CarFront className="h-4 w-4 text-emerald-400" />, duration: 4500 }
+        );
+      };
+      ws.onclose = () => { if (!closed) setTimeout(open, 3000); };
+      ws.onerror = () => { try { ws.close(); } catch (e) { /* ignore */ } };
+    };
+    open();
+    return () => { closed = true; try { ws && ws.close(); } catch (e) { /* ignore */ } };
+  }, []);
+
   return (
     <div className="space-y-6" data-testid="live-page">
       <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
