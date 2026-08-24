@@ -46,6 +46,9 @@ class AgentConfig:
     agent_id: str
     agent_secret: str
     cameras: List[CameraSpec] = field(default_factory=list)
+    # Local YOLO+OCR detection (runs on the showroom PC, off by default)
+    enable_local_detection: bool = False
+    detection_interval_seconds: float = 3.0
 
     # Retained for backward compat (first camera's values)
     @property
@@ -137,4 +140,7 @@ class AgentConfig:
             agent_id=req("VASHU_AGENT_ID"),
             agent_secret=req("VASHU_AGENT_SECRET"),
             cameras=cameras,
+            enable_local_detection=os.environ.get("ENABLE_LOCAL_DETECTION", "false").strip().lower()
+                in ("1", "true", "yes", "on"),
+            detection_interval_seconds=float(os.environ.get("DETECTION_INTERVAL_SECONDS", "3.0")),
         )

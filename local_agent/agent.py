@@ -97,8 +97,9 @@ async def _stream_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
 
 
 async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
-    log.info("[AGENT] starting version=1.1.0 agent_id=%s host=%s cameras=%d",
-             cfg.agent_id, socket.gethostname(), len(cfg.cameras))
+    log.info("[AGENT] starting version=1.2.0 agent_id=%s host=%s cameras=%d local_detection=%s",
+             cfg.agent_id, socket.gethostname(), len(cfg.cameras),
+             "ON" if cfg.enable_local_detection else "off")
     for c in cfg.cameras:
         log.info("[AGENT]  · %s (%s) source=%s @ %dx%d/%dfps q%d",
                  c.id, c.name, _redact(c.source), c.width, c.height, c.fps, c.jpeg_quality)
@@ -121,7 +122,7 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
                     "agent_id": cfg.agent_id,
                     "hostname": socket.gethostname(),
                     "platform": platform.system().lower(),
-                    "version": "1.1.0",
+                    "version": "1.2.0",
                 })
             except Exception as e:
                 log.error("[ERROR] Connection failure: %s", e)
@@ -133,8 +134,23 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
 
     stream_tasks = [_stream_camera(spec, conn, stop_evt) for spec in cfg.cameras]
 
+    # Optional local YOLO+OCR detection — runs at the edge and pushes plate_detected messages.
+    detection_tasks = []
+    if cfg.enable_local_detection:
+        try:
+            from plate_detector import get_detector
+            detector = get_detector()
+        except Exception as e:
+            log.warning("[DETECTOR] disabled — import failed: %s", e)
+            detector = None
+        if detector is not None:
+            detection_tasks = [_detect_camera(spec, conn, stop_evt, detector, cfg.detection_interval_seconds)
+                               for spec in cfg.cameras]
+            log.info("[DETECTOR] local YOLO detection ENABLED on %d camera(s) every %.1fs",
+                     len(cfg.cameras), cfg.detection_interval_seconds)
+
     try:
-        await asyncio.gather(connection_loop(), *stream_tasks)
+        await asyncio.gather(connection_loop(), *stream_tasks, *detection_tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
@@ -142,6 +158,53 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
         await conn.close()
         log.info("[AGENT] stopped")
     return 0
+
+
+async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyncio.Event,
+                          detector, interval_seconds: float) -> None:
+    """Run YOLO+OCR on the latest frame from `spec` every `interval_seconds`.
+
+    Reuses a lightweight throwaway CameraCapture (single-frame poll) so the
+    main stream thread stays untouched. On success, sends a `plate_detected`
+    JSON message with the vehicle crop JPEG.
+    """
+    import base64 as _b64
+    cam = CameraCapture(spec.source, width=spec.width, height=spec.height, target_fps=spec.fps)
+    last_plate: Optional[str] = None
+    last_plate_at: float = 0.0
+    try:
+        while not stop_evt.is_set():
+            await asyncio.sleep(interval_seconds)
+            try:
+                jpeg = await asyncio.to_thread(cam.grab_jpeg, spec.jpeg_quality)
+                if jpeg is None:
+                    continue
+                det = await detector.process_jpeg(jpeg)
+                if det is None:
+                    continue
+                # Local dedup — don't spam the cloud if we're still looking at
+                # the same car. Backend has its own 30s dedup as backstop.
+                now = time.time()
+                if det.plate == last_plate and (now - last_plate_at) < 30:
+                    continue
+                last_plate, last_plate_at = det.plate, now
+                await conn.safe_send({
+                    "type": "plate_detected",
+                    "camera_id": spec.id,
+                    "name": spec.name,
+                    "plate": det.plate,
+                    "confidence": det.confidence,
+                    "vehicle_class": det.vehicle_class,
+                    "vehicle_conf": round(det.vehicle_conf, 3),
+                    "crop_jpeg_b64": _b64.b64encode(det.crop_jpeg).decode("ascii"),
+                    "ts": now,
+                })
+                log.info("[DETECTOR] %s → plate=%s conf=%s vehicle=%s(%.2f)",
+                         spec.id, det.plate, det.confidence, det.vehicle_class, det.vehicle_conf)
+            except Exception as e:
+                log.warning("[DETECTOR] %s error: %s", spec.id, e)
+    finally:
+        cam.release()
 
 
 async def _test_mode(cfg: AgentConfig, spec: CameraSpec, cam: CameraCapture, conn: CloudConnection) -> int:

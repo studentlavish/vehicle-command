@@ -26,7 +26,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 from camera_manager import camera_manager
-from plate_pipeline import start_auto_detection_loop
+from plate_pipeline import start_auto_detection_loop, _persist_entry  # noqa: F401
 from event_bus import event_bus
 
 # Optional integrations
@@ -1651,6 +1651,29 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 except Exception:
                     continue
                 await _handle_frame(cam_id, jpeg, msg.get("name", ""))
+
+            elif mtype == "plate_detected":
+                # Local agent ran YOLO+OCR at the edge and is telling us a
+                # plate was detected — persist + broadcast (no ML needed here).
+                cam_id = msg.get("camera_id", "")
+                plate = (msg.get("plate") or "").upper().strip()
+                b64 = msg.get("crop_jpeg_b64", "")
+                if not cam_id or not plate:
+                    continue
+                try:
+                    crop_jpeg = _b64.b64decode(b64) if b64 else b""
+                except Exception:
+                    crop_jpeg = b""
+                try:
+                    persistence = await _persist_entry(db, cam_id, plate, crop_jpeg)
+                    await websocket.send_json({
+                        "type": "plate_ack",
+                        "plate": plate,
+                        "duplicate": persistence.get("duplicate", False),
+                        "owner_status": persistence.get("owner_status"),
+                    })
+                except Exception:
+                    logger.exception("[agent] persistence failed for plate=%s", plate)
 
             else:
                 await websocket.send_json({"type": "error", "message": f"unknown type: {mtype}"})
