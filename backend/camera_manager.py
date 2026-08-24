@@ -61,7 +61,8 @@ class CameraState:
     frames_captured: int = 0
     error: Optional[str] = None
     subscribers: int = 0
-    # Automatic plate detection (populated by plate_pipeline.start_auto_detection_loop)
+    # Automatic plate detection now runs at the edge inside `local_agent/plate_detector.py`.
+    # The backend receives detections via /api/agent/ws → _persist_entry.
     latest_plate: Optional[Dict[str, Any]] = None
     latest_plate_is_new: bool = False
     _thread: Optional[threading.Thread] = field(default=None, repr=False)

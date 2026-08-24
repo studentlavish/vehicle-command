@@ -26,7 +26,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 from camera_manager import camera_manager
-from plate_pipeline import start_auto_detection_loop, _persist_entry  # noqa: F401
+from plate_pipeline import _persist_entry
 from event_bus import event_bus
 
 # Optional integrations
@@ -2010,9 +2010,10 @@ async def startup():
     await ensure_indexes()
     await seed_admin()
     await seed_demo()
-    # Kick off automatic YOLO+OCR pipeline in the background
-    asyncio.create_task(start_auto_detection_loop(camera_manager, db=db, interval_seconds=3.0))
-    # 180-day retention cleanup — runs immediately + every 24h
+    # NOTE: YOLO/OCR now runs on the showroom PC via /app/local_agent —
+    # the backend only persists `plate_detected` messages arriving on
+    # /api/agent/ws (see _persist_entry). No ML runs here.
+    # 180-day retention cleanup — 1h startup grace, then every 24h.
     asyncio.create_task(_retention_loop(interval_hours=24.0))
 
 
