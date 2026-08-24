@@ -228,8 +228,9 @@ def serialize_session(doc: dict) -> dict:
 
 
 # Backward-compat: existing "vehicle records" table treats each session as a row and joins master info.
-async def serialize_session_with_master(doc: dict) -> dict:
-    master = await db.vehicle_masters.find_one({"vehicle_number": doc["vehicle_number"]})
+async def serialize_session_with_master(doc: dict, master: Optional[dict] = None) -> dict:
+    if master is None:
+        master = await db.vehicle_masters.find_one({"vehicle_number": doc["vehicle_number"]})
     s = serialize_session(doc)
     s["owner_name"] = (master or {}).get("owner_name", "")
     s["contact_number"] = (master or {}).get("phone_number", "")
@@ -241,6 +242,15 @@ async def serialize_session_with_master(doc: dict) -> dict:
     elif s["status"] == "completed":
         s["status"] = "exited"
     return s
+
+
+async def _batch_master_map(docs: list) -> Dict[str, dict]:
+    """Pre-fetch every vehicle_master referenced by a list of sessions in one query."""
+    numbers = list({d["vehicle_number"] for d in docs if d.get("vehicle_number")})
+    if not numbers:
+        return {}
+    masters = await db.vehicle_masters.find({"vehicle_number": {"$in": numbers}}).to_list(len(numbers))
+    return {m["vehicle_number"]: m for m in masters}
 
 
 # ===================== Models =====================
@@ -496,11 +506,29 @@ async def search_masters(q: str, limit: int = 20, user: dict = Depends(get_curre
         ]
     }
     docs = await db.vehicle_masters.find(query).sort("updated_at", -1).to_list(limit)
+    # Batch counts to avoid N+1: one aggregate for totals, one for actives.
+    numbers = [m["vehicle_number"] for m in docs]
+    total_map: Dict[str, int] = {}
+    active_map: Dict[str, int] = {}
+    if numbers:
+        async for row in db.visit_sessions.aggregate([
+            {"$match": {"vehicle_number": {"$in": numbers}}},
+            {"$group": {"_id": "$vehicle_number", "count": {"$sum": 1}}},
+        ]):
+            total_map[row["_id"]] = row["count"]
+        async for row in db.visit_sessions.aggregate([
+            {"$match": {"vehicle_number": {"$in": numbers}, "status": "active"}},
+            {"$group": {"_id": "$vehicle_number", "count": {"$sum": 1}}},
+        ]):
+            active_map[row["_id"]] = row["count"]
     out = []
     for m in docs:
-        total = await db.visit_sessions.count_documents({"vehicle_number": m["vehicle_number"]})
-        active = await db.visit_sessions.count_documents({"vehicle_number": m["vehicle_number"], "status": "active"})
-        out.append({**serialize_master(m), "total_visits": total, "active_visits": active})
+        vn = m["vehicle_number"]
+        out.append({
+            **serialize_master(m),
+            "total_visits": total_map.get(vn, 0),
+            "active_visits": active_map.get(vn, 0),
+        })
     return out
 
 
@@ -624,9 +652,10 @@ async def list_visit_sessions(
     start, end = range_bounds(range, from_, to)
     apply_range_query(query, start, end, field="entry_time")
     docs = await db.visit_sessions.find(query).sort("entry_time", -1).to_list(limit)
+    m_map = await _batch_master_map(docs)
     out = []
     for d in docs:
-        out.append(await serialize_session_with_master(d))
+        out.append(await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])))
     return out
 
 
@@ -659,9 +688,10 @@ async def list_vehicles(
         day = date[:10]
         query["visit_date"] = day
     docs = await db.visit_sessions.find(query).sort("entry_time", -1).to_list(limit)
+    m_map = await _batch_master_map(docs)
     out = []
     for d in docs:
-        out.append(await serialize_session_with_master(d))
+        out.append(await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])))
     return out
 
 
@@ -1104,12 +1134,28 @@ async def update_settings(payload: SettingsIn, user: dict = Depends(require_role
 
 
 # ===================== Retention purge =====================
-async def _retention_loop(interval_hours: float = 24.0) -> None:
+# Auto retention is user-requested ("180-day auto cleanup so old visits and
+# frames stop piling up in Mongo") but can be disabled globally via
+# RETENTION_ENABLED=false if operators want to hold off deletes temporarily.
+RETENTION_ENABLED = os.environ.get("RETENTION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: float = 3600.0) -> None:
     """Background job: prune visit_sessions older than RETENTION_DAYS (180d).
 
-    Runs once immediately on startup, then every `interval_hours` hours.
-    Also removes the corresponding snapshot files from disk.
+    Waits `startup_grace_seconds` (default 1h) after boot before the first
+    purge — this prevents surprise deletes right after a deploy — then runs
+    every `interval_hours` hours. Also removes the corresponding snapshot
+    files from disk. Set env RETENTION_ENABLED=false to disable entirely.
     """
+    if not RETENTION_ENABLED:
+        logger.info("[retention] disabled via RETENTION_ENABLED=false")
+        return
+    # Startup grace so a fresh deploy never nukes data seconds after boot.
+    try:
+        await asyncio.sleep(startup_grace_seconds)
+    except asyncio.CancelledError:
+        return
     while True:
         try:
             cutoff_dt = now_utc() - timedelta(days=RETENTION_DAYS)
@@ -1789,13 +1835,11 @@ async def seed_demo():
             if not verify_password("demo1234", existing["password_hash"]):
                 await db.users.update_one({"_id": existing["_id"]}, {"$set": {"password_hash": hash_password("demo1234")}})
 
-    # Drop legacy 'vehicles' collection from initial MVP if present
-    try:
-        if "vehicles" in await db.list_collection_names():
-            await db.drop_collection("vehicles")
-            logger.info("Dropped legacy 'vehicles' collection")
-    except Exception:
-        pass
+    # Legacy 'vehicles' collection migration was completed on the initial
+    # production deploy; the destructive drop_collection has been removed to
+    # ensure no future startup can accidentally delete data. If any stray
+    # legacy collection ever needs to be removed, do it via the mongo shell
+    # as an explicit, one-shot admin action.
 
     if await db.vehicle_masters.count_documents({}) >= 15:
         return
