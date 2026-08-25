@@ -1687,9 +1687,12 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
             elif mtype == "plate_detected":
                 # Local agent ran YOLO+OCR at the edge and is telling us a
                 # plate was detected — persist + broadcast (no ML needed here).
-                cam_id = msg.get("camera_id", "")
+                cam_id_raw = msg.get("camera_id", "")
+                cam_id = str(cam_id_raw).strip().upper()
                 plate = (msg.get("plate") or "").upper().strip()
                 b64 = msg.get("crop_jpeg_b64", "")
+                plate_b64 = msg.get("plate_jpeg_b64", "")
+                confidence = msg.get("confidence", "medium")
                 if not cam_id or not plate:
                     continue
                 try:
@@ -1697,12 +1700,21 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 except Exception:
                     crop_jpeg = b""
                 try:
-                    persistence = await _persist_entry(db, cam_id, plate, crop_jpeg)
+                    plate_jpeg = _b64.b64decode(plate_b64) if plate_b64 else b""
+                except Exception:
+                    plate_jpeg = b""
+                try:
+                    persistence = await _persist_entry(
+                        db, cam_id, plate, crop_jpeg,
+                        plate_jpeg=plate_jpeg, confidence=confidence,
+                    )
                     await websocket.send_json({
                         "type": "plate_ack",
                         "plate": plate,
                         "duplicate": persistence.get("duplicate", False),
+                        "event": persistence.get("event"),
                         "owner_status": persistence.get("owner_status"),
+                        "session_id": (persistence.get("session") or {}).get("id"),
                     })
                 except Exception:
                     logger.exception("[agent] persistence failed for plate=%s", plate)

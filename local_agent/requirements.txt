@@ -2,10 +2,11 @@ opencv-python-headless>=4.10.0
 websockets>=12.0
 python-dotenv>=1.0.1
 numpy>=1.26.0
-# --- Local AI plate detection (YOLO + Gemini OCR) ---
-# Install these on the showroom PC so plate recognition runs at the edge.
+# --- Local AI plate detection (YOLO + EasyOCR primary, Gemini fallback) ---
+# Install on the showroom PC so plate recognition runs at the edge.
 # If you don't want local detection, set ENABLE_LOCAL_DETECTION=false and skip
 # these packages — the agent will run in frame-streaming-only mode.
 ultralytics>=8.3.0
 torch>=2.2.0
+easyocr>=1.7.1
 httpx>=0.27.0
