@@ -25,7 +25,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
-from camera_manager import camera_manager
+from camera_manager import camera_manager, CameraSourceConflict
 from plate_pipeline import _persist_entry
 from event_bus import event_bus
 
@@ -1434,7 +1434,10 @@ class CameraConnectIn(BaseModel):
 
 @api.get("/cameras")
 async def list_cameras(user: dict = Depends(require_roles(*ROLE_ALL))):
-    return camera_manager.list()
+    # Hide fully-removed / stopped cameras from the UI so the card disappears
+    # when an admin disconnects an obsolete direct-URL camera.
+    all_cams = camera_manager.list()
+    return {cid: st for cid, st in all_cams.items() if st.get("status") != "stopped"}
 
 
 @api.get("/cameras/{camera_id}")
@@ -1447,20 +1450,44 @@ async def get_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE_AL
 
 @api.post("/cameras/connect")
 async def connect_camera(payload: CameraConnectIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    # Refuse to overlay a direct-URL capture on top of an agent-fed camera.
+    # The local agent is the authoritative source for its camera IDs — otherwise
+    # the cloud would try to reach the phone's private LAN IP (e.g. 192.168.x.x).
     try:
         info = camera_manager.connect(payload.camera_id, payload.source, payload.label or "")
         return info
+    except CameraSourceConflict as ce:
+        raise HTTPException(status_code=409, detail=str(ce))
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Camera connect failed: {e}")
 
 
+@api.delete("/cameras/{camera_id}")
+async def delete_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """Fully remove a camera from the registry (stops capture thread if any).
+    Use this to clean up stale duplicates. Agent-fed cameras that are still
+    online will be re-registered on the next frame from the local agent."""
+    ok = camera_manager.remove(camera_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return {"ok": True, "camera_id": camera_id.strip().upper()}
+
+
 @api.post("/cameras/{camera_id}/disconnect")
 async def disconnect_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
-    if not camera_manager.disconnect(camera_id):
+    """Disconnect a camera and remove it from the registry.
+
+    - Direct-URL cameras: capture thread is stopped, entry removed.
+    - Agent-fed cameras: entry removed; the local agent will re-register the
+      camera automatically on the next frame if it's still streaming — so
+      only *stale* agent-fed cameras stay disconnected.
+    """
+    if not camera_manager.remove(camera_id):
         raise HTTPException(status_code=404, detail="Camera not found")
-    return {"ok": True, "camera_id": camera_id}
+    logger.info("[CAMERA] disconnected + removed camera_id=%s by user=%s", camera_id.strip().upper(), user.get("email"))
+    return {"ok": True, "camera_id": camera_id.strip().upper()}
 
 
 def _authorize_ws(token: Optional[str]) -> Optional[dict]:
@@ -1559,9 +1586,12 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
     async def _handle_frame(cam_id: str, jpeg: bytes, name: str) -> None:
         if not cam_id or not jpeg:
             return
-        if cam_id not in cameras_registered:
-            camera_manager.register_agent_camera(cam_id, label=name or cam_id, agent_id=active_agent_id or "")
-            cameras_registered.add(cam_id)
+        cam_id_norm = cam_id.strip().upper()
+        if cam_id_norm not in cameras_registered:
+            camera_manager.register_agent_camera(cam_id_norm, label=name or cam_id_norm, agent_id=active_agent_id or "")
+            cameras_registered.add(cam_id_norm)
+            logger.info("[CAMERA] agent camera registered camera_id=%s agent_id=%s", cam_id_norm, active_agent_id or "?")
+        camera_manager.push_frame(cam_id_norm, jpeg)
         camera_manager.push_frame(cam_id, jpeg)
 
     try:
@@ -1613,13 +1643,15 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 await websocket.send_json({"type": "registered", "agent_id": active_agent_id})
 
             elif mtype == "camera_status":
-                cam_id = msg.get("camera_id")
-                if not cam_id:
+                cam_id_raw = msg.get("camera_id")
+                if not cam_id_raw:
                     continue
+                cam_id = str(cam_id_raw).strip().upper()
                 name = msg.get("name", cam_id)
                 status = msg.get("status", "online")
                 if status == "online":
                     camera_manager.register_agent_camera(cam_id, label=name, agent_id=active_agent_id or "")
+                    logger.info("[CAMERA] agent camera registered camera_id=%s agent_id=%s", cam_id, active_agent_id or "?")
                 else:
                     camera_manager.mark_agent_offline(cam_id, msg.get("error", "agent reported offline"))
                 cameras_registered.add(cam_id)
@@ -1734,11 +1766,17 @@ async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] =
         return
 
     if camera_manager.get(camera_id) is None:
-        await websocket.send_json({"type": "error", "message": f"camera '{camera_id}' not connected. Call /api/cameras/connect first."})
+        await websocket.send_json({
+            "type": "error",
+            "message": (
+                f"camera '{camera_id}' not connected. "
+                "If this is an agent-fed camera, make sure the Local Agent is running and streaming."
+            ),
+        })
         await websocket.close(code=4404)
         return
 
-    logger.info("[ws camera %s] client connected user=%s", camera_id, payload.get("email"))
+    logger.info("[STREAM] browser subscribed camera_id=%s user=%s", camera_id.strip().upper(), payload.get("email"))
 
     # Push initial status
     state = camera_manager.get(camera_id)

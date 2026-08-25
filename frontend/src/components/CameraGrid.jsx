@@ -240,27 +240,29 @@ function CameraTile({ state, onDisconnect }) {
 
 function ConnectCameraDialog({ open, onOpenChange, onConnected }) {
   const [type, setType] = useState("http");
-  const [id, setId] = useState("cam-01");
-  const [label, setLabel] = useState("Front Gate");
+  const [id, setId] = useState("");
+  const [label, setLabel] = useState("");
   const [source, setSource] = useState("");
   const [busy, setBusy] = useState(false);
 
   const preset = PRESETS.find((p) => p.key === type) || PRESETS[0];
 
   const submit = async () => {
-    if (!id.trim() || !source.trim()) {
+    const idTrim = id.trim().toUpperCase();
+    if (!idTrim || !source.trim()) {
       toast.error("Camera ID and Source are required");
       return;
     }
     setBusy(true);
     try {
-      await api.post("/cameras/connect", { camera_id: id.trim(), source: source.trim(), label: label.trim() });
-      toast.success(`Connecting ${id}…`, { description: "Status updates in real-time." });
+      await api.post("/cameras/connect", { camera_id: idTrim, source: source.trim(), label: label.trim() });
+      toast.success(`Connecting ${idTrim}…`, { description: "Status updates in real-time." });
       onConnected?.();
       onOpenChange(false);
-      setSource("");
+      setSource(""); setId(""); setLabel("");
     } catch (e) {
-      toast.error("Connect failed", { description: e.response?.data?.detail || e.message });
+      const detail = e.response?.data?.detail || e.message;
+      toast.error("Connect failed", { description: detail });
     } finally {
       setBusy(false);
     }
@@ -272,6 +274,10 @@ function ConnectCameraDialog({ open, onOpenChange, onConnected }) {
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2"><CamIcon className="h-5 w-5 text-blue-400" /> Connect a Camera</DialogTitle>
         </DialogHeader>
+
+        <div className="rounded-xl border border-blue-500/25 bg-blue-500/5 text-blue-200 text-[11px] leading-relaxed px-3 py-2">
+          <span className="font-semibold">Tip:</span> Cameras streamed by the Windows <span className="font-mono">Local Agent</span> (e.g. Android IP Webcam on the showroom LAN) appear here automatically. Only use this form for cameras the cloud can reach directly (USB on a cloud host, public RTSP, ONVIF).
+        </div>
 
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -287,11 +293,11 @@ function ConnectCameraDialog({ open, onOpenChange, onConnected }) {
           </div>
           <div>
             <Label className="text-slate-300 text-[10px] uppercase tracking-widest">Camera ID</Label>
-            <Input value={id} onChange={(e) => setId(e.target.value)} className="mt-1 bg-white/5 border-white/10 text-white font-mono" placeholder="cam-01" data-testid="camera-id-input" />
+            <Input value={id} onChange={(e) => setId(e.target.value)} className="mt-1 bg-white/5 border-white/10 text-white font-mono" placeholder="e.g. GATE-01" data-testid="camera-id-input" />
           </div>
           <div className="col-span-2">
             <Label className="text-slate-300 text-[10px] uppercase tracking-widest">Label (display name)</Label>
-            <Input value={label} onChange={(e) => setLabel(e.target.value)} className="mt-1 bg-white/5 border-white/10 text-white" placeholder="Front Gate" data-testid="camera-label-input" />
+            <Input value={label} onChange={(e) => setLabel(e.target.value)} className="mt-1 bg-white/5 border-white/10 text-white" placeholder="e.g. Front Gate" data-testid="camera-label-input" />
           </div>
           <div className="col-span-2">
             <Label className="text-slate-300 text-[10px] uppercase tracking-widest">Source</Label>

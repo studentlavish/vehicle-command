@@ -45,6 +45,20 @@ def _parse_source(source: Union[str, int]) -> Union[str, int]:
     return s
 
 
+def _normalize_id(camera_id: str) -> str:
+    """Normalize a camera_id: uppercase + strip whitespace. This prevents
+    accidental duplicates like `cam-01` vs `CAM-01` from coexisting."""
+    return (camera_id or "").strip().upper()
+
+
+def _is_agent_fed(state: "CameraState") -> bool:
+    return isinstance(state.source, str) and state.source.startswith("agent:")
+
+
+class CameraSourceConflict(Exception):
+    """Raised when a direct-connect tries to overwrite an agent-fed camera."""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -96,31 +110,44 @@ class CameraManager:
             return {cid: st.public() for cid, st in self._cams.items()}
 
     def get(self, camera_id: str) -> Optional[CameraState]:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            return self._cams.get(camera_id)
+            return self._cams.get(cid)
 
     # ---------- agent-fed cameras (no local capture thread) ----------
     def register_agent_camera(self, camera_id: str, label: str = "", agent_id: str = "") -> Dict[str, Any]:
         """Register a camera whose frames are pushed from an external Local Agent.
-        No cv2 capture thread is started — frames arrive via push_frame()."""
+        No cv2 capture thread is started — frames arrive via push_frame().
+
+        Agent-fed cameras are the AUTHORITATIVE source of truth for that
+        camera_id: if a direct-URL capture thread was previously running under
+        the same id, it is stopped and its state is replaced.
+        """
+        cid = _normalize_id(camera_id)
         with self._lock:
-            existing = self._cams.get(camera_id)
+            existing = self._cams.get(cid)
             if existing and existing._thread and existing._thread.is_alive():
-                logger.info("[camera %s] already has local capture — agent register skipped", camera_id)
-                return existing.public()
-            state = existing or CameraState(camera_id=camera_id, source=f"agent:{agent_id or 'unknown'}", label=label or camera_id)
+                # Direct-URL capture was running under the same id — stop it
+                # so the agent-fed stream becomes the single source of truth.
+                logger.info("[camera %s] stopping stale direct-URL capture (source=%s) — agent takes over",
+                            cid, existing.source)
+                existing._stop.set()
+            state = existing or CameraState(camera_id=cid, source=f"agent:{agent_id or 'unknown'}", label=label or cid)
+            state.camera_id = cid
             state.source = f"agent:{agent_id or 'unknown'}"
-            state.label = label or state.label or camera_id
+            state.label = label or state.label or cid
             state.status = "online"
             state.connected_at = datetime.now(timezone.utc).isoformat()
             state.error = None
-            self._cams[camera_id] = state
-        logger.info("[camera %s] registered as agent-fed (agent=%s)", camera_id, agent_id or "?")
+            state._thread = None  # agent-fed has no local thread
+            self._cams[cid] = state
+        logger.info("[camera %s] registered as agent-fed (agent=%s)", cid, agent_id or "?")
         return state.public()
 
     def push_frame(self, camera_id: str, jpeg: bytes) -> bool:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            state = self._cams.get(camera_id)
+            state = self._cams.get(cid)
         if state is None:
             return False
         state.last_frame_jpeg = jpeg
@@ -131,58 +158,92 @@ class CameraManager:
         return True
 
     def mark_agent_offline(self, camera_id: str, reason: str = "") -> None:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            state = self._cams.get(camera_id)
+            state = self._cams.get(cid)
         if state is None:
             return
         state.status = "offline"
         state.error = reason or "agent disconnected"
-        logger.info("[camera %s] marked offline (%s)", camera_id, reason or "agent disconnected")
+        logger.info("[camera %s] marked offline (%s)", cid, reason or "agent disconnected")
 
     def connect(self, camera_id: str, source: Union[str, int], label: str = "") -> Dict[str, Any]:
-        """Start a capture thread for this camera. Idempotent per camera_id."""
+        """Start a capture thread for this camera. Idempotent per camera_id.
+
+        Refuses to overwrite an agent-fed camera — those have priority as the
+        authoritative source for that id. If you truly want to convert an
+        agent-fed camera to a direct capture, call `remove()` first.
+        """
+        cid = _normalize_id(camera_id)
         parsed = _parse_source(source)
         with self._lock:
-            existing = self._cams.get(camera_id)
+            existing = self._cams.get(cid)
+            if existing and _is_agent_fed(existing) and existing.status != "stopped":
+                logger.warning("[camera %s] connect() refused — agent-fed camera already registered (agent=%s)",
+                               cid, existing.source)
+                raise CameraSourceConflict(
+                    f"Camera '{cid}' is already registered as an agent-fed stream "
+                    f"({existing.source}). Direct URL capture is not allowed for this id — "
+                    f"the local agent is the authoritative source."
+                )
             if existing and existing._thread and existing._thread.is_alive():
                 # if source changed, reset
                 if existing.source == parsed:
-                    logger.info("[camera %s] connect() no-op (already running on %s)", camera_id, parsed)
+                    logger.info("[camera %s] connect() no-op (already running on %s)", cid, parsed)
                     return existing.public()
-                logger.info("[camera %s] source changed → restarting", camera_id)
+                logger.info("[camera %s] source changed → restarting", cid)
                 existing._stop.set()
-            state = CameraState(camera_id=camera_id, source=parsed, label=label or camera_id)
-            self._cams[camera_id] = state
+            state = CameraState(camera_id=cid, source=parsed, label=label or cid)
+            self._cams[cid] = state
 
         state._stop.clear()
         state._thread = threading.Thread(
             target=self._capture_loop,
             args=(state,),
-            name=f"cam-{camera_id}",
+            name=f"cam-{cid}",
             daemon=True,
         )
         state._thread.start()
-        logger.info("[camera %s] launched capture thread source=%s", camera_id, parsed)
+        logger.info("[camera %s] launched capture thread source=%s", cid, parsed)
         return state.public()
 
     def disconnect(self, camera_id: str) -> bool:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            state = self._cams.get(camera_id)
+            state = self._cams.get(cid)
         if not state:
             return False
         state._stop.set()
         state.status = "stopped"
-        logger.info("[camera %s] disconnect requested", camera_id)
+        logger.info("[camera %s] disconnect requested", cid)
+        return True
+
+    def remove(self, camera_id: str) -> bool:
+        """Fully remove a camera from the registry (stops thread if any).
+        Used to clean up stale/duplicate entries."""
+        cid = _normalize_id(camera_id)
+        with self._lock:
+            state = self._cams.pop(cid, None)
+        if not state:
+            return False
+        try:
+            state._stop.set()
+        except Exception:
+            pass
+        state.status = "stopped"
+        logger.info("[camera %s] removed from registry", cid)
         return True
 
     def latest_frame(self, camera_id: str) -> Optional[bytes]:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            state = self._cams.get(camera_id)
+            state = self._cams.get(cid)
         return state.last_frame_jpeg if state else None
 
     def inc_subscribers(self, camera_id: str, delta: int) -> None:
+        cid = _normalize_id(camera_id)
         with self._lock:
-            state = self._cams.get(camera_id)
+            state = self._cams.get(cid)
             if state:
                 state.subscribers = max(0, state.subscribers + delta)
 
