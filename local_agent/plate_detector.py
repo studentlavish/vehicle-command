@@ -57,6 +57,12 @@ PLATE_MODEL_PATH = os.environ.get("PLATE_MODEL_PATH", "").strip()
 EASYOCR_LANGS = [s.strip() for s in os.environ.get("EASYOCR_LANGS", "en").split(",") if s.strip()]
 EASYOCR_GPU = os.environ.get("EASYOCR_GPU", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# When no dedicated plate model is available, run EasyOCR directly on the
+# vehicle crop. To prevent false positives the fallback ONLY emits a plate
+# when the OCR result matches the strict Indian plate regex AND passes the
+# multi-frame confirmation gate. Set to "false" to keep hard-audit mode.
+ALLOW_VEHICLE_CROP_OCR = os.environ.get("ALLOW_VEHICLE_CROP_OCR", "true").strip().lower() in ("1", "true", "yes", "on")
+
 # Regex to accept a class name as a plate class ("license_plate", "plate", "lp"...)
 _PLATE_CLASS_RE = re.compile(r"(license.?plate|number.?plate|^plate$|^lp$)", re.I)
 
@@ -312,24 +318,33 @@ class LocalPlateDetector:
         top_v = vehicles[0]
         vehicle_crop = self.crop(frame, top_v["bbox"])
 
-        # Plate detection MUST come from a real plate model. Without it, we
-        # do NOT invent one from a heuristic ROI. Emit no detection.
-        if self._plate_model is None:
-            log.debug("[DETECTOR] audit mode — vehicle seen but no plate model configured; skipping OCR")
+        # Plate detection: prefer the dedicated plate YOLO. If not configured,
+        # optionally fall back to OCR-ing the vehicle crop directly. The strict
+        # PLATE_RE regex + multi-frame confirmation gate prevent false emits.
+        plate_crop: np.ndarray
+        strict_regex_required = False
+        if self._plate_model is not None:
+            plates = self.detect_plates(vehicle_crop)
+            if not plates:
+                self._decay(camera_id)
+                return None
+            top_p = plates[0]
+            plate_crop = self.crop(vehicle_crop, top_p["bbox"], pad=0.02)
+        elif ALLOW_VEHICLE_CROP_OCR:
+            # Fallback: OCR the whole vehicle crop with a strict regex guard.
+            plate_crop = vehicle_crop
+            strict_regex_required = True
+        else:
+            log.debug("[DETECTOR] hard-audit mode — no plate model, fallback disabled; skipping OCR")
             return None
 
-        plates = self.detect_plates(vehicle_crop)
-        if not plates:
-            self._decay(camera_id)
-            return None
-        top_p = plates[0]
-        plate_crop = self.crop(vehicle_crop, top_p["bbox"], pad=0.02)
-
-        # OCR
         read = self.read_plate(plate_crop)
         if not read:
             return None
         plate, ocr_conf = read
+        if strict_regex_required and not PLATE_RE.search(plate):
+            log.debug("[DETECTOR] fallback rejected non-regex plate=%s", plate)
+            return None
 
         # Multi-frame confirmation
         state = self._confirmation[camera_id]
