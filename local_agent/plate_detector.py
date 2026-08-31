@@ -51,7 +51,15 @@ CONFIRM_WINDOW_SECONDS = float(os.environ.get("CONFIRM_WINDOW_SECONDS", "15"))
 # Model paths
 _HERE = os.path.dirname(__file__)
 VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", os.path.join(_HERE, "yolov8n.pt"))
-PLATE_MODEL_PATH = os.environ.get("PLATE_MODEL_PATH", "").strip()
+# If PLATE_MODEL_PATH is not set, look for local_agent/best.pt (typical filename
+# for a trained license-plate YOLO). If that file doesn't exist we fall back to
+# audit / vehicle-crop-OCR mode — plate_detector.py explains both paths in the
+# module docstring.
+_default_plate_path = os.path.join(_HERE, "best.pt")
+PLATE_MODEL_PATH = os.environ.get(
+    "PLATE_MODEL_PATH",
+    _default_plate_path if os.path.isfile(_default_plate_path) else "",
+).strip()
 
 # EasyOCR config
 EASYOCR_LANGS = [s.strip() for s in os.environ.get("EASYOCR_LANGS", "en").split(",") if s.strip()]
@@ -63,8 +71,11 @@ EASYOCR_GPU = os.environ.get("EASYOCR_GPU", "0").strip().lower() in ("1", "true"
 # multi-frame confirmation gate. Set to "false" to keep hard-audit mode.
 ALLOW_VEHICLE_CROP_OCR = os.environ.get("ALLOW_VEHICLE_CROP_OCR", "true").strip().lower() in ("1", "true", "yes", "on")
 
-# Regex to accept a class name as a plate class ("license_plate", "plate", "lp"...)
-_PLATE_CLASS_RE = re.compile(r"(license.?plate|number.?plate|^plate$|^lp$)", re.I)
+# Regex to accept a class name as a plate class. Real-world exports use
+# a variety of names — "plate", "license_plate", "License Plate", or even
+# the stringified list "['plate']" — so we match `plate|license|^lp$`
+# anywhere inside the class name.
+_PLATE_CLASS_RE = re.compile(r"(plate|license|\blp\b)", re.I)
 
 
 def _normalize_plate(raw: str) -> Optional[str]:
