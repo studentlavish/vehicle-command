@@ -197,6 +197,7 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
                     "vehicle_class": det.vehicle_class,
                     "vehicle_conf": round(det.vehicle_conf, 3),
                     "crop_jpeg_b64": _b64.b64encode(det.crop_jpeg).decode("ascii"),
+                    "plate_jpeg_b64": _b64.b64encode(det.plate_jpeg).decode("ascii") if det.plate_jpeg else None,
                     "ts": now,
                 })
                 log.info("[DETECTOR] %s → plate=%s conf=%s vehicle=%s(%.2f)",
