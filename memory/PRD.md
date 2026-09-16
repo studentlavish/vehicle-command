@@ -76,5 +76,12 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
   - HTML template: yesterday's Entries · Exits · Unique Vehicles · Avg Dwell · Longest Dwell · Busiest Camera.
 - **Live Occupancy Chart**: New `LiveOccupancyChart.jsx` on the Dashboard shows a rolling 2-hour sparkline of cars inside; polls `/api/dashboard/stats` every 30s and pushes an immediate sample whenever an entry.recorded event bumps `stats.cars_inside.value`.
 
+## What's Been Implemented (2026-09-16)
+### Hands-Free ANPR — Manual Enrich Popup Removed
+- Deleted `frontend/src/components/AutoMasterEnrichModal.jsx` and all its wiring in `LiveMonitoring.jsx` (`pendingEnrich` queue, `resolveEnrich`, modal render). New plates no longer trigger any popup — 100% hands-free.
+- Backend unchanged and verified: `plate_pipeline.py` auto-creates `vehicle_masters` with `owner_name="Unknown Owner"`, blank phone/model, and persists the `visit_session` with entry/exit timestamps + vehicle/plate snapshots immediately.
+- Staff see only a transient success toast ("plate · Unknown Owner · Entry recorded", 4.5s). Owner details remain editable later from Vehicle Records (`PATCH /api/vehicles/master/{vn}`).
+- Verified: `tests/test_entry_exit_e2e.py` (entry → 30s dedup → exit → snapshots → Unknown Owner) ALL PASS; `tests/test_plate_detected_ws.py` PASS; Live Monitoring screenshot confirms no modal.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
