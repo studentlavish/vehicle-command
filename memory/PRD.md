@@ -83,5 +83,10 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - Staff see only a transient success toast ("plate · Unknown Owner · Entry recorded", 4.5s). Owner details remain editable later from Vehicle Records (`PATCH /api/vehicles/master/{vn}`).
 - Verified: `tests/test_entry_exit_e2e.py` (entry → 30s dedup → exit → snapshots → Unknown Owner) ALL PASS; `tests/test_plate_detected_ws.py` PASS; Live Monitoring screenshot confirms no modal.
 
+### Preview 503 Investigation (2026-09-16) — NO CODE BUG, RESOLVED
+- User reported HTTP 503 from backend/API after popup removal. Root cause: transient — the container's supervisor services had just restarted (backend/frontend uptime reset), so the ingress returned 503 during the restart window. Not caused by the popup-removal change (frontend-only edit).
+- Evidence: zero real HTTP 503 lines in backend or nginx logs (grep hits were port numbers like :50328); all endpoints return 200 (login, `/api/dashboard/stats`, `/api/cameras`, `/api/visit-sessions`, `/api/vehicles`); frontend compiled cleanly post-edit (no "Failed to compile"/"Module not found"); `test_entry_exit_e2e.py` ALL PASS again.
+- No rollback performed. ANPR auto-save, date/time + snapshot persistence, CAM-01, Local Agent, YOLO, EasyOCR all unchanged. Not deployed.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
