@@ -19,6 +19,7 @@ from typing import List, Optional, Literal, Dict, Any, Tuple
 import bcrypt
 import httpx
 import jwt
+import whatsapp_meta as wa_meta
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import StreamingResponse
@@ -1478,12 +1479,23 @@ async def send_whatsapp_report(payload: WhatsAppSendIn, user: dict = Depends(req
     body = payload.body or await _build_daily_summary_text()
     to = payload.to or cfg["to"]
 
+    # Primary provider: Meta WhatsApp Cloud API (active when META_* env is configured)
+    if wa_meta.meta_whatsapp_enabled():
+        if not to:
+            raise HTTPException(status_code=400, detail="Recipient number not configured (Settings → Admin WhatsApp To).")
+        try:
+            result = await wa_meta.send_text(db, to=to, body=body, by=user["email"], context="manual_report")
+            return {"delivered": True, "mode": "live", "provider": "meta", "sid": result.get("message_id"), "preview": {"to": to, "body": body}}
+        except wa_meta.WhatsAppMetaError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
     if not (HAS_TWILIO and cfg["sid"] and cfg["token"] and cfg["from"] and to):
         # Dry-run mode — return preview so the UI can display it
         return {
             "delivered": False,
             "mode": "dry-run",
-            "reason": "Twilio credentials not configured (set TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_WHATSAPP_FROM in .env, plus the recipient number).",
+            "provider": "none",
+            "reason": "WhatsApp credentials not configured (set META_ACCESS_TOKEN + META_PHONE_NUMBER_ID in backend/.env, or the legacy Twilio vars, plus the recipient number).",
             "preview": {"to": to or "(missing)", "body": body},
         }
 
@@ -1494,11 +1506,24 @@ async def send_whatsapp_report(payload: WhatsAppSendIn, user: dict = Depends(req
             "sid": message.sid,
             "to": to,
             "body": body,
+            "provider": "twilio",
+            "status": "sent",
+            "direction": "outbound",
             "sent_at": now_utc().isoformat(),
             "by": user["email"],
         })
-        return {"delivered": True, "mode": "live", "sid": message.sid, "preview": {"to": to, "body": body}}
+        return {"delivered": True, "mode": "live", "provider": "twilio", "sid": message.sid, "preview": {"to": to, "body": body}}
     except Exception as e:
+        await db.whatsapp_log.insert_one({
+            "to": to,
+            "body": body,
+            "provider": "twilio",
+            "status": "failed",
+            "direction": "outbound",
+            "error": str(e)[:300],
+            "sent_at": now_utc().isoformat(),
+            "by": user["email"],
+        })
         logger.exception("Twilio send failed")
         raise HTTPException(status_code=500, detail=f"WhatsApp send failed: {e}")
 
@@ -1507,13 +1532,75 @@ async def send_whatsapp_report(payload: WhatsAppSendIn, user: dict = Depends(req
 async def whatsapp_preview(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     cfg = await _twilio_config()
     body = await _build_daily_summary_text()
-    configured = bool(HAS_TWILIO and cfg["sid"] and cfg["token"] and cfg["from"] and cfg["to"])
+    meta_on = wa_meta.meta_whatsapp_enabled()
+    twilio_on = bool(HAS_TWILIO and cfg["sid"] and cfg["token"] and cfg["from"] and cfg["to"])
     return {
-        "configured": configured,
+        "configured": meta_on or twilio_on,
+        "provider": "meta" if meta_on else ("twilio" if twilio_on else "none"),
         "to": cfg["to"] or "",
         "from_": cfg["from"] or "",
         "body": body,
     }
+
+
+# ---------- Meta WhatsApp webhooks (verification + inbound) ----------
+@api.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(request: Request):
+    q = request.query_params
+    challenge = wa_meta.verify_webhook_challenge(q.get("hub.mode"), q.get("hub.verify_token"), q.get("hub.challenge"))
+    if challenge is None:
+        raise HTTPException(status_code=403, detail="Webhook verification failed")
+    return Response(content=challenge, media_type="text/plain")
+
+
+@api.post("/whatsapp/webhook")
+async def whatsapp_webhook_receive(request: Request):
+    raw = await request.body()
+    if not wa_meta.verify_signature(raw, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    try:
+        payload = await request.json()  # body is cached; safe after signature check
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+        return {"ok": True, "ignored": True}
+    stored = 0
+    for entry in payload.get("entry", []) or []:
+        if wa_meta.META_WABA_ID and entry.get("id") != wa_meta.META_WABA_ID:
+            continue
+        for change in entry.get("changes", []) or []:
+            value = change.get("value", {}) or {}
+            # Inbound messages — upsert on message_id so Meta delivery retries are idempotent
+            for message in value.get("messages", []) or []:
+                doc = {
+                    "direction": "inbound",
+                    "provider": "meta",
+                    "status": "received",
+                    "message_id": message.get("id"),
+                    "from": message.get("from"),
+                    "type": message.get("type"),
+                    "text": (message.get("text") or {}).get("body"),
+                    "created_at": now_utc().isoformat(),
+                }
+                if doc["message_id"]:
+                    await db.whatsapp_log.update_one(
+                        {"direction": "inbound", "message_id": doc["message_id"]},
+                        {"$setOnInsert": doc}, upsert=True)
+                else:
+                    await db.whatsapp_log.insert_one(doc)
+                stored += 1
+            # Delivery/read status events for our outbound messages
+            for st in value.get("statuses", []) or []:
+                await db.whatsapp_log.update_one(
+                    {"direction": "status", "message_id": st.get("id"), "status": st.get("status")},
+                    {"$setOnInsert": {
+                        "direction": "status", "provider": "meta",
+                        "message_id": st.get("id"), "status": st.get("status"),
+                        "recipient_id": st.get("recipient_id"),
+                        "created_at": now_utc().isoformat(),
+                    }},
+                    upsert=True)
+    return {"ok": True, "stored": stored}
 
 
 # ===================== Health =====================
@@ -2319,6 +2406,18 @@ async def _run_digest_send(run_id: str) -> None:
             except Exception as e:
                 logger.warning("[digest %s] send to %s failed: %s", run_id, to_addr, e)
         logger.info("[digest %s] sent %d/%d for %s", run_id, sent, len(recipients), stats["date"])
+        # WhatsApp companion — Meta Cloud API only when configured; never breaks email.
+        if wa_meta.meta_whatsapp_enabled():
+            try:
+                cfg = await _twilio_config()  # reuses the same "Admin WhatsApp To" recipient
+                wa_to = cfg["to"]
+                if wa_to:
+                    await wa_meta.send_text(db, to=wa_to, body=await _build_daily_summary_text(), by="cron", context="daily_digest")
+                    logger.info("[digest %s] whatsapp report sent", run_id)
+                else:
+                    logger.info("[digest %s] whatsapp skipped — no recipient configured", run_id)
+            except Exception as e:
+                logger.warning("[digest %s] whatsapp send failed: %s", run_id, e)
     except Exception:
         logger.exception("[digest %s] failed", run_id)
 

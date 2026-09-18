@@ -97,5 +97,15 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - Frontend: `AuthCallback.jsx` (new) exchanges session_id; `App.js` wraps routes in `AppRouter` detecting `location.hash` session_id synchronously; `AuthContext` skips /auth/me during callback + new `googleSession()`; `Login.jsx` adds "Sign in with Google" button (redirect derived from `window.location.origin`, no hardcoding). Dashboard/layout/routes/colors untouched.
 - Verified: password login 200, /auth/me 200, bogus session_id 401, Google session_token fallback auth 200, logout 200, frontend compiles clean, `test_entry_exit_e2e.py` ALL PASS (ANPR untouched).
 
+## What's Been Implemented (2026-09-18 · WhatsApp / Meta Cloud API)
+### Meta WhatsApp Cloud API — PRIMARY provider (dry-run until credentials pasted)
+- New `backend/whatsapp_meta.py` — clean service layer: `send_text()` (Graph API `/{META_PHONE_NUMBER_ID}/messages`, Bearer in header only), `meta_whatsapp_enabled()`, `verify_webhook_challenge()`, `verify_signature()` (HMAC-SHA256, enforced when `META_APP_SECRET` set), one auto-retry on 429/5xx, success+failure logged to `whatsapp_log` with tokens NEVER logged or persisted.
+- `backend/.env` placeholders added (empty): `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_WABA_ID`, `META_VERIFY_TOKEN`, `META_APP_SECRET`. `META_GRAPH_VERSION` optional (default v26.0).
+- `server.py` `/whatsapp/send-report`: Meta-first when configured → Twilio fallback → dry-run preview (response now includes `provider`). Twilio path now logs failures to `whatsapp_log` too. `/whatsapp/preview` reports active provider.
+- New webhooks: `GET /api/whatsapp/webhook` (Meta hub verification, 403 until META_VERIFY_TOKEN set) and `POST /api/whatsapp/webhook` (signature check, inbound messages + delivery statuses upserted into `whatsapp_log`, idempotent on message_id, ignores non-WABA objects).
+- Daily digest cron (`_run_digest_send`) now also sends the WhatsApp report to the existing "Admin WhatsApp To" (`twilio_to`) recipient — ONLY when Meta is configured; skips silently otherwise; email path untouched.
+- Verified: unit tests (enabled flag, send success, sanitized failure logs, retry-once, network error, webhook verify + signature) ALL PASS; endpoint tests (dry-run, webhook 403/inbound/idempotent/ignored, digest cron regression, ANPR e2e) ALL PASS.
+- Pending from user: paste real Meta credentials (System User token recommended, not 24h test token) into backend/.env, then set the callback URL `<BASE>/api/whatsapp/webhook` + verify token in the Meta app dashboard and subscribe to `messages`.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
