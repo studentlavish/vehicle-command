@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta, date as ddate
 from typing import List, Optional, Literal, Dict, Any, Tuple
 
 import bcrypt
+import httpx
 import jwt
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, Query
@@ -107,6 +108,28 @@ def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("refresh_token", refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
 
 
+async def _user_from_google_session(token: str) -> Optional[dict]:
+    """Fallback auth: Emergent-managed Google session token stored server-side."""
+    sess = await db.user_sessions.find_one({"session_token": token})
+    if not sess:
+        return None
+    try:
+        exp = sess.get("expires_at")
+        exp_dt = datetime.fromisoformat(exp) if isinstance(exp, str) else exp
+        if exp_dt and exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if not exp_dt or exp_dt < datetime.now(timezone.utc):
+            return None
+    except Exception:
+        return None
+    user = await db.users.find_one({"_id": ObjectId(sess["user_id"])})
+    if not user or user.get("status") == "inactive":
+        return None
+    user["id"] = str(user.pop("_id"))
+    user.pop("password_hash", None)
+    return user
+
+
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -128,6 +151,9 @@ async def get_current_user(request: Request) -> dict:
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
+        google_user = await _user_from_google_session(token)
+        if google_user is not None:
+            return google_user
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -260,6 +286,10 @@ class LoginIn(BaseModel):
     remember_me: Optional[bool] = False
 
 
+class GoogleSessionIn(BaseModel):
+    session_id: str
+
+
 class EntryIn(BaseModel):
     vehicle_number: str
     owner_name: Optional[str] = None
@@ -364,8 +394,70 @@ async def login(payload: LoginIn, response: Response):
     }
 
 
+EMERGENT_SESSION_DATA_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
+
+
+@api.post("/auth/google/session")
+async def google_session(payload: GoogleSessionIn, response: Response):
+    """Exchange an Emergent Google OAuth session_id for the app's JWT cookies.
+
+    The session-data call MUST happen server-side. The Google account's email
+    must already exist in `users` (admin-managed allowlist) — unknown accounts
+    are rejected, nothing is auto-provisioned here.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(EMERGENT_SESSION_DATA_URL, headers={"X-Session-ID": payload.session_id})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Could not reach Google auth service")
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired Google session")
+    data = r.json()
+    email = (data.get("email") or "").strip().lower()
+    gtoken = data.get("session_token") or ""
+    if not email or not gtoken:
+        raise HTTPException(status_code=401, detail="Invalid Google session response")
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=403, detail="This Google account is not authorized. Ask an admin to add your email under Users.")
+    if user.get("status") == "inactive":
+        raise HTTPException(status_code=403, detail="Account is inactive")
+    if user.get("role") not in ROLE_ALL:
+        raise HTTPException(status_code=403, detail="Unknown role")
+    uid = str(user["_id"])
+    now = now_utc()
+    await db.user_sessions.insert_one({
+        "user_id": uid,
+        "session_token": gtoken,
+        "provider": "google",
+        "expires_at": (now + timedelta(days=7)).isoformat(),
+        "created_at": now.isoformat(),
+    })
+    access = create_access_token(uid, email)
+    refresh = create_refresh_token(uid)
+    set_auth_cookies(response, access, refresh)
+    response.set_cookie("session_token", gtoken, httponly=True, secure=True, samesite="none", max_age=604800, path="/")
+    update = {"last_login": now.isoformat(), "auth_provider": "google"}
+    if data.get("name") and not user.get("name"):
+        update["name"] = data["name"]
+    if data.get("picture"):
+        update["picture"] = data["picture"]
+    await db.users.update_one({"_id": user["_id"]}, {"$set": update})
+    return {
+        "id": uid,
+        "email": email,
+        "name": update.get("name") or user.get("name", "User"),
+        "role": user.get("role"),
+        "token": access,
+    }
+
+
 @api.post("/auth/logout")
-async def logout(response: Response):
+async def logout(request: Request, response: Response):
+    gtoken = request.cookies.get("session_token")
+    if gtoken:
+        await db.user_sessions.delete_many({"session_token": gtoken})
+        response.delete_cookie("session_token", path="/")
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     return {"ok": True}
@@ -1884,6 +1976,30 @@ async def seed_admin():
                                   {"$set": {"password_hash": hash_password(ADMIN_PASSWORD), "role": "admin"}})
 
 
+GOOGLE_ADMIN_EMAIL = os.environ.get("GOOGLE_ADMIN_EMAIL", "")
+
+
+async def seed_google_admin():
+    """Explicitly configured owner account that authenticates via Google only."""
+    if not GOOGLE_ADMIN_EMAIL:
+        return
+    email = GOOGLE_ADMIN_EMAIL.strip().lower()
+    if await db.users.find_one({"email": email}):
+        return
+    await db.users.insert_one({
+        "email": email,
+        # Random unknown password — this account signs in via Google only.
+        "password_hash": hash_password(str(ObjectId())),
+        "name": "Owner",
+        "role": "admin",
+        "status": "active",
+        "auth_provider": "google",
+        "created_at": now_utc().isoformat(),
+        "last_login": None,
+    })
+    logger.info("Seeded Google admin user: %s", email)
+
+
 async def seed_demo():
     # Seed additional demo users
     demo_users = [
@@ -2059,6 +2175,7 @@ async def ensure_indexes():
 async def startup():
     await ensure_indexes()
     await seed_admin()
+    await seed_google_admin()
     await seed_demo()
     # NOTE: YOLO/OCR now runs on the showroom PC via /app/local_agent —
     # the backend only persists `plate_detected` messages arriving on

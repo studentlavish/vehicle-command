@@ -88,5 +88,14 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - Evidence: zero real HTTP 503 lines in backend or nginx logs (grep hits were port numbers like :50328); all endpoints return 200 (login, `/api/dashboard/stats`, `/api/cameras`, `/api/visit-sessions`, `/api/vehicles`); frontend compiled cleanly post-edit (no "Failed to compile"/"Module not found"); `test_entry_exit_e2e.py` ALL PASS again.
 - No rollback performed. ANPR auto-save, date/time + snapshot persistence, CAM-01, Local Agent, YOLO, EasyOCR all unchanged. Not deployed.
 
+## What's Been Implemented (2026-09-18)
+### Google Sign-In (Emergent-managed OAuth)
+- `POST /api/auth/google/session` in `server.py` — server-side exchange of Emergent `session_id` via `https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data` (`X-Session-ID` header). Looks up email in `users`; **rejects with 403 if not pre-added** (admin-managed allowlist, no auto-provisioning). Issues the SAME JWT access/refresh cookies as password login; stores Google `session_token` in new `user_sessions` collection (7-day tz-aware expiry) for audit/logout.
+- `get_current_user` gains a fallback: Bearer/cookie token not decodable as JWT → looked up in `user_sessions` (Google session). All existing JWT guards, RBAC roles, refresh unchanged.
+- `logout` now also deletes the Google session from `user_sessions` + clears `session_token` cookie.
+- `seed_google_admin()` — seeds `GOOGLE_ADMIN_EMAIL` (`yadavlaviish04@gmail.com`, in backend/.env) as role=admin, `auth_provider=google`, unusable random password (Google-only sign-in). Idempotent.
+- Frontend: `AuthCallback.jsx` (new) exchanges session_id; `App.js` wraps routes in `AppRouter` detecting `location.hash` session_id synchronously; `AuthContext` skips /auth/me during callback + new `googleSession()`; `Login.jsx` adds "Sign in with Google" button (redirect derived from `window.location.origin`, no hardcoding). Dashboard/layout/routes/colors untouched.
+- Verified: password login 200, /auth/me 200, bogus session_id 401, Google session_token fallback auth 200, logout 200, frontend compiles clean, `test_entry_exit_e2e.py` ALL PASS (ANPR untouched).
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
