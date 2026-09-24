@@ -193,6 +193,7 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
                     "camera_id": spec.id,
                     "name": spec.name,
                     "plate": det.plate,
+                    "plate_text": det.plate,
                     "confidence": det.confidence,
                     "vehicle_class": det.vehicle_class,
                     "vehicle_conf": round(det.vehicle_conf, 3),
@@ -200,6 +201,8 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
                     "plate_jpeg_b64": _b64.b64encode(det.plate_jpeg).decode("ascii") if det.plate_jpeg else None,
                     "ts": now,
                 })
+                log.info("[PLATE] EVENT SENT plate=%s plate_text=%s cam=%s conf=%s",
+                         det.plate, det.plate, spec.id, det.confidence)
                 log.info("[DETECTOR] %s → plate=%s conf=%s vehicle=%s(%.2f)",
                          spec.id, det.plate, det.confidence, det.vehicle_class, det.vehicle_conf)
             except Exception as e:

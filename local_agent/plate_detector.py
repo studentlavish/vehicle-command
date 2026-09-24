@@ -48,6 +48,13 @@ PLATE_RE = re.compile(r"[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}")
 CONFIRM_FRAMES = int(os.environ.get("CONFIRM_FRAMES", "3"))
 CONFIRM_WINDOW_SECONDS = float(os.environ.get("CONFIRM_WINDOW_SECONDS", "15"))
 
+# HIGH-CONFIDENCE fast path: a single strong plate-model detection whose OCR
+# text is a structurally valid Indian registration bypasses the multi-frame
+# confirmation gate entirely.
+HIGH_CONF_YOLO_THRESHOLD = float(os.environ.get("HIGH_CONF_YOLO_THRESHOLD", "0.78"))
+# Full structural validation: SS-D(D)-L(LL)-NNNN (e.g. DL24ZB8987, KA05MG9999)
+_STRICT_INDIAN_PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$")
+
 # Model paths
 _HERE = os.path.dirname(__file__)
 VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", os.path.join(_HERE, "yolov8n.pt"))
@@ -356,6 +363,27 @@ class LocalPlateDetector:
         if strict_regex_required and not PLATE_RE.search(plate):
             log.debug("[DETECTOR] fallback rejected non-regex plate=%s", plate)
             return None
+
+        # HIGH-CONFIDENCE fast path — a single strong, structurally-valid read
+        # is emitted immediately instead of waiting for the confirmation gate.
+        # (Only when the dedicated plate YOLO is active; fallback OCR mode has
+        # no plate-localisation confidence and always uses the slow path.)
+        yolo_plate_conf = top_p["conf"] if self._plate_model is not None else 0.0
+        if yolo_plate_conf >= HIGH_CONF_YOLO_THRESHOLD and _STRICT_INDIAN_PLATE_RE.match(plate):
+            fast_state = self._confirmation[camera_id]
+            fast_state.plate = ""
+            fast_state.count = 0
+            fast_state.first_seen = 0.0
+            log.info("[PLATE] HIGH-CONFIDENCE AUTO-CONFIRMED plate=%s yolo_conf=%.2f ocr_conf=%.2f cam=%s",
+                     plate, yolo_plate_conf, ocr_conf, camera_id)
+            return LocalDetection(
+                plate=plate,
+                confidence="high",
+                crop_jpeg=self.encode_jpeg(vehicle_crop, quality=78) or jpeg,
+                plate_jpeg=self.encode_jpeg(plate_crop, quality=85) or b"",
+                vehicle_class=top_v["cls_name"],
+                vehicle_conf=top_v["conf"],
+            )
 
         # Multi-frame confirmation
         state = self._confirmation[camera_id]

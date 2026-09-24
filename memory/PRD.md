@@ -107,5 +107,12 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - Verified: unit tests (enabled flag, send success, sanitized failure logs, retry-once, network error, webhook verify + signature) ALL PASS; endpoint tests (dry-run, webhook 403/inbound/idempotent/ignored, digest cron regression, ANPR e2e) ALL PASS.
 - Pending from user: paste real Meta credentials (System User token recommended, not 24h test token) into backend/.env, then set the callback URL `<BASE>/api/whatsapp/webhook` + verify token in the Meta app dashboard and subscribe to `messages`.
 
+## What's Been Implemented (2026-09-24 · Local Agent High-Confidence Fast Path)
+### Single-read auto-confirm for clearly recognized plates
+- `local_agent/plate_detector.py` — new HIGH-CONFIDENCE fast path in `process_jpeg`: when the dedicated plate YOLO confidence ≥ `HIGH_CONF_YOLO_THRESHOLD` (env, default **0.78**) AND the OCR text fully matches `_STRICT_INDIAN_PLATE_RE` (`^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$`), the plate is emitted on the FIRST frame — no 2-of-3 wait. Slow-path multi-frame confirmation (3 frames / 15s window) unchanged for normal/medium reads. Fast path resets the confirmation state to prevent double-emit. Vehicle-crop OCR fallback mode never fast-paths. New log: `[PLATE] HIGH-CONFIDENCE AUTO-CONFIRMED ...`.
+- `local_agent/agent.py` — `plate_detected` payload now also carries `plate_text`; new log `[PLATE] EVENT SENT ...`. Local duplicate suppression and backend 30s cooldown untouched.
+- Backend unchanged — `plate_detected` handler tolerates the new field; `_persist_entry` still auto-creates vehicle_masters (Unknown Owner), active ENTRY visit_session, snapshots.
+- Verified: detector logic tests 7/7 (immediate emit, gate preserved, invalid-format reject, 0.77 below threshold, fallback slow-only, regex, state reset); E2E with new payload (DL76HC8987): ack entry/new → master "Unknown Owner" → active ENTRY session on CAM-01 with entry_time → snapshot saved + served 200 → visible via master/sessions history.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
