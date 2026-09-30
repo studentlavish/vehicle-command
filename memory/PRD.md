@@ -152,5 +152,13 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - **Verified:** init/put/get credential round-trip; upload→object storage with byte-identical read-back and no local copy; simulated storage outage → local fallback write; low-disk guardrail blocks fallback; empty jpeg → ""; legacy local snapshot serves 200; nonexistent → 404; live E2E `plate_detected` → both `entry_image` + `entry_plate_image` stored in object storage, served byte-identical via the existing endpoint.
 - **Known note:** object storage has no delete API — snapshots of records purged by the 180-day retention become orphaned objects (small, bounded by retention window). To be addressed if quota ever matters.
 
+## What's Been Implemented (2026-09-30 · Task 2: MongoDB Automated Backup)
+### Daily MongoDB backup → Emergent Object Storage
+- **New `backend/backup_utils.py`** — `run_backup(db, mongo_url, db_name, run_id)`: `mongodump --uri=$MONGO_URL --db=$DB_NAME --archive --gzip` (MongoDB Database Tools 100.19.1) staged in `/tmp` (66 GB scratch), gzip-magic validated, uploaded to `rdx-vashu/backups/mongodb/<name>.archive.gz`, staging file deleted in `finally` (never persists on /app), metadata recorded in new additive `backups` collection. Mongo URI sanitized out of all error logs (`_sanitize`). Retention: keeps latest 7 successful (`BACKUP_KEEP` env, default 7), older marked `expired=True` (soft — object store has no delete API, verified Task 1.1).
+- **`backend/server.py`** — `POST /api/cron/backup` (same `WEBHOOK_CRON_SECRET` Bearer + compare_digest pattern as the digest cron; acks 2xx, runs `_run_backup_safe` in background — failures logged + recorded, never raised, previous backups untouched) + `GET /api/backups` (admin/manager, metadata only).
+- **`.emergent/crons.yml`** — new `daily-backup` entry: `0 2 * * *` UTC → `POST {{BASE_URL}}/api/cron/backup`.
+- **Verified:** auth guard 401 (no/wrong secret) · real backup = 126,452 bytes, valid gzip, `mongorestore --dryRun` passed (read-only, zero DB writes) · failure path (bad URI) raises cleanly with sanitized error, previous backups intact, no /tmp leak · URI appears 0 times in logs · `GET /api/backups` 401 unauth, lists baseline backup for admin · crons.yml parses, both jobs enabled. DB schema unchanged (new additive `backups` collection only); frontend/CAM-01/local_agent/YOLO/EasyOCR untouched; not deployed.
+- **Limitation:** expired backups are soft-expired only (object bytes remain — platform has no delete API). At ~126 KB/backup this is negligible for years.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.

@@ -2104,6 +2104,7 @@ from fastapi.responses import FileResponse
 from plate_pipeline import SNAPSHOTS_DIR as _SNAPSHOTS_DIR
 from plate_pipeline import snapshot_disk_stats as _snapshot_disk_stats
 import object_storage as _objstore
+import backup_utils
 
 
 @api.get("/snapshots/{filename}")
@@ -2541,6 +2542,48 @@ async def cron_digest_preview(user: dict = Depends(require_roles(*ROLE_ADMIN_ONL
     stats = await _collect_digest_stats()
     recipients = await _digest_recipients()
     return {"stats": stats, "recipients": recipients}
+
+
+async def _run_backup_safe(run_id: str):
+    """Wrapper: backup failures are logged + recorded, never raised — the
+    running showroom app is unaffected and previous backups are kept."""
+    try:
+        await backup_utils.run_backup(db, mongo_url, os.environ["DB_NAME"], run_id)
+    except Exception as e:
+        logger.exception("[backup %s] failed: %s", run_id, e)
+        try:
+            await db.backups.insert_one({
+                "id": str(uuid.uuid4()),
+                "run_id": run_id,
+                "kind": "mongodb",
+                "status": "failed",
+                "error": str(e)[:400],
+                "expired": False,
+                "created_at": now_utc().isoformat(),
+            })
+        except Exception:
+            pass
+
+
+@app.post("/api/cron/backup")
+async def cron_backup(request: Request):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    auth = request.headers.get("authorization", "")
+    if not WEBHOOK_CRON_SECRET or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = auth.split(" ", 1)[1].strip()
+    if not pysecrets.compare_digest(token, WEBHOOK_CRON_SECRET):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    run_id = request.headers.get("x-webhook-id") or str(uuid.uuid4())
+    asyncio.create_task(_run_backup_safe(run_id))
+    return {"ok": True, "queued": True, "run_id": run_id}
+
+
+@api.get("/backups")
+async def list_backups(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """Backup history (metadata only — no secrets, no DB content)."""
+    docs = await db.backups.find({"expired": False}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return {"backups": docs, "keep": backup_utils.BACKUP_KEEP}
 
 
 @app.on_event("shutdown")
