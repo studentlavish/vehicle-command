@@ -710,6 +710,29 @@ async def list_vehicle_sessions(
     return [serialize_session(d) for d in docs]
 
 
+@api.get("/vehicles/master/{vehicle_number}/sessions/paginated")
+async def get_vehicle_sessions_paginated(
+    vehicle_number: str,
+    range: str = "180d",
+    from_: Optional[str] = None,
+    to: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    vn = normalize_plate(vehicle_number)
+    if not await db.vehicle_masters.find_one({"vehicle_number": vn}):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    start, end = range_bounds(range, from_, to)
+    query: Dict[str, Any] = {"vehicle_number": vn}
+    apply_range_query(query, start, end, field="entry_time")
+    p, ps = _paginate_params(page, page_size, 50)
+    total = await db.visit_sessions.count_documents(query)
+    docs = await db.visit_sessions.find(query).sort("entry_time", -1).skip((p - 1) * ps).to_list(ps)
+    return {"items": [serialize_session(d) for d in docs], "total": total,
+            "page": p, "page_size": ps, "has_next": (p * ps) < total, "has_prev": p > 1}
+
+
 @api.patch("/vehicles/master/{vehicle_number}")
 async def patch_vehicle_master(vehicle_number: str, payload: MasterPatch, user: dict = Depends(get_current_user)):
     vn = normalize_plate(vehicle_number)
@@ -725,6 +748,23 @@ async def patch_vehicle_master(vehicle_number: str, payload: MasterPatch, user: 
 
 
 # ---------- Global visit session listing ----------
+# Pagination policy (applies to visit-sessions, vehicles, and per-vehicle sessions):
+#   • Legacy behaviour preserved: when the client omits `page`, we return the
+#     plain JSON array (existing frontend contracts unchanged).
+#   • When the client passes `page`, we return a paginated envelope with
+#     items + total + page + page_size + has_next + has_prev. `limit` is
+#     still honoured as a maximum page size cap.
+MAX_PAGE_SIZE = 500
+
+
+def _paginate_params(page: Optional[int], page_size: Optional[int], limit_default: int) -> tuple[Optional[int], int]:
+    if page is None:
+        return None, min(max(1, limit_default), MAX_PAGE_SIZE * 4)  # legacy: return up to limit rows
+    p = max(1, int(page))
+    ps = min(max(1, int(page_size or 50)), MAX_PAGE_SIZE)
+    return p, ps
+
+
 @api.get("/visit-sessions")
 async def list_visit_sessions(
     q: Optional[str] = None,
@@ -733,23 +773,31 @@ async def list_visit_sessions(
     from_: Optional[str] = None,
     to: Optional[str] = None,
     limit: int = 500,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
     user: dict = Depends(get_current_user),
 ):
     query: Dict[str, Any] = {}
     if q:
         query["vehicle_number"] = {"$regex": normalize_plate(q), "$options": "i"}
     if status and status != "all":
-        # accept both legacy ("inside","exited") and new ("active","completed")
         mapping = {"inside": "active", "exited": "completed", "pending": "pending"}
         query["status"] = mapping.get(status, status)
     start, end = range_bounds(range, from_, to)
     apply_range_query(query, start, end, field="entry_time")
-    docs = await db.visit_sessions.find(query).sort("entry_time", -1).to_list(limit)
+
+    p, ps = _paginate_params(page, page_size, limit)
+    cursor = db.visit_sessions.find(query).sort("entry_time", -1)
+    if p is None:
+        docs = await cursor.to_list(ps)
+        m_map = await _batch_master_map(docs)
+        return [await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])) for d in docs]
+    total = await db.visit_sessions.count_documents(query)
+    docs = await cursor.skip((p - 1) * ps).to_list(ps)
     m_map = await _batch_master_map(docs)
-    out = []
-    for d in docs:
-        out.append(await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])))
-    return out
+    items = [await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])) for d in docs]
+    return {"items": items, "total": total, "page": p, "page_size": ps,
+            "has_next": (p * ps) < total, "has_prev": p > 1}
 
 
 # ===================== Legacy /api/vehicles CRUD (backward compat) =====================
@@ -759,11 +807,12 @@ async def list_vehicles(
     status: Optional[str] = None,
     date: Optional[str] = None,
     limit: int = 500,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
     user: dict = Depends(get_current_user),
 ):
     query: Dict[str, Any] = {}
     if q:
-        # search sessions by number OR join with master by owner/phone
         matching_masters = await db.vehicle_masters.find({
             "$or": [
                 {"vehicle_number": {"$regex": normalize_plate(q), "$options": "i"}},
@@ -778,14 +827,20 @@ async def list_vehicles(
         mapping = {"inside": "active", "exited": "completed", "pending": "pending"}
         query["status"] = mapping.get(status, status)
     if date:
-        day = date[:10]
-        query["visit_date"] = day
-    docs = await db.visit_sessions.find(query).sort("entry_time", -1).to_list(limit)
+        query["visit_date"] = date[:10]
+
+    p, ps = _paginate_params(page, page_size, limit)
+    cursor = db.visit_sessions.find(query).sort("entry_time", -1)
+    if p is None:
+        docs = await cursor.to_list(ps)
+        m_map = await _batch_master_map(docs)
+        return [await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])) for d in docs]
+    total = await db.visit_sessions.count_documents(query)
+    docs = await cursor.skip((p - 1) * ps).to_list(ps)
     m_map = await _batch_master_map(docs)
-    out = []
-    for d in docs:
-        out.append(await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])))
-    return out
+    items = [await serialize_session_with_master(d, master=m_map.get(d["vehicle_number"])) for d in docs]
+    return {"items": items, "total": total, "page": p, "page_size": ps,
+            "has_next": (p * ps) < total, "has_prev": p > 1}
 
 
 @api.post("/vehicles")
@@ -1086,9 +1141,9 @@ def _report_query(period: str) -> Dict[str, Any]:
 
 @api.get("/reports/export")
 async def export_report(period: str = "daily", format: str = "csv", user: dict = Depends(get_current_user)):
-    docs = await db.visit_sessions.find(_report_query(period)).sort("entry_time", -1).to_list(5000)
-    rows = []
-    for d in docs:
+    # No silent truncation — iterate the cursor to include every matching row.
+    rows: list = []
+    async for d in db.visit_sessions.find(_report_query(period)).sort("entry_time", -1):
         rows.append(await serialize_session_with_master(d))
     filename_base = f"rdx_report_{period}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
     if format == "csv":
@@ -1122,9 +1177,9 @@ async def export_visits(
         vn = normalize_plate(vehicle_number)
         query["vehicle_number"] = vn
         title_suffix = vn
-    docs = await db.visit_sessions.find(query).sort("entry_time", -1).to_list(10000)
-    rows = []
-    for d in docs:
+    # No silent truncation — stream every matching row from the cursor.
+    rows: list = []
+    async for d in db.visit_sessions.find(query).sort("entry_time", -1):
         rows.append(await serialize_session_with_master(d))
     filename = f"rdx_visits_{(vehicle_number or 'all').replace(' ', '')}_{now_utc().strftime('%Y%m%d_%H%M%S')}"
     if format == "csv":
@@ -1254,30 +1309,45 @@ async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: f
             cutoff_dt = now_utc() - timedelta(days=RETENTION_DAYS)
             cutoff = cutoff_dt.isoformat()
             # Collect snapshot file names first so we can unlink from disk after DB purge.
-            snapshots_to_delete: list[str] = []
+            # IMPORTANT: include entry_plate_image + exit_plate_image — the earlier
+            # implementation missed these and plate crops leaked forever.
+            IMG_FIELDS = ("entry_image", "exit_image", "entry_plate_image", "exit_plate_image")
+            per_field_counts: dict[str, int] = {k: 0 for k in IMG_FIELDS}
+            snapshots_to_delete: list[tuple[str, str]] = []  # (field, filename)
+            expired_records = 0
+            projection = {k: 1 for k in IMG_FIELDS}
             async for doc in db.visit_sessions.find(
                 {"entry_time": {"$lt": cutoff}},
-                {"entry_image": 1, "exit_image": 1},
+                projection,
             ):
-                for k in ("entry_image", "exit_image"):
+                expired_records += 1
+                for k in IMG_FIELDS:
                     url = (doc.get(k) or "").strip()
                     if url.startswith("/api/snapshots/"):
-                        snapshots_to_delete.append(url.rsplit("/", 1)[-1])
+                        snapshots_to_delete.append((k, url.rsplit("/", 1)[-1]))
             r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
             removed_files = 0
+            failed_files = 0
             snap_dir = os.path.join(os.path.dirname(__file__), "snapshots")
-            for name in snapshots_to_delete:
+            for field, name in snapshots_to_delete:
                 fpath = os.path.join(snap_dir, name)
                 try:
                     if os.path.isfile(fpath):
                         os.remove(fpath)
                         removed_files += 1
-                except Exception:
-                    pass
-            if r.deleted_count or removed_files:
+                        per_field_counts[field] += 1
+                    # not-a-file is intentional no-op (safe to retry — idempotent)
+                except Exception as e:
+                    failed_files += 1
+                    logger.warning("[retention] failed to remove %s: %s", fpath, e)
+            if expired_records or removed_files or failed_files:
                 logger.info(
-                    "[retention] purged %d visit_sessions and %d snapshot files older than %sd",
-                    r.deleted_count, removed_files, RETENTION_DAYS,
+                    "[retention] expired_records=%d db_deleted=%d files_removed=%d failed=%d "
+                    "(entry_image=%d exit_image=%d entry_plate_image=%d exit_plate_image=%d) older than %sd",
+                    expired_records, r.deleted_count, removed_files, failed_files,
+                    per_field_counts["entry_image"], per_field_counts["exit_image"],
+                    per_field_counts["entry_plate_image"], per_field_counts["exit_plate_image"],
+                    RETENTION_DAYS,
                 )
         except Exception:
             logger.exception("[retention] loop error")
@@ -2032,6 +2102,7 @@ async def root():
 # ---------- Auto-detection snapshots ----------
 from fastapi.responses import FileResponse
 from plate_pipeline import SNAPSHOTS_DIR as _SNAPSHOTS_DIR
+from plate_pipeline import snapshot_disk_stats as _snapshot_disk_stats
 
 
 @api.get("/snapshots/{filename}")
@@ -2042,6 +2113,12 @@ async def get_snapshot(filename: str, user: dict = Depends(require_roles(*ROLE_A
     if not os.path.isfile(fp):
         raise HTTPException(status_code=404, detail="Snapshot not found")
     return FileResponse(fp, media_type="image/jpeg")
+
+
+@api.get("/storage/snapshots")
+async def get_storage_stats(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """Real (not hardcoded) disk-usage stats for the snapshot volume."""
+    return _snapshot_disk_stats()
 
 
 # ===================== Startup =====================

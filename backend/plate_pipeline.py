@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import shutil
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -37,6 +38,40 @@ os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
 # Prevents the same car sitting in view from creating multiple sessions.
 COOLDOWN_SECONDS = 30
 
+# Safety guardrail: refuse to write new snapshots when the underlying disk
+# has less than this many MB free. Prevents the pipeline from filling the
+# volume to 100% (which would kill Mongo / uvicorn). Configurable via env.
+SNAPSHOT_MIN_FREE_MB = int(os.environ.get("SNAPSHOT_MIN_FREE_MB", "500"))
+_last_low_disk_log_at: float = 0.0
+
+
+def snapshot_disk_stats() -> Dict[str, Any]:
+    """Return REAL disk usage stats for the snapshots volume (no faked capacity)."""
+    try:
+        total, used, free = shutil.disk_usage(SNAPSHOTS_DIR)
+    except Exception as e:
+        return {"error": str(e)}
+    snap_bytes = 0
+    snap_files = 0
+    try:
+        with os.scandir(SNAPSHOTS_DIR) as it:
+            for entry in it:
+                if entry.is_file():
+                    snap_bytes += entry.stat().st_size
+                    snap_files += 1
+    except Exception:
+        pass
+    return {
+        "path": SNAPSHOTS_DIR,
+        "disk_total_bytes": total,
+        "disk_used_bytes": used,
+        "disk_free_bytes": free,
+        "snapshots_bytes": snap_bytes,
+        "snapshots_count": snap_files,
+        "min_free_mb_threshold": SNAPSHOT_MIN_FREE_MB,
+        "healthy": free >= SNAPSHOT_MIN_FREE_MB * 1024 * 1024,
+    }
+
 
 def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
     """Persist a JPEG to disk and return its `/api/snapshots/...` URL.
@@ -44,9 +79,29 @@ def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
     `kind` is one of `entry|exit|plate_entry|plate_exit` and is used only
     for the file name so the folder stays flat and predictable while still
     being self-describing.
+
+    Refuses to write (and returns "") when free disk drops below the
+    configured threshold — the DB record still gets created with an empty
+    image field, keeping ANPR fully functional even under disk pressure.
     """
     if not jpeg:
         return ""
+    try:
+        free = shutil.disk_usage(SNAPSHOTS_DIR).free
+        if free < SNAPSHOT_MIN_FREE_MB * 1024 * 1024:
+            # Log at most once per minute to avoid log-spam under sustained pressure.
+            import time as _t
+            global _last_low_disk_log_at
+            now = _t.time()
+            if now - _last_low_disk_log_at > 60:
+                _last_low_disk_log_at = now
+                logger.warning(
+                    "[snapshot] LOW DISK — free=%.0fMB threshold=%dMB — skipping write kind=%s plate=%s",
+                    free / 1024 / 1024, SNAPSHOT_MIN_FREE_MB, kind, plate,
+                )
+            return ""
+    except Exception:
+        pass  # if we cannot stat the volume, still attempt the write
     safe = "".join(c for c in (plate or "UNKNOWN") if c.isalnum())[:16] or "UNKNOWN"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = f"{ts}_{safe}_{kind}_{uuid.uuid4().hex[:8]}.jpg"

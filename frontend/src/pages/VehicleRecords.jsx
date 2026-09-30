@@ -53,6 +53,10 @@ export default function VehicleRecords() {
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [hasPrev, setHasPrev] = useState(false);
 
   const [selected, setSelected] = useState(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -62,6 +66,8 @@ export default function VehicleRecords() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
 
+  const PAGE_SIZE = 100;
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -70,17 +76,22 @@ export default function VehicleRecords() {
           q: q || undefined,
           status: status !== "all" ? status : undefined,
           date: date ? new Date(date).toISOString().slice(0, 10) : undefined,
-          limit: 500,
+          page,
+          page_size: PAGE_SIZE,
         },
       });
-      setRows(data);
+      setRows(data.items || []);
+      setTotal(data.total || 0);
+      setHasNext(!!data.has_next);
+      setHasPrev(!!data.has_prev);
     } catch (e) {
       toast.error("Failed to load", { description: e.message });
     } finally {
       setLoading(false);
     }
-  }, [q, status, date]);
+  }, [q, status, date, page]);
 
+  useEffect(() => { setPage(1); }, [q, status, date]);
   useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
@@ -150,6 +161,37 @@ export default function VehicleRecords() {
       <VehicleFilters q={q} setQ={setQ} status={status} setStatus={setStatus} date={date} setDate={setDate} />
 
       <VehicleTable rows={rows} loading={loading} onView={openView} onEdit={openEdit} onDelete={remove} />
+
+      {!loading && total > 0 && (
+        <div className="flex items-center justify-between px-2 text-xs text-slate-400" data-testid="vehicles-pagination">
+          <div>
+            Showing <span className="text-slate-200">{(page - 1) * PAGE_SIZE + 1}</span>–
+            <span className="text-slate-200">{(page - 1) * PAGE_SIZE + rows.length}</span> of{" "}
+            <span className="text-slate-200">{total.toLocaleString()}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm" variant="outline"
+              className="h-8 px-3 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
+              disabled={!hasPrev}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              data-testid="vehicles-prev"
+            >
+              Prev
+            </Button>
+            <span className="tabular-nums">Page {page} / {Math.max(1, Math.ceil(total / PAGE_SIZE))}</span>
+            <Button
+              size="sm" variant="outline"
+              className="h-8 px-3 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
+              disabled={!hasNext}
+              onClick={() => setPage((p) => p + 1)}
+              data-testid="vehicles-next"
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      )}
 
       <VehicleDetailsDialog vehicle={selected} open={detailsOpen} onOpenChange={setDetailsOpen} />
 

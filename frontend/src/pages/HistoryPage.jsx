@@ -2,7 +2,10 @@ import React, { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { LogIn as LogInIcon, LogOut } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { LogIn as LogInIcon, LogOut, ChevronLeft, ChevronRight } from "lucide-react";
+
+const PAGE_SIZE = 50;
 
 function formatTime(iso) {
   if (!iso) return "—";
@@ -12,32 +15,40 @@ function formatTime(iso) {
 export default function HistoryPage({ mode = "entry" }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [hasPrev, setHasPrev] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
+      setLoading(true);
       try {
-        const { data } = await api.get("/vehicles", { params: { limit: 500 } });
-        // filter based on mode
-        let filtered = data;
-        if (mode === "entry") filtered = data.filter((v) => !!v.entry_time);
-        if (mode === "exit") filtered = data.filter((v) => !!v.exit_time);
-        filtered.sort((a, b) => {
-          const ta = new Date(mode === "exit" ? a.exit_time : a.entry_time).getTime();
-          const tb = new Date(mode === "exit" ? b.exit_time : b.entry_time).getTime();
-          return tb - ta;
-        });
-        setRows(filtered);
+        // For "exit" mode we only want completed sessions; entry mode shows every session.
+        const params = { page, page_size: PAGE_SIZE };
+        if (mode === "exit") params.status = "exited";
+        const { data } = await api.get("/vehicles", { params });
+        if (cancelled) return;
+        const items = data.items || [];
+        setRows(items);
+        setTotal(data.total || 0);
+        setHasNext(!!data.has_next);
+        setHasPrev(!!data.has_prev);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [mode]);
+    return () => { cancelled = true; };
+  }, [mode, page]);
 
   const Icon = mode === "exit" ? LogOut : LogInIcon;
   const title = mode === "exit" ? "Exit History" : "Entry History";
   const subtitle = mode === "exit"
     ? "Chronological log of every vehicle exit from the showroom."
     : "Chronological log of every vehicle entry into the showroom.";
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <div className="space-y-6" data-testid={`${mode}-history-page`}>
@@ -84,6 +95,37 @@ export default function HistoryPage({ mode = "entry" }) {
             </tbody>
           </table>
         </div>
+
+        {!loading && total > 0 && (
+          <div className="flex items-center justify-between px-5 py-3 border-t border-white/5 text-xs text-slate-400" data-testid={`${mode}-history-pagination`}>
+            <div>
+              Showing <span className="text-slate-200">{(page - 1) * PAGE_SIZE + 1}</span>–
+              <span className="text-slate-200">{(page - 1) * PAGE_SIZE + rows.length}</span> of{" "}
+              <span className="text-slate-200">{total.toLocaleString()}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm" variant="outline"
+                className="h-8 px-2 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
+                disabled={!hasPrev}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                data-testid={`${mode}-history-prev`}
+              >
+                <ChevronLeft className="h-3.5 w-3.5" /> Prev
+              </Button>
+              <span className="tabular-nums">Page {page} / {totalPages}</span>
+              <Button
+                size="sm" variant="outline"
+                className="h-8 px-2 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
+                disabled={!hasNext}
+                onClick={() => setPage((p) => p + 1)}
+                data-testid={`${mode}-history-next`}
+              >
+                Next <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
