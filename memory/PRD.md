@@ -160,5 +160,12 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - **Verified:** auth guard 401 (no/wrong secret) · real backup = 126,452 bytes, valid gzip, `mongorestore --dryRun` passed (read-only, zero DB writes) · failure path (bad URI) raises cleanly with sanitized error, previous backups intact, no /tmp leak · URI appears 0 times in logs · `GET /api/backups` 401 unauth, lists baseline backup for admin · crons.yml parses, both jobs enabled. DB schema unchanged (new additive `backups` collection only); frontend/CAM-01/local_agent/YOLO/EasyOCR untouched; not deployed.
 - **Limitation:** expired backups are soft-expired only (object bytes remain — platform has no delete API). At ~126 KB/backup this is negligible for years.
 
+## Retention Audit (2026-09-30 · READ-ONLY, no changes)
+- Cutoff: `RETENTION_DAYS=180` hard-coded (server.py:65); `entry_time < now_utc()-180d` (ISO string compare).
+- Only `visit_sessions` purged; `vehicle_masters` NEVER deleted; all other collections untouched.
+- All 4 image fields cleaned from local disk; Object Storage bytes orphaned (no platform DELETE API).
+- Schedule: in-process loop, 24h interval, 1h startup grace, `RETENTION_ENABLED` kill switch (unset → enabled). Runtime logs confirm real purges.
+- **Open risks flagged (not fixed):** (1) `POST /api/maintenance/purge-expired` is any-role (not admin-only) and skips snapshot file cleanup; (2) active sessions with entry_time >180d would be purged (status not in filter).
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.
