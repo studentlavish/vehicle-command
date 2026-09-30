@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from event_bus import event_bus
+import object_storage
 
 logger = logging.getLogger("rdx.plate_pipeline")
 logger.setLevel(logging.INFO)
@@ -73,19 +74,36 @@ def snapshot_disk_stats() -> Dict[str, Any]:
     }
 
 
-def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
-    """Persist a JPEG to disk and return its `/api/snapshots/...` URL.
+async def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
+    """Persist a JPEG — Emergent Object Storage first, local disk as fallback.
 
     `kind` is one of `entry|exit|plate_entry|plate_exit` and is used only
     for the file name so the folder stays flat and predictable while still
     being self-describing.
 
-    Refuses to write (and returns "") when free disk drops below the
-    configured threshold — the DB record still gets created with an empty
-    image field, keeping ANPR fully functional even under disk pressure.
+    Returns the stable `/api/snapshots/...` URL regardless of where the bytes
+    are stored, so DB records, the frontend, and existing records never change.
+
+    Local-disk writes still respect the 500 MB free-space guardrail — the
+    pipeline never fills the volume to 100%.
     """
     if not jpeg:
         return ""
+    safe = "".join(c for c in (plate or "UNKNOWN") if c.isalnum())[:16] or "UNKNOWN"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    name = f"{ts}_{safe}_{kind}_{uuid.uuid4().hex[:8]}.jpg"
+
+    # Primary: Emergent Object Storage (off the small application volume).
+    try:
+        await object_storage.put_object(f"{object_storage.APP_PREFIX}/snapshots/{name}", jpeg, "image/jpeg")
+        return f"/api/snapshots/{name}"
+    except Exception as e:
+        logger.warning(
+            "[snapshot] object storage upload failed (%s: %s) — falling back to local disk for %s",
+            type(e).__name__, e, name,
+        )
+
+    # Fallback: local disk with the free-space guardrail.
     try:
         free = shutil.disk_usage(SNAPSHOTS_DIR).free
         if free < SNAPSHOT_MIN_FREE_MB * 1024 * 1024:
@@ -102,9 +120,6 @@ def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
             return ""
     except Exception:
         pass  # if we cannot stat the volume, still attempt the write
-    safe = "".join(c for c in (plate or "UNKNOWN") if c.isalnum())[:16] or "UNKNOWN"
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    name = f"{ts}_{safe}_{kind}_{uuid.uuid4().hex[:8]}.jpg"
     path = os.path.join(SNAPSHOTS_DIR, name)
     try:
         with open(path, "wb") as f:
@@ -210,8 +225,8 @@ async def _persist_entry(
                 pass
 
     # 4. Write snapshots
-    vehicle_snap = _write_snapshot(f"{event_kind}", plate, jpeg_frame) if jpeg_frame else ""
-    plate_snap = _write_snapshot(f"plate_{event_kind}", plate, plate_jpeg) if plate_jpeg else ""
+    vehicle_snap = await _write_snapshot(f"{event_kind}", plate, jpeg_frame) if jpeg_frame else ""
+    plate_snap = await _write_snapshot(f"plate_{event_kind}", plate, plate_jpeg) if plate_jpeg else ""
 
     if is_exit:
         # 5a. Close the active session as EXIT

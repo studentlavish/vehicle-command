@@ -143,5 +143,14 @@ Android IP Camera → Local Agent (Windows PC, YOLO + Gemini OCR)
 - `/app` volume is still only 3.0 GB free on preview; production disk should be sized for ≥27 GB (180d × 150 KB/movement × 1,000/day). The guardrail prevents the pipeline from filling the disk to 100% but does not create space. If production runs low, either grow the volume or lower `SNAPSHOT_MIN_FREE_MB` after adding a bigger volume.
 - Existing single-vehicle sessions endpoint `/api/vehicles/master/{vn}/sessions` keeps its 500-row `limit=` default (unchanged contract for the detail view). Use `/sessions/paginated` for large histories.
 
+## What's Been Implemented (2026-09-30 · Task 1: Snapshot Object Storage)
+### New snapshots now go to Emergent Object Storage (off the 9.8 GB app volume)
+- **New `backend/object_storage.py`** — async adapter for the platform object storage (`INTEGRATION_PROXY_URL` + `EMERGENT_LLM_KEY`, both already provisioned). `init_storage()` lazy session key, `put_object()` (one forced re-init retry on 403/404), `get_object_or_none()` (None on missing object). App prefix: `rdx-vashu`.
+- **`backend/plate_pipeline.py`** — `_write_snapshot()` is now async: uploads to `rdx-vashu/snapshots/{filename}` FIRST; on any failure logs a warning and falls back to local disk (the 500 MB `SNAPSHOT_MIN_FREE_MB` guardrail still governs the fallback). Returns the same `/api/snapshots/{filename}` URL either way — DB fields, filenames, and contracts unchanged. Two call sites in `_persist_entry` now `await` it. No other callers exist.
+- **`backend/server.py`** — `GET /api/snapshots/{filename}` now: local disk first (legacy files, fast path) → object storage fallback → 404. Same route, same auth, same response bytes.
+- **Not changed:** DB schema, auth, frontend, CAM-01, showroom-pc-01, YOLO, EasyOCR, entry/exit logic, 180-day retention policy. No existing local snapshots touched or deleted. No MongoDB backup work (deferred, per instruction).
+- **Verified:** init/put/get credential round-trip; upload→object storage with byte-identical read-back and no local copy; simulated storage outage → local fallback write; low-disk guardrail blocks fallback; empty jpeg → ""; legacy local snapshot serves 200; nonexistent → 404; live E2E `plate_detected` → both `entry_image` + `entry_plate_image` stored in object storage, served byte-identical via the existing endpoint.
+- **Known note:** object storage has no delete API — snapshots of records purged by the 180-day retention become orphaned objects (small, bounded by retention window). To be addressed if quota ever matters.
+
 ## Test Credentials
 See `/app/memory/test_credentials.md`.

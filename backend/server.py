@@ -2103,16 +2103,26 @@ async def root():
 from fastapi.responses import FileResponse
 from plate_pipeline import SNAPSHOTS_DIR as _SNAPSHOTS_DIR
 from plate_pipeline import snapshot_disk_stats as _snapshot_disk_stats
+import object_storage as _objstore
 
 
 @api.get("/snapshots/{filename}")
 async def get_snapshot(filename: str, user: dict = Depends(require_roles(*ROLE_ALL))):
     # basic path-traversal guard
     safe = os.path.basename(filename)
+    # Legacy snapshots live on local disk — serve them directly (fast path).
     fp = os.path.join(_SNAPSHOTS_DIR, safe)
-    if not os.path.isfile(fp):
+    if os.path.isfile(fp):
+        return FileResponse(fp, media_type="image/jpeg")
+    # New snapshots live in Emergent Object Storage.
+    try:
+        data, ctype = await _objstore.get_object_or_none(f"{_objstore.APP_PREFIX}/snapshots/{safe}")
+    except Exception as e:
+        logger.warning("[snapshot] object storage fetch failed for %s: %s", safe, e)
+        raise HTTPException(status_code=502, detail="Snapshot storage unavailable")
+    if data is None:
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    return FileResponse(fp, media_type="image/jpeg")
+    return Response(content=data, media_type=ctype or "image/jpeg")
 
 
 @api.get("/storage/snapshots")
