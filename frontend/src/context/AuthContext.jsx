@@ -19,23 +19,11 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
-    // CRITICAL: returning from Emergent Google OAuth — AuthCallback exchanges
-    // the session_id and establishes the session before any /auth/me check.
-    if (window.location.hash?.includes("session_id=")) {
-      setLoading(false);
-      return;
-    }
     checkSession();
   }, [checkSession]);
 
   const login = async (email, password, rememberMe) => {
     const { data } = await api.post("/auth/login", { email, password, remember_me: rememberMe });
-    setUser(data);
-    return data;
-  };
-
-  const googleSession = async (sessionId) => {
-    const { data } = await api.post("/auth/google/session", { session_id: sessionId });
     setUser(data);
     return data;
   };
@@ -53,7 +41,7 @@ export function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, googleSession, refresh: checkSession, formatApiError }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, refresh: checkSession, formatApiError }}>
       {children}
     </AuthContext.Provider>
   );

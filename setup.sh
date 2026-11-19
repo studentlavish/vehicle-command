@@ -84,7 +84,7 @@ say "Setting up backend virtualenv"
 cd "$ROOT/backend"
 [ -d .venv ] || "$PY" -m venv .venv
 .venv/bin/pip install --upgrade pip wheel >/dev/null
-.venv/bin/pip install -r requirements-local.txt
+.venv/bin/pip install -r requirements.txt
 # Optional: Emergent LLM SDK (only needed for AI plate-read / chat features)
 if [ "${INSTALL_EMERGENT:-1}" = "1" ]; then
   .venv/bin/pip install emergentintegrations --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/ \

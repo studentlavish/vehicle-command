@@ -1,16 +1,27 @@
-"""Emergent-managed Resend email helper — used by the daily digest cron.
+"""Outgoing email (daily digest, alerts).
 
-Implements the guardrail gate from the integration playbook: structural
-defense-in-depth for G2 (no credential asks / forms) and G3 (only absolute
-https links, no shorteners / IP literals / punycode / userinfo, anchor text
-must match real host).
+EMAIL_PROVIDER
+    resend    Resend API directly — RESEND_API_KEY, EMAIL_FROM
+    smtp      any SMTP server — SMTP_HOST, SMTP_PORT (587), SMTP_USER,
+              SMTP_PASSWORD, SMTP_TLS (starttls | ssl | none), EMAIL_FROM
+    emergent  legacy Emergent-managed proxy — EMERGENT_EMAIL_KEY
+    (unset)   email disabled
+
+Every message passes a safety gate first: no forms or credential requests
+(G2); only absolute https links, no shorteners / IP literals / punycode /
+userinfo, and link text must match the real host (G3).
 """
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
 import re
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import formataddr, make_msgid
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
@@ -18,12 +29,21 @@ import httpx
 
 logger = logging.getLogger("rdx.email")
 
-# Constant per playbook — do NOT read from env, so it survives deployment.
-EMAIL_BASE_URL = "https://integrations.emergentagent.com"
+EMERGENT_EMAIL_URL = "https://integrations.emergentagent.com/api/v1/email/send"
+RESEND_URL = "https://api.resend.com/emails"
 
 EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY", "")
 EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "Vashu Hyundai")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "").strip()
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
+
+
+def provider() -> str:
+    """The active email provider ("" when email is not configured)."""
+    p = os.environ.get("EMAIL_PROVIDER", "").strip().lower()
+    if not p and EMAIL_KEY:
+        return "emergent"  # older installs configured only EMERGENT_EMAIL_KEY
+    return p if p in ("resend", "smtp", "emergent") else ""
 
 
 _SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
@@ -101,26 +121,77 @@ def _assert_safe_email(subject: str, html: str) -> None:
 
 
 async def send_email(*, to: str, subject: str, html: str, reply_to: str | None = None) -> str | None:
-    """Send one transactional email via the Emergent-managed Resend proxy.
+    """Send one transactional email. Returns the provider message id (or None).
 
-    Returns the provider message id or None. Raises on hard failure.
+    Raises RuntimeError when email is not configured and on hard failures.
     """
+    p = provider()
+    if not p:
+        raise RuntimeError("Email is not configured (set EMAIL_PROVIDER)")
+    _assert_safe_email(subject, html)
+    reply = reply_to or EMAIL_REPLY_TO
+    if p == "resend":
+        return await _send_resend(to, subject, html, reply)
+    if p == "smtp":
+        return await asyncio.to_thread(_send_smtp, to, subject, html, reply)
+    return await _send_emergent(to, subject, html, reply)
+
+
+def _from_header() -> str:
+    if not EMAIL_FROM:
+        raise RuntimeError("EMAIL_FROM is not set (the sender address, e.g. reports@yourdomain.com)")
+    return formataddr((EMAIL_FROM_NAME, EMAIL_FROM))
+
+
+async def _post_json(url: str, headers: dict, payload: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _send_resend(to: str, subject: str, html: str, reply: str | None) -> str | None:
+    key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("RESEND_API_KEY is not set")
+    payload = {"from": _from_header(), "to": [to], "subject": subject, "html": html}
+    if reply:
+        payload["reply_to"] = reply
+    data = await _post_json(RESEND_URL, {"Authorization": f"Bearer {key}"}, payload)
+    return data.get("id")
+
+
+def _send_smtp(to: str, subject: str, html: str, reply: str | None) -> str | None:
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if not host:
+        raise RuntimeError("SMTP_HOST is not set")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    mode = os.environ.get("SMTP_TLS", "starttls").strip().lower()
+    msg = EmailMessage()
+    msg["From"] = _from_header()
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid(domain=EMAIL_FROM.split("@")[-1] if "@" in EMAIL_FROM else None)
+    if reply:
+        msg["Reply-To"] = reply
+    msg.set_content("This message needs an HTML-capable email client.")
+    msg.add_alternative(html, subtype="html")
+    cls = smtplib.SMTP_SSL if mode == "ssl" else smtplib.SMTP
+    with cls(host, port, timeout=30) as smtp:
+        if mode == "starttls":
+            smtp.starttls(context=ssl.create_default_context())
+        user = os.environ.get("SMTP_USER", "")
+        if user:
+            smtp.login(user, os.environ.get("SMTP_PASSWORD", ""))
+        smtp.send_message(msg)
+    return msg["Message-ID"]
+
+
+async def _send_emergent(to: str, subject: str, html: str, reply: str | None) -> str | None:
     if not EMAIL_KEY:
         raise RuntimeError("EMERGENT_EMAIL_KEY is not configured")
-    _assert_safe_email(subject, html)
-    payload = {
-        "to": [to],
-        "subject": subject,
-        "html": html,
-        "from_name": EMAIL_FROM_NAME,
-    }
-    if reply_to or EMAIL_REPLY_TO:
-        payload["contact_email"] = reply_to or EMAIL_REPLY_TO
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{EMAIL_BASE_URL}/api/v1/email/send",
-            headers={"X-Email-Key": EMAIL_KEY},
-            json=payload,
-        )
-    resp.raise_for_status()
-    return resp.json().get("id")
+    payload = {"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME}
+    if reply:
+        payload["contact_email"] = reply
+    data = await _post_json(EMERGENT_EMAIL_URL, {"X-Email-Key": EMAIL_KEY}, payload)
+    return data.get("id")

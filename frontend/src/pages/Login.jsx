@@ -1,5 +1,6 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import api, { API } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -19,15 +20,28 @@ const FEATURES = [
   { icon: BarChart3, title: "Traffic analytics", text: "Daily, weekly and monthly visitor trends and reports." },
 ];
 
+const GOOGLE_ERRORS = {
+  google_not_allowed: "This Google account isn't allowed. Ask an admin to add your email under Users.",
+  google_cancelled: "Google sign-in was cancelled.",
+  google_expired: "The Google sign-in took too long. Please try again.",
+  google_state: "The Google sign-in couldn't be verified. Please try again.",
+  google_failed: "Google sign-in failed. Please try again.",
+};
+
 export default function Login() {
   const { login, formatApiError } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const [googleEnabled, setGoogleEnabled] = useState(false);
+  useEffect(() => {
+    api.get("/auth/config").then(({ data }) => setGoogleEnabled(!!data?.google)).catch(() => setGoogleEnabled(false));
+  }, []);
   const [email, setEmail] = useState(IS_DEV ? DEMO[0].email : "");
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(GOOGLE_ERRORS[params.get("error")] || "");
 
   const submit = async (e) => {
     e.preventDefault();
@@ -48,9 +62,7 @@ export default function Login() {
   };
 
   const google = () => {
-    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
-    const redirectUrl = window.location.origin + "/";
-    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+    window.location.href = `${API}/auth/google/start`;
   };
 
   return (
@@ -145,6 +157,7 @@ export default function Login() {
                 {loading ? <><Loader2 className="h-4 w-4 animate-spin" /> Signing in…</> : "Sign in"}
               </Button>
 
+              {googleEnabled && (<>
               <div className="flex items-center gap-3 py-1">
                 <div className="h-px flex-1 bg-border" />
                 <span className="text-xs text-muted-foreground">or</span>
@@ -160,6 +173,7 @@ export default function Login() {
                 </svg>
                 Continue with Google
               </Button>
+              </>)}
             </form>
           </div>
 

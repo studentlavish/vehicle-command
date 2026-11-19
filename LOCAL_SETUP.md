@@ -103,7 +103,7 @@ Needs cloud keys in `backend/.env` (blank = feature quietly disabled):
 | WhatsApp (Meta Cloud API) | `META_*` |
 | "Sign in with Google" | Uses Emergent's hosted auth; may not work from localhost — use email/password locally |
 
-The two scheduled jobs from Emergent (`.emergent/crons.yml`) don't run locally. Trigger them manually if needed:
+Daily jobs (digest 09:00, backup 03:00, retention 03:30 — `DIGEST_TIME`, `BACKUP_TIME`, `RETENTION_TIME`) run inside the backend. They can also be triggered manually:
 
 ```bash
 source backend/.env

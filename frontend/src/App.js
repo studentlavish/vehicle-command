@@ -1,10 +1,9 @@
 import React from "react";
-import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/context/AuthContext";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
-import AuthCallback from "@/pages/AuthCallback";
 import Dashboard from "@/pages/Dashboard";
 import LiveMonitoring from "@/pages/LiveMonitoring";
 import VehicleRecords from "@/pages/VehicleRecords";
@@ -30,12 +29,6 @@ function Guarded({ children }) {
 }
 
 function AppRouter() {
-  const location = useLocation();
-  // OAuth session_id arrives in the URL fragment — detect synchronously during
-  // render (not useEffect) so the exchange happens before any guard runs.
-  if (location.hash?.includes("session_id=")) {
-    return <AuthCallback />;
-  }
   return (
     <Routes>
       <Route path="/login" element={<Login />} />

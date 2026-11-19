@@ -1,5 +1,6 @@
-# Test and lint tools. Install into BOTH virtualenvs:
+# Test and lint tools. Install into BOTH virtualenvs (moto is only used by backend tests):
 #   backend/.venv/bin/pip install -r requirements-dev.txt
 #   local_agent/.venv/bin/pip install -r requirements-dev.txt
 pytest>=8.0
 ruff>=0.6
+moto[s3]>=5.0

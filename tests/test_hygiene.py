@@ -79,3 +79,10 @@ def test_plate_rules_copies_identical():
     a = (ROOT / "backend" / "plate_rules.py").read_bytes()
     b = (ROOT / "local_agent" / "plate_rules.py").read_bytes()
     assert a == b, "backend/plate_rules.py and local_agent/plate_rules.py have drifted"
+
+
+def test_emergent_only_in_legacy_adapters():
+    """Production runs on our own server; Emergent remains only as a legacy read/email adapter."""
+    allowed = {"backend/object_storage.py", "backend/email_utils.py"}
+    hits = [h for h in _hits(r"emergentagent\.com|emergentintegrations", _app_files()) if h.split(":")[0] not in allowed]
+    assert not hits, hits

@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from event_bus import event_bus
 import object_storage
 import plate_rules
+import storage
 
 logger = logging.getLogger("rdx.plate_pipeline")
 logger.setLevel(logging.INFO)
@@ -103,17 +104,14 @@ def snapshot_disk_stats() -> Dict[str, Any]:
 
 
 async def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
-    """Persist a JPEG — Emergent Object Storage first, local disk as fallback.
+    """Persist a JPEG and return its stable `/api/snapshots/<file>` URL.
 
-    `kind` is one of `entry|exit|plate_entry|plate_exit` and is used only
-    for the file name so the folder stays flat and predictable while still
-    being self-describing.
+    `kind` is one of `entry|exit|plate_entry|plate_exit|review|plate_review`
+    and is used only for the file name.
 
-    Returns the stable `/api/snapshots/...` URL regardless of where the bytes
-    are stored, so DB records, the frontend, and existing records never change.
-
-    Local-disk writes still respect the 500 MB free-space guardrail — the
-    pipeline never fills the volume to 100%.
+    With STORAGE_BACKEND=s3 the image goes to the bucket, falling back to local
+    disk if the upload fails. Local-disk writes respect the SNAPSHOT_MIN_FREE_MB
+    guardrail, so the pipeline never fills the volume.
     """
     if not jpeg:
         return ""
@@ -121,22 +119,15 @@ async def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = f"{ts}_{safe}_{kind}_{uuid.uuid4().hex[:8]}.jpg"
 
-    # Primary: Emergent Object Storage (off the small application volume) —
-    # skipped entirely when no key is configured (e.g. running locally).
-    try:
-        if not getattr(object_storage, "EMERGENT_KEY", ""):
-            raise RuntimeError("object storage not configured")
-        await object_storage.put_object(f"{object_storage.APP_PREFIX}/snapshots/{name}", jpeg, "image/jpeg")
-        return f"/api/snapshots/{name}"
-    except RuntimeError:
-        pass
-    except Exception as e:
-        logger.warning(
-            "[snapshot] object storage upload failed (%s: %s) — falling back to local disk for %s",
-            type(e).__name__, e, name,
-        )
+    store = storage.get()
+    if store.name != "local":
+        try:
+            await store.put(f"snapshots/{name}", jpeg, "image/jpeg")
+            return f"/api/snapshots/{name}"
+        except Exception as e:
+            logger.warning("[snapshot] %s upload failed (%s: %s) — falling back to local disk for %s",
+                           store.name, type(e).__name__, e, name)
 
-    # Fallback: local disk with the free-space guardrail.
     try:
         free = shutil.disk_usage(SNAPSHOTS_DIR).free
         if free < SNAPSHOT_MIN_FREE_MB * 1024 * 1024:
@@ -161,6 +152,40 @@ async def _write_snapshot(kind: str, plate: str, jpeg: bytes) -> str:
         logger.warning("[snapshot] write failed for %s (%s): %s", plate, kind, e)
         return ""
     return f"/api/snapshots/{name}"
+
+
+async def read_snapshot(name: str) -> Optional[bytes]:
+    """Snapshot bytes: local disk → configured storage → legacy Emergent store (old records)."""
+    name = os.path.basename(name or "")
+    if not name:
+        return None
+    fp = os.path.join(SNAPSHOTS_DIR, name)
+    if os.path.isfile(fp):
+        with open(fp, "rb") as f:
+            return f.read()
+    store = storage.get()
+    if store.name != "local":
+        data = await store.get(f"snapshots/{name}")
+        if data is not None:
+            return data
+    if getattr(object_storage, "EMERGENT_KEY", ""):
+        data, _ = await object_storage.get_object_or_none(f"{object_storage.APP_PREFIX}/snapshots/{name}")
+        return data
+    return None
+
+
+async def delete_snapshot(name: str) -> bool:
+    """Remove a snapshot wherever it lives (local disk and/or bucket)."""
+    name = os.path.basename(name or "")
+    removed = False
+    fp = os.path.join(SNAPSHOTS_DIR, name)
+    if name and os.path.isfile(fp):
+        os.remove(fp)
+        removed = True
+    store = storage.get()
+    if name and store.name != "local":
+        removed = await store.delete(f"snapshots/{name}") or removed
+    return removed
 
 
 def _master_public(master: dict) -> dict:

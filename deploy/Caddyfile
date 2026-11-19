@@ -1,0 +1,27 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	# API + WebSockets (agent, live camera, live events) — Caddy proxies upgrades automatically.
+	handle /api/* {
+		reverse_proxy backend:8001
+	}
+
+	# Dashboard (single-page app).
+	handle {
+		root * /srv
+		@assets path /static/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		header /index.html Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

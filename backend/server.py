@@ -17,12 +17,11 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict, Any, Tuple
 
 import bcrypt
-import httpx
 import jwt
 import whatsapp_meta as wa_meta
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr
@@ -36,14 +35,11 @@ import local_ocr
 from zoneinfo import ZoneInfo
 from event_bus import event_bus
 import security
+import scheduler
+import google_oauth
+import config_check
 
 # Optional integrations
-try:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
-    HAS_LLM = True
-except ImportError:
-    HAS_LLM = False
-
 try:
     from twilio.rest import Client as TwilioClient
     HAS_TWILIO = True
@@ -63,7 +59,6 @@ JWT_ALG = "HS256"
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"].lower()
 # Only used to create the first admin on a fresh install (see seed_admin).
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
@@ -119,28 +114,6 @@ def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("refresh_token", refresh, **security.cookie_kwargs(604800))
 
 
-async def _user_from_google_session(token: str) -> Optional[dict]:
-    """Fallback auth: Emergent-managed Google session token stored server-side."""
-    sess = await db.user_sessions.find_one({"session_token": token})
-    if not sess:
-        return None
-    try:
-        exp = sess.get("expires_at")
-        exp_dt = datetime.fromisoformat(exp) if isinstance(exp, str) else exp
-        if exp_dt and exp_dt.tzinfo is None:
-            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-        if not exp_dt or exp_dt < datetime.now(timezone.utc):
-            return None
-    except Exception:
-        return None
-    user = await db.users.find_one({"_id": ObjectId(sess["user_id"])})
-    if not user or user.get("status") == "inactive":
-        return None
-    user["id"] = str(user.pop("_id"))
-    user.pop("password_hash", None)
-    return user
-
-
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -164,9 +137,6 @@ async def get_current_user(request: Request) -> dict:
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
-        google_user = await _user_from_google_session(token)
-        if google_user is not None:
-            return google_user
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -317,10 +287,6 @@ class LoginIn(BaseModel):
     remember_me: Optional[bool] = False
 
 
-class GoogleSessionIn(BaseModel):
-    session_id: str
-
-
 class EntryIn(BaseModel):
     vehicle_number: str
     owner_name: Optional[str] = None
@@ -443,70 +409,75 @@ async def login(payload: LoginIn, request: Request, response: Response):
     }
 
 
-EMERGENT_SESSION_DATA_URL = "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data"
+# ---------- Sign in with Google (direct OAuth, see google_oauth.py) ----------
+def _login_redirect(error: str = "") -> RedirectResponse:
+    target = google_oauth.public_url() or ""
+    return RedirectResponse(f"{target}/login?error={error}" if error else f"{target}/", status_code=303)
 
 
-@api.post("/auth/google/session")
-async def google_session(payload: GoogleSessionIn, response: Response):
-    """Exchange an Emergent Google OAuth session_id for the app's JWT cookies.
+@api.get("/auth/config")
+async def auth_config():
+    """What the login page should offer."""
+    return {"google": google_oauth.enabled()}
 
-    The session-data call MUST happen server-side. The Google account's email
-    must already exist in `users` (admin-managed allowlist) — unknown accounts
-    are rejected, nothing is auto-provisioned here.
-    """
+
+@api.get("/auth/google/start")
+async def google_start():
+    if not google_oauth.enabled():
+        raise HTTPException(status_code=404, detail="Google sign-in is not configured")
+    flow = google_oauth.new_flow()
+    resp = RedirectResponse(google_oauth.authorization_url(flow), status_code=303)
+    token = jwt.encode({**flow, "exp": datetime.now(timezone.utc) + timedelta(seconds=google_oauth.FLOW_SECONDS)},
+                       JWT_SECRET, algorithm=JWT_ALG)
+    resp.set_cookie(google_oauth.FLOW_COOKIE, token, **{**security.cookie_kwargs(google_oauth.FLOW_SECONDS),
+                                                        "path": "/api/auth/google"})
+    return resp
+
+
+@api.get("/auth/google/callback")
+async def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Google sends the user back here. Only emails already listed under Users may sign in."""
+    def fail(reason: str) -> RedirectResponse:
+        r = _login_redirect(reason)
+        r.delete_cookie(google_oauth.FLOW_COOKIE, path="/api/auth/google")
+        return r
+
+    if error or not code:
+        return fail("google_cancelled")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(EMERGENT_SESSION_DATA_URL, headers={"X-Session-ID": payload.session_id})
-    except Exception:
-        raise HTTPException(status_code=502, detail="Could not reach Google auth service")
-    if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid or expired Google session")
-    data = r.json()
-    email = (data.get("email") or "").strip().lower()
-    gtoken = data.get("session_token") or ""
-    if not email or not gtoken:
-        raise HTTPException(status_code=401, detail="Invalid Google session response")
+        flow = jwt.decode(request.cookies.get(google_oauth.FLOW_COOKIE, ""), JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.PyJWTError:
+        return fail("google_expired")
+    if not state or not pysecrets.compare_digest(state, flow.get("state", "")):
+        return fail("google_state")
+    try:
+        claims = await google_oauth.identity_from_code(code, flow)
+    except Exception as e:
+        logger.warning("[auth] Google sign-in failed: %s", e)
+        return fail("google_failed")
+    email = claims["email"].strip().lower()
     user = await db.users.find_one({"email": email})
     if not user:
-        raise HTTPException(status_code=403, detail="This Google account is not authorized. Ask an admin to add your email under Users.")
-    if user.get("status") == "inactive":
-        raise HTTPException(status_code=403, detail="Account is inactive")
-    if user.get("role") not in ROLE_ALL:
-        raise HTTPException(status_code=403, detail="Unknown role")
+        logger.info("[auth] Google sign-in refused for %s (not under Users)", email)
+        return fail("google_not_allowed")
+    if user.get("status") == "inactive" or user.get("role") not in ROLE_ALL:
+        return fail("google_not_allowed")
     uid = str(user["_id"])
-    now = now_utc()
-    await db.user_sessions.insert_one({
-        "user_id": uid,
-        "session_token": gtoken,
-        "provider": "google",
-        "expires_at": (now + timedelta(days=7)).isoformat(),
-        "created_at": now.isoformat(),
-    })
-    access = create_access_token(uid, email)
-    refresh = create_refresh_token(uid)
-    set_auth_cookies(response, access, refresh)
-    response.set_cookie("session_token", gtoken, httponly=True, secure=True, samesite="none", max_age=604800, path="/")
-    update = {"last_login": now.isoformat(), "auth_provider": "google"}
-    if data.get("name") and not user.get("name"):
-        update["name"] = data["name"]
-    if data.get("picture"):
-        update["picture"] = data["picture"]
+    update = {"last_login": now_utc().isoformat(), "auth_provider": "google"}
+    if claims.get("name") and not user.get("name"):
+        update["name"] = claims["name"]
+    if claims.get("picture"):
+        update["picture"] = claims["picture"]
     await db.users.update_one({"_id": user["_id"]}, {"$set": update})
-    return {
-        "id": uid,
-        "email": email,
-        "name": update.get("name") or user.get("name", "User"),
-        "role": user.get("role"),
-        "token": access,
-    }
+    await security.audit(db, {"email": email, "role": user.get("role")}, "auth.google_login", email)
+    resp = _login_redirect()
+    set_auth_cookies(resp, create_access_token(uid, email), create_refresh_token(uid))
+    resp.delete_cookie(google_oauth.FLOW_COOKIE, path="/api/auth/google")
+    return resp
 
 
 @api.post("/auth/logout")
 async def logout(request: Request, response: Response):
-    gtoken = request.cookies.get("session_token")
-    if gtoken:
-        await db.user_sessions.delete_many({"session_token": gtoken})
-        response.delete_cookie("session_token", path="/")
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     return {"ok": True}
@@ -1450,32 +1421,6 @@ async def update_settings(payload: SettingsIn, user: dict = Depends(require_role
 RETENTION_ENABLED = os.environ.get("RETENTION_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
-async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: float = 3600.0) -> None:
-    """Background job: prune visit_sessions older than RETENTION_DAYS (180d).
-
-    Waits `startup_grace_seconds` (default 1h) after boot before the first
-    purge — this prevents surprise deletes right after a deploy — then runs
-    every `interval_hours` hours. Also removes the corresponding snapshot
-    files from disk. Set env RETENTION_ENABLED=false to disable entirely.
-    """
-    if not RETENTION_ENABLED:
-        logger.info("[retention] disabled via RETENTION_ENABLED=false")
-        return
-    # Startup grace so a fresh deploy never nukes data seconds after boot.
-    try:
-        await asyncio.sleep(startup_grace_seconds)
-    except asyncio.CancelledError:
-        return
-    while True:
-        try:
-            res = await purge_expired_sessions()
-            if res["expired_records"] or res["files_removed"] or res["files_failed"]:
-                logger.info("[retention] %s", res)
-        except Exception:
-            logger.exception("[retention] loop error")
-        await asyncio.sleep(interval_hours * 3600)
-
-
 _RETENTION_IMG_FIELDS = ("entry_image", "exit_image", "entry_plate_image", "exit_plate_image")
 
 
@@ -1485,7 +1430,6 @@ async def purge_expired_sessions() -> Dict[str, Any]:
     Visits still marked active (car inside) are never purged, however old.
     Safe to re-run (idempotent).
     """
-    from plate_pipeline import SNAPSHOTS_DIR as snap_dir
     cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
     query = {"status": {"$ne": "active"}, "$or": [
         {"entry_time": {"$lt": cutoff}},
@@ -1502,14 +1446,12 @@ async def purge_expired_sessions() -> Dict[str, Any]:
     r = await db.visit_sessions.delete_many(query)
     removed = failed = 0
     for name in files:
-        fpath = os.path.join(snap_dir, os.path.basename(name))
         try:
-            if os.path.isfile(fpath):
-                os.remove(fpath)
+            if await plate_pipeline.delete_snapshot(name):
                 removed += 1
         except Exception as e:
             failed += 1
-            logger.warning("[retention] failed to remove %s: %s", fpath, e)
+            logger.warning("[retention] failed to remove snapshot %s: %s", name, e)
     return {"cutoff": cutoff, "expired_records": expired, "deleted": r.deleted_count,
             "files_removed": removed, "files_failed": failed}
 
@@ -1555,64 +1497,26 @@ def _extract_plate(text: str) -> Optional[str]:
     return None
 
 
-async def _gemini_plate_read(b64: str) -> str:
-    """Optional cloud reader (SCAN_ENGINE=gemini): Google Gemini via Emergent."""
-    prompt = (
-        "You are an OCR system for vehicle license plates. "
-        "Read ONLY the license plate text from this image. "
-        "Return ONLY the plate as continuous alphanumeric characters (no spaces, no dashes). "
-        "If no plate is visible or you are unsure, respond with the single word: UNKNOWN. "
-        "Do not add any explanation or extra words. Example valid output: UP21AB1234"
-    )
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"plate-{uuid.uuid4()}",
-        system_message="You are a precise OCR engine. Output only the requested text.",
-    ).with_model("gemini", "gemini-3-flash-preview")
-    msg = UserMessage(text=prompt, file_contents=[ImageContent(image_base64=b64)])
-    try:
-        resp = await chat.send_message(msg)
-        return resp if isinstance(resp, str) else str(resp)
-    except Exception:
-        from emergentintegrations.llm.chat import TextDelta, StreamDone
-        raw = ""
-        async for ev in chat.stream_message(msg):
-            if isinstance(ev, TextDelta):
-                raw += ev.content
-            elif isinstance(ev, StreamDone):
-                break
-        return raw
-
-
 @api.post("/vehicles/scan-plate")
 async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*ROLE_ALL))):
-    # Default: free offline readers on this machine. SCAN_ENGINE=gemini switches
-    # to Google Gemini via Emergent (needs EMERGENT_LLM_KEY, paid per call).
-    use_cloud = os.environ.get("SCAN_ENGINE", "local").strip().lower() == "gemini"
-    if use_cloud and (not HAS_LLM or not EMERGENT_LLM_KEY):
-        raise HTTPException(status_code=503, detail="SCAN_ENGINE=gemini needs EMERGENT_LLM_KEY. Remove SCAN_ENGINE to use the free offline reader.")
-
+    # Free offline readers on this server (see local_ocr.py).
     b64 = _strip_data_url(payload.image_base64).strip()
     if not b64:
         raise HTTPException(status_code=400, detail="image_base64 is required")
 
-    engine_note = "gemini"
     try:
-        if use_cloud:
-            raw = await _gemini_plate_read(b64)
-        else:
-            try:
-                local = await asyncio.to_thread(local_ocr.read_base64, b64)
-            except RuntimeError as e:
-                raise HTTPException(status_code=503, detail=str(e))
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            engine_note = local["engine"]
-            if not local["plate"]:
-                return {"plate": None, "confidence": "low", "raw": "", "action": None, "engine": engine_note,
-                        "reason": "Found a plate but couldn't read a valid Indian number" if local["plate_found"]
-                                  else "No number plate found in the photo — try a closer, straighter shot"}
-            raw = local["plate"]
+        try:
+            local = await asyncio.to_thread(local_ocr.read_base64, b64)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        engine_note = local["engine"]
+        if not local["plate"]:
+            return {"plate": None, "confidence": "low", "raw": "", "action": None, "engine": engine_note,
+                    "reason": "Found a plate but couldn't read a valid Indian number" if local["plate_found"]
+                              else "No number plate found in the photo — try a closer, straighter shot"}
+        raw = local["plate"]
 
         cleaned = (raw or "").strip().upper()
         if cleaned == "UNKNOWN" or not cleaned:
@@ -2495,14 +2399,8 @@ async def _snapshot_bytes(url: str) -> Optional[bytes]:
     """Bytes of a /api/snapshots/<file> image from local disk or object storage."""
     if not url or not url.startswith("/api/snapshots/"):
         return None
-    name = os.path.basename(url)
-    fp = os.path.join(plate_pipeline.SNAPSHOTS_DIR, name)
-    if os.path.isfile(fp):
-        with open(fp, "rb") as f:
-            return f.read()
     try:
-        data, _ = await _objstore.get_object_or_none(f"{_objstore.APP_PREFIX}/snapshots/{name}")
-        return data
+        return await plate_pipeline.read_snapshot(os.path.basename(url))
     except Exception:
         return None
 
@@ -2672,6 +2570,12 @@ async def reject_plate_review(rid: str, user: dict = Depends(require_roles(*ROLE
     return {"ok": True}
 
 
+@api.get("/health")
+async def health():
+    """Liveness: the process is up and serving (no dependencies checked)."""
+    return {"ok": True}
+
+
 @api.get("/")
 async def root():
     return {"service": "RDX Car Showroom API", "ok": True}
@@ -2681,27 +2585,23 @@ async def root():
 from fastapi.responses import FileResponse
 from plate_pipeline import SNAPSHOTS_DIR as _SNAPSHOTS_DIR
 from plate_pipeline import snapshot_disk_stats as _snapshot_disk_stats
-import object_storage as _objstore
 import backup_utils
 
 
 @api.get("/snapshots/{filename}")
 async def get_snapshot(filename: str, user: dict = Depends(require_roles(*ROLE_ALL))):
-    # basic path-traversal guard
-    safe = os.path.basename(filename)
-    # Legacy snapshots live on local disk — serve them directly (fast path).
+    safe = os.path.basename(filename)  # path-traversal guard
     fp = os.path.join(_SNAPSHOTS_DIR, safe)
-    if os.path.isfile(fp):
+    if os.path.isfile(fp):  # local disk — fast path
         return FileResponse(fp, media_type="image/jpeg")
-    # New snapshots live in Emergent Object Storage.
     try:
-        data, ctype = await _objstore.get_object_or_none(f"{_objstore.APP_PREFIX}/snapshots/{safe}")
+        data = await plate_pipeline.read_snapshot(safe)
     except Exception as e:
-        logger.warning("[snapshot] object storage fetch failed for %s: %s", safe, e)
+        logger.warning("[snapshot] storage fetch failed for %s: %s", safe, e)
         raise HTTPException(status_code=502, detail="Snapshot storage unavailable")
     if data is None:
         raise HTTPException(status_code=404, detail="Snapshot not found")
-    return Response(content=data, media_type=ctype or "image/jpeg")
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 @api.get("/storage/snapshots")
@@ -2791,21 +2691,42 @@ async def ensure_indexes():
 
 @app.on_event("startup")
 async def startup():
+    config_check.check_or_exit()
     await ensure_indexes()
     await security.ensure_indexes(db)
     await plate_pipeline.ensure_session_indexes(db)
     await seed_admin()
     await seed_google_admin()
     await seed_bootstrap_agent()
-    # NOTE: YOLO/OCR now runs on the showroom PC via /app/local_agent —
-    # the backend only persists `plate_detected` messages arriving on
-    # /api/agent/ws (see _persist_entry). No ML runs here.
-    # 180-day retention cleanup — 1h startup grace, then every 24h.
-    asyncio.create_task(_retention_loop(interval_hours=24.0))
+    # Daily jobs (digest, backup, retention) — see scheduler.py.
+    if SCHEDULER_ENABLED:
+        app.state.scheduler = asyncio.create_task(scheduler.run_forever(db, _scheduled_jobs()))
+    else:
+        logger.info("[scheduler] disabled via SCHEDULER_ENABLED=false")
+
+
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _scheduled_jobs() -> List["scheduler.Job"]:
+    async def retention(run_id: str) -> None:
+        res = await purge_expired_sessions()
+        logger.info("[retention %s] %s", run_id, res)
+
+    async def backup(run_id: str) -> None:
+        await backup_utils.run_backup(db, mongo_url, os.environ["DB_NAME"], run_id)
+
+    return [
+        scheduler.Job("digest", os.environ.get("DIGEST_TIME", "09:00"), _run_digest_send,
+                      enabled=bool(_email_provider())),
+        scheduler.Job("backup", os.environ.get("BACKUP_TIME", "03:00"), backup,
+                      enabled=os.environ.get("BACKUP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")),
+        scheduler.Job("retention", os.environ.get("RETENTION_TIME", "03:30"), retention, enabled=RETENTION_ENABLED),
+    ]
 
 
 # ===================== Daily Digest Email (cron) =====================
-from email_utils import send_email as _send_email  # noqa: E402
+from email_utils import send_email as _send_email, provider as _email_provider  # noqa: E402
 
 WEBHOOK_CRON_SECRET = os.environ.get("WEBHOOK_CRON_SECRET", "")
 _digest_seen_run_ids: set[str] = set()
@@ -2824,8 +2745,7 @@ def _fmt_hms(seconds: Optional[float]) -> str:
 
 async def _collect_digest_stats() -> dict:
     """Compute yesterday's showroom summary in Asia/Kolkata."""
-    from zoneinfo import ZoneInfo
-    tz = ZoneInfo("Asia/Kolkata")
+    tz = APP_TZ
     now_ist = datetime.now(tz)
     yday = (now_ist - timedelta(days=1)).date()
     day_start = datetime.combine(yday, datetime.min.time(), tzinfo=tz).astimezone(timezone.utc)
@@ -3045,6 +2965,9 @@ async def list_backups(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER)))
 
 @app.on_event("shutdown")
 async def shutdown():
+    task = getattr(app.state, "scheduler", None)
+    if task:
+        task.cancel()
     client.close()
 
 

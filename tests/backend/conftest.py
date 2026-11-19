@@ -28,6 +28,7 @@ ADMIN_PASSWORD = secrets.token_urlsafe(16)
 AGENT_SECRET = secrets.token_urlsafe(24)
 CRON_SECRET = secrets.token_urlsafe(24)
 _SNAP_DIR = tempfile.mkdtemp(prefix="vc_test_snapshots_")
+_STORE_DIR = tempfile.mkdtemp(prefix="vc_test_storage_")
 
 # Force (not setdefault) so values from backend/.env are never used by tests.
 _TEST_ENV = {
@@ -40,8 +41,15 @@ _TEST_ENV = {
     "VASHU_AGENT_SECRET": AGENT_SECRET,
     "WEBHOOK_CRON_SECRET": CRON_SECRET,
     "SNAPSHOTS_DIR": _SNAP_DIR,
+    "STORAGE_BACKEND": "local",
+    "STORAGE_DIR": _STORE_DIR,
+    "SCHEDULER_ENABLED": "false",
     "RETENTION_ENABLED": "false",
-    "SEED_DEMO": "false",
+    "EMAIL_PROVIDER": "",
+    "GOOGLE_CLIENT_ID": "",
+    "GOOGLE_CLIENT_SECRET": "",
+    "PUBLIC_URL": "",
+    "AGENT_BOOTSTRAP_ID": "",
     "COOKIE_SECURE": "false",
     "EMERGENT_LLM_KEY": "",
     "EMERGENT_EMAIL_KEY": "",
@@ -72,6 +80,7 @@ def _drop_test_db() -> None:
 def pytest_unconfigure(config):
     _drop_test_db()
     shutil.rmtree(_SNAP_DIR, ignore_errors=True)
+    shutil.rmtree(_STORE_DIR, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -116,6 +125,8 @@ def _isolate(request):
     for p in Path(_SNAP_DIR).iterdir():
         if p.is_file():
             p.unlink()
+    shutil.rmtree(_STORE_DIR, ignore_errors=True)
+    Path(_STORE_DIR).mkdir(exist_ok=True)
 
 
 def login(client, email: str, password: str) -> dict:
