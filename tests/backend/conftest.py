@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional, Tuple
 
 import pytest
 
@@ -130,20 +131,43 @@ def admin_headers(client) -> dict:
     return login(client, ADMIN_EMAIL, ADMIN_PASSWORD)
 
 
+def register_agent(db, agent_id: str = "agent-under-test", secret: Optional[str] = None) -> str:
+    """Insert an agent row directly. With secret=None the agent is a legacy one
+    (no own secret) that authenticates with the shared VASHU_AGENT_SECRET."""
+    import security
+    doc = {"agent_id": agent_id, "status": "offline"}
+    if secret is not None:
+        doc["secret_hash"] = security.hash_secret(secret)
+    db.agents.update_one({"agent_id": agent_id}, {"$set": doc}, upsert=True)
+    return secret if secret is not None else AGENT_SECRET
+
+
 @pytest.fixture
-def agent_ws(client):
-    """Factory: open an authenticated agent WebSocket and consume the hello."""
+def agent_ws(client, db):
+    """Factory: register an agent with its own secret, open its WebSocket, consume the hello."""
     from contextlib import contextmanager
 
     @contextmanager
-    def _open(agent_id: str = "agent-under-test", secret: str = AGENT_SECRET):
-        with client.websocket_connect(f"/api/agent/ws?agent_id={agent_id}",
-                                      headers={"x-agent-secret": secret}) as ws:
+    def _open(agent_id: str = "agent-under-test"):
+        secret = register_agent(db, agent_id, secrets.token_urlsafe(24))
+        with client.websocket_connect("/api/agent/ws",
+                                      headers={"x-agent-id": agent_id, "x-agent-secret": secret}) as ws:
             hello = ws.receive_json()
             assert hello.get("type") == "hello", hello
             yield ws
 
     return _open
+
+
+def make_user(client, admin_headers: dict, role: str, password: Optional[str] = None) -> Tuple[dict, str]:
+    """Create a user with a known password; returns (user json, password)."""
+    password = password or secrets.token_urlsafe(14)
+    r = client.post("/api/users", headers=admin_headers, json={
+        "name": f"{role.title()} User", "email": f"{role}-{secrets.token_hex(3)}@example.com",
+        "role": role, "password": password,
+    })
+    assert r.status_code == 200, r.text
+    return r.json(), password
 
 
 # Minimal valid JPEG (1×1 px) for snapshot tests.

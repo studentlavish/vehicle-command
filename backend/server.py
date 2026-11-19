@@ -33,6 +33,7 @@ import plate_rules
 import local_ocr
 from zoneinfo import ZoneInfo
 from event_bus import event_bus
+import security
 
 # Optional integrations
 try:
@@ -58,7 +59,8 @@ db = client[os.environ["DB_NAME"]]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALG = "HS256"
 ADMIN_EMAIL = os.environ["ADMIN_EMAIL"].lower()
-ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
+# Only used to create the first admin on a fresh install (see seed_admin).
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -69,7 +71,6 @@ RETENTION_DAYS = 180
 
 # Day boundaries ("today", daily reports, visit_date) use the showroom's timezone.
 APP_TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Kolkata"))
-_WEAK_PASSWORDS = {"admin123", "admin", "password", "demo1234", "123456", "12345678", "changeme"}
 
 # Role permissions
 ROLE_ALL = ("admin", "manager", "security")
@@ -112,8 +113,8 @@ def create_refresh_token(user_id: str) -> str:
 
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=False, samesite="lax", max_age=604800, path="/")
+    response.set_cookie("access_token", access, **security.cookie_kwargs(43200))
+    response.set_cookie("refresh_token", refresh, **security.cookie_kwargs(604800))
 
 
 async def _user_from_google_session(token: str) -> Optional[dict]:
@@ -378,6 +379,17 @@ class UserIn(BaseModel):
     email: EmailStr
     role: Literal["admin", "manager", "security"] = "manager"
     status: Literal["active", "inactive"] = "active"
+    # Optional — when omitted a temporary password is generated and returned once.
+    password: Optional[str] = None
+
+
+class PasswordSetIn(BaseModel):
+    password: Optional[str] = None
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class SettingsIn(BaseModel):
@@ -399,11 +411,18 @@ class SettingsIn(BaseModel):
 
 # ===================== Auth Routes =====================
 @api.post("/auth/login")
-async def login(payload: LoginIn, response: Response):
+async def login(payload: LoginIn, request: Request, response: Response):
     email = payload.email.lower()
+    ip = request.client.host if request.client else ""
+    locked = await security.login_locked_for(db, email, ip)
+    if locked:
+        raise HTTPException(status_code=429, detail=f"Too many failed sign-in attempts. Try again in {locked // 60 + 1} min.",
+                            headers={"Retry-After": str(locked)})
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
+        await security.record_login_failure(db, email, ip)
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    await security.clear_login_failures(db, email, ip)
     if user.get("status") == "inactive":
         raise HTTPException(status_code=403, detail="Account is inactive")
     if user.get("role") not in ROLE_ALL:
@@ -509,7 +528,7 @@ async def refresh_token(request: Request, response: Response):
         if not user or user.get("status") == "inactive":
             raise HTTPException(status_code=401, detail="User not found or inactive")
         access = create_access_token(str(user["_id"]), user["email"])
-        response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
+        response.set_cookie("access_token", access, **security.cookie_kwargs(43200))
         return {"ok": True}
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -786,6 +805,7 @@ async def patch_vehicle_master(vehicle_number: str, payload: MasterPatch, user: 
     result = await db.vehicle_masters.update_one({"vehicle_number": vn}, {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Vehicle not found")
+    await security.audit(db, user, "vehicle_master.update", vn, fields=sorted(k for k in updates if k != "updated_at"))
     doc = await db.vehicle_masters.find_one({"vehicle_number": vn})
     return serialize_master(doc)
 
@@ -980,6 +1000,7 @@ async def update_vehicle(vid: str, payload: VehiclePatch, user: dict = Depends(r
     result = await db.visit_sessions.update_one({"id": vid}, {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Vehicle session not found")
+    await security.audit(db, user, "visit.update", vid, fields=sorted(set(updates) | set(master_updates)))
     doc = await db.visit_sessions.find_one({"id": vid})
     if master_updates:
         master_updates["updated_at"] = now_utc().isoformat()
@@ -989,9 +1010,11 @@ async def update_vehicle(vid: str, payload: VehiclePatch, user: dict = Depends(r
 
 @api.delete("/vehicles/{vid}")
 async def delete_vehicle(vid: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    doc = await db.visit_sessions.find_one({"id": vid}, {"_id": 0, "vehicle_number": 1, "entry_time": 1, "status": 1})
     result = await db.visit_sessions.delete_one({"id": vid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Vehicle session not found")
+    await security.audit(db, user, "visit.delete", vid, **(doc or {}))
     return {"ok": True}
 
 
@@ -1276,26 +1299,85 @@ async def create_user(payload: UserIn, user: dict = Depends(require_roles(*ROLE_
     existing = await db.users.find_one({"email": payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="User with this email already exists")
+    password, generated = _password_or_generate(payload.password)
     doc = {
         "name": payload.name,
         "email": payload.email.lower(),
         "role": payload.role,
         "status": payload.status,
-        "password_hash": hash_password(pysecrets.token_urlsafe(12)),
+        "password_hash": hash_password(password),
         "created_at": now_utc().isoformat(),
         "last_login": None,
     }
     r = await db.users.insert_one(doc)
-    return {"id": str(r.inserted_id), **{k: v for k, v in doc.items() if k not in ("password_hash", "_id")}}
+    await security.audit(db, user, "user.create", doc["email"], role=payload.role)
+    out = {"id": str(r.inserted_id), **{k: v for k, v in doc.items() if k not in ("password_hash", "_id")}}
+    if generated:
+        out["temporary_password"] = password
+    return out
+
+
+def _password_or_generate(password: Optional[str]) -> Tuple[str, bool]:
+    """Validate a chosen password, or generate one. Returns (password, was_generated)."""
+    if password:
+        problem = security.password_problem(password)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+        return password, False
+    return security.generate_password(), True
+
+
+@api.post("/users/{uid}/password")
+async def set_user_password(uid: str, payload: PasswordSetIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """Admin resets someone's password (the 'Forgot password?' path)."""
+    try:
+        oid = ObjectId(uid)
+    except Exception:
+        raise HTTPException(status_code=404, detail="User not found")
+    target = await db.users.find_one({"_id": oid}, {"email": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    password, generated = _password_or_generate(payload.password)
+    await db.users.update_one({"_id": oid}, {"$set": {"password_hash": hash_password(password),
+                                                       "password_changed_at": now_utc().isoformat()}})
+    await security.audit(db, user, "user.password_reset", target["email"])
+    return {"ok": True, **({"temporary_password": password} if generated else {})}
+
+
+@api.get("/audit-log")
+async def list_audit_log(limit: int = 200, action: Optional[str] = None,
+                         user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    q = {"action": action} if action else {}
+    docs = await db.audit_log.find(q, {"_id": 0}).sort("at", -1).to_list(min(max(limit, 1), 1000))
+    for d in docs:
+        if isinstance(d.get("at"), datetime):
+            d["at"] = d["at"].replace(tzinfo=timezone.utc).isoformat()
+    return docs
+
+
+@api.post("/auth/change-password")
+async def change_own_password(payload: PasswordChangeIn, user: dict = Depends(get_current_user)):
+    doc = await db.users.find_one({"_id": ObjectId(user["id"])})
+    if not doc or not verify_password(payload.current_password, doc.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    problem = security.password_problem(payload.new_password)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    await db.users.update_one({"_id": doc["_id"]}, {"$set": {"password_hash": hash_password(payload.new_password),
+                                                              "password_changed_at": now_utc().isoformat()}})
+    await security.audit(db, user, "user.password_change", doc["email"])
+    return {"ok": True}
 
 
 @api.delete("/users/{uid}")
 async def delete_user(uid: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     if uid == user["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    result = await db.users.delete_one({"_id": ObjectId(uid)})
-    if result.deleted_count == 0:
+    target = await db.users.find_one({"_id": ObjectId(uid)}, {"email": 1, "role": 1})
+    if not target:
         raise HTTPException(status_code=404, detail="User not found")
+    await db.users.delete_one({"_id": target["_id"]})
+    await security.audit(db, user, "user.delete", target.get("email", uid))
     return {"ok": True}
 
 
@@ -1341,6 +1423,7 @@ async def update_settings(payload: SettingsIn, user: dict = Depends(require_role
         updates.pop("twilio_token", None)
     updates.pop("database_url_display", None)
     await db.settings.update_one({"key": "app"}, {"$set": updates}, upsert=True)
+    await security.audit(db, user, "settings.update", "app", fields=sorted(k for k in updates if "token" not in k))
     return _public_settings(await db.settings.find_one({"key": "app"}))
 
 
@@ -1369,60 +1452,55 @@ async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: f
         return
     while True:
         try:
-            cutoff_dt = now_utc() - timedelta(days=RETENTION_DAYS)
-            cutoff = cutoff_dt.isoformat()
-            # Collect snapshot file names first so we can unlink from disk after DB purge.
-            # IMPORTANT: include entry_plate_image + exit_plate_image — the earlier
-            # implementation missed these and plate crops leaked forever.
-            IMG_FIELDS = ("entry_image", "exit_image", "entry_plate_image", "exit_plate_image")
-            per_field_counts: dict[str, int] = {k: 0 for k in IMG_FIELDS}
-            snapshots_to_delete: list[tuple[str, str]] = []  # (field, filename)
-            expired_records = 0
-            projection = {k: 1 for k in IMG_FIELDS}
-            async for doc in db.visit_sessions.find(
-                {"entry_time": {"$lt": cutoff}},
-                projection,
-            ):
-                expired_records += 1
-                for k in IMG_FIELDS:
-                    url = (doc.get(k) or "").strip()
-                    if url.startswith("/api/snapshots/"):
-                        snapshots_to_delete.append((k, url.rsplit("/", 1)[-1]))
-            r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
-            removed_files = 0
-            failed_files = 0
-            from plate_pipeline import SNAPSHOTS_DIR as snap_dir
-            for field, name in snapshots_to_delete:
-                fpath = os.path.join(snap_dir, name)
-                try:
-                    if os.path.isfile(fpath):
-                        os.remove(fpath)
-                        removed_files += 1
-                        per_field_counts[field] += 1
-                    # not-a-file is intentional no-op (safe to retry — idempotent)
-                except Exception as e:
-                    failed_files += 1
-                    logger.warning("[retention] failed to remove %s: %s", fpath, e)
-            if expired_records or removed_files or failed_files:
-                logger.info(
-                    "[retention] expired_records=%d db_deleted=%d files_removed=%d failed=%d "
-                    "(entry_image=%d exit_image=%d entry_plate_image=%d exit_plate_image=%d) older than %sd",
-                    expired_records, r.deleted_count, removed_files, failed_files,
-                    per_field_counts["entry_image"], per_field_counts["exit_image"],
-                    per_field_counts["entry_plate_image"], per_field_counts["exit_plate_image"],
-                    RETENTION_DAYS,
-                )
+            res = await purge_expired_sessions()
+            if res["expired_records"] or res["files_removed"] or res["files_failed"]:
+                logger.info("[retention] %s", res)
         except Exception:
             logger.exception("[retention] loop error")
         await asyncio.sleep(interval_hours * 3600)
 
 
+_RETENTION_IMG_FIELDS = ("entry_image", "exit_image", "entry_plate_image", "exit_plate_image")
+
+
+async def purge_expired_sessions() -> Dict[str, Any]:
+    """Delete finished visits older than RETENTION_DAYS and their snapshot files.
+
+    Visits still marked active (car inside) are never purged, however old.
+    Safe to re-run (idempotent).
+    """
+    from plate_pipeline import SNAPSHOTS_DIR as snap_dir
+    cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
+    query = {"entry_time": {"$lt": cutoff}, "status": {"$ne": "active"}}
+    files: list[str] = []
+    expired = 0
+    async for doc in db.visit_sessions.find(query, {k: 1 for k in _RETENTION_IMG_FIELDS}):
+        expired += 1
+        for k in _RETENTION_IMG_FIELDS:
+            url = (doc.get(k) or "").strip()
+            if url.startswith("/api/snapshots/"):
+                files.append(url.rsplit("/", 1)[-1])
+    r = await db.visit_sessions.delete_many(query)
+    removed = failed = 0
+    for name in files:
+        fpath = os.path.join(snap_dir, os.path.basename(name))
+        try:
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+                removed += 1
+        except Exception as e:
+            failed += 1
+            logger.warning("[retention] failed to remove %s: %s", fpath, e)
+    return {"cutoff": cutoff, "expired_records": expired, "deleted": r.deleted_count,
+            "files_removed": removed, "files_failed": failed}
+
+
 @api.post("/maintenance/purge-expired")
 async def purge_expired(user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
-    """Delete visit sessions older than RETENTION_DAYS."""
-    cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
-    r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
-    return {"deleted": r.deleted_count, "cutoff": cutoff}
+    """Delete finished visit sessions older than RETENTION_DAYS (and their snapshots)."""
+    res = await purge_expired_sessions()
+    await security.audit(db, user, "maintenance.purge_expired", "", **res)
+    return res
 
 
 # ===================== AI Number Plate Recognition =====================
@@ -1862,16 +1940,36 @@ class AgentRegisterIn(BaseModel):
 VASHU_AGENT_SECRET = os.environ.get("VASHU_AGENT_SECRET", "")
 
 
-def _authorize_agent(secret: Optional[str]) -> bool:
-    if not VASHU_AGENT_SECRET:
+# Largest JPEG accepted from an agent (live frames and detection crops).
+MAX_AGENT_JPEG_BYTES = int(os.environ.get("MAX_AGENT_JPEG_BYTES", str(2 * 1024 * 1024)))
+_warned_shared_secret: set = set()
+
+
+async def _authorize_agent(agent_id: Optional[str], secret: Optional[str]) -> bool:
+    """An agent must be registered (POST /api/agent/register) and present its own secret.
+
+    Agents registered before per-agent secrets existed (no secret_hash yet) may
+    still use the shared VASHU_AGENT_SECRET until an admin rotates their secret.
+    Unknown agent IDs are always refused.
+    """
+    if not agent_id or not secret:
         return False
-    return bool(secret) and secret == VASHU_AGENT_SECRET
+    doc = await db.agents.find_one({"agent_id": agent_id}, {"secret_hash": 1})
+    if not doc:
+        return False
+    if doc.get("secret_hash"):
+        return security.secret_matches(secret, doc["secret_hash"])
+    if security.shared_secret_matches(secret, VASHU_AGENT_SECRET):
+        if agent_id not in _warned_shared_secret:
+            _warned_shared_secret.add(agent_id)
+            logger.warning("[agent %s] authenticated with the shared VASHU_AGENT_SECRET — give it its own secret "
+                           "(Settings → Camera agents → Rotate secret)", agent_id)
+        return True
+    return False
 
 
-@api.get("/agent/status")
-async def agent_status(user: dict = Depends(require_roles(*ROLE_ALL))):
-    docs = await db.agents.find({}).to_list(200)
-    return [{
+def _public_agent(d: dict) -> dict:
+    return {
         "agent_id": d.get("agent_id"),
         "hostname": d.get("hostname", ""),
         "platform": d.get("platform", ""),
@@ -1880,17 +1978,58 @@ async def agent_status(user: dict = Depends(require_roles(*ROLE_ALL))):
         "last_heartbeat": d.get("last_heartbeat"),
         "connected_at": d.get("connected_at"),
         "cameras": d.get("cameras", []),
-    } for d in docs]
+        "has_own_secret": bool(d.get("secret_hash")),
+    }
+
+
+@api.get("/agent/status")
+async def agent_status(user: dict = Depends(require_roles(*ROLE_ALL))):
+    docs = await db.agents.find({}).to_list(200)
+    return [_public_agent(d) for d in docs]
+
+
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
 
 
 @api.post("/agent/register")
-async def agent_register_http(payload: AgentRegisterIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
-    now_iso = now_utc().isoformat()
-    await db.agents.update_one({"agent_id": payload.agent_id}, {"$set": {
-        "agent_id": payload.agent_id, "hostname": payload.hostname, "platform": payload.platform,
-        "version": payload.version, "created_at": now_iso, "status": "offline",
-    }}, upsert=True)
-    return {"ok": True, "agent_id": payload.agent_id}
+async def agent_register_http(payload: AgentRegisterIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """Register a new camera agent. The secret is returned ONCE — put it in the agent's .env."""
+    agent_id = payload.agent_id.strip()
+    if not _AGENT_ID_RE.match(agent_id):
+        raise HTTPException(status_code=400, detail="Agent ID: 2–64 letters, digits, '-', '_' or '.'")
+    if await db.agents.find_one({"agent_id": agent_id}, {"_id": 1}):
+        raise HTTPException(status_code=409, detail="An agent with this ID already exists — rotate its secret instead")
+    secret = security.generate_agent_secret()
+    await db.agents.insert_one({
+        "agent_id": agent_id, "hostname": payload.hostname, "platform": payload.platform,
+        "version": payload.version, "created_at": now_utc().isoformat(), "status": "offline",
+        "secret_hash": security.hash_secret(secret),
+    })
+    await security.audit(db, user, "agent.register", agent_id)
+    return {"ok": True, "agent_id": agent_id, "secret": secret}
+
+
+@api.post("/agent/{agent_id}/rotate-secret")
+async def agent_rotate_secret(agent_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """Issue a new secret for an agent (the old one stops working immediately)."""
+    secret = security.generate_agent_secret()
+    r = await db.agents.update_one({"agent_id": agent_id}, {"$set": {"secret_hash": security.hash_secret(secret),
+                                                                    "secret_rotated_at": now_utc().isoformat()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    await security.audit(db, user, "agent.rotate_secret", agent_id)
+    return {"ok": True, "agent_id": agent_id, "secret": secret}
+
+
+@api.delete("/agent/{agent_id}")
+async def agent_delete(agent_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    doc = await db.agents.find_one_and_delete({"agent_id": agent_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    for cam_id in doc.get("cameras", []):
+        camera_manager.mark_agent_offline(cam_id, "agent removed")
+    await security.audit(db, user, "agent.delete", agent_id)
+    return {"ok": True}
 
 
 @api.post("/agent/{agent_id}/disconnect")
@@ -1912,18 +2051,20 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
          header must include {"type":"frame","camera_id":..,"name":..,"seq":..,"ts":..}
     """
     await websocket.accept()
-    hdr_secret = websocket.headers.get("x-agent-secret", "")
-    if not _authorize_agent(secret or hdr_secret):
+    # Prefer headers (secrets in URLs end up in proxy logs); query params kept for older agents.
+    agent_id = (websocket.headers.get("x-agent-id") or agent_id or "").strip()
+    secret = websocket.headers.get("x-agent-secret") or secret or ""
+    if not await _authorize_agent(agent_id, secret):
+        logger.warning("[agent %s] refused: unknown agent or bad secret", agent_id or "?")
         await websocket.send_json({"type": "error", "message": "unauthorized"})
         await websocket.close(code=4401)
         return
 
-    active_agent_id: Optional[str] = agent_id
+    active_agent_id: str = agent_id
     cameras_registered: set = set()
-    if active_agent_id:
-        await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
-            "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
-        }}, upsert=True)
+    await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
+        "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
+    }})
 
     await websocket.send_json({"type": "hello", "ok": True})
     logger.info("[agent %s] connected", active_agent_id or "?")
@@ -1933,6 +2074,9 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
 
     async def _handle_frame(cam_id: str, jpeg: bytes, name: str) -> None:
         if not cam_id or not jpeg:
+            return
+        if len(jpeg) > MAX_AGENT_JPEG_BYTES:
+            logger.warning("[agent %s] dropped oversized frame (%d bytes) camera=%s", active_agent_id, len(jpeg), cam_id)
             return
         cam_id_norm = cam_id.strip().upper()
         if cam_id_norm not in cameras_registered:
@@ -1979,15 +2123,15 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
             mtype = msg.get("type")
 
             if mtype == "agent_register":
-                active_agent_id = msg.get("agent_id") or active_agent_id
-                if not active_agent_id:
-                    await websocket.send_json({"type": "error", "message": "agent_id required"})
+                claimed = msg.get("agent_id") or active_agent_id
+                if claimed != active_agent_id:
+                    await websocket.send_json({"type": "error", "message": "agent_id does not match the authenticated agent"})
                     continue
                 await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
-                    "agent_id": active_agent_id, "hostname": msg.get("hostname", ""),
+                    "hostname": msg.get("hostname", ""),
                     "platform": msg.get("platform", "windows"), "version": msg.get("version", "1.0.0"),
                     "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
-                }}, upsert=True)
+                }})
                 await websocket.send_json({"type": "registered", "agent_id": active_agent_id})
 
             elif mtype == "camera_status":
@@ -2006,7 +2150,7 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 if active_agent_id:
                     await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {
                         "cameras": list(cameras_registered), "last_heartbeat": now_utc().isoformat(),
-                    }}, upsert=True)
+                    }})
 
             elif mtype == "heartbeat":
                 if active_agent_id:
@@ -2041,9 +2185,10 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     continue
                 def _b64_or_empty(v):
                     try:
-                        return _b64.b64decode(v) if v else b""
+                        data = _b64.b64decode(v) if v else b""
                     except Exception:
                         return b""
+                    return data if len(data) <= MAX_AGENT_JPEG_BYTES else b""
                 try:
                     persistence = await route_detection(
                         db,
@@ -2248,6 +2393,8 @@ async def accept_plate_review(rid: str, payload: ReviewAcceptIn, user: dict = De
                                          f"{prefix}_plate_image": review.get("plate_image")}.items() if v}
         if img_updates:
             await db.visit_sessions.update_one({"id": sess["id"]}, {"$set": img_updates})
+    await security.audit(db, user, "review.accept", rid, plate=plate, original=review.get("plate"),
+                         event=result.get("event"), duplicate=result.get("duplicate", False))
     await db.plate_reviews.update_one({"id": rid}, {"$set": {
         "status": "accepted", "final_plate": plate, "result_event": result.get("event"),
         "duplicate": result.get("duplicate", False),
@@ -2264,6 +2411,7 @@ async def reject_plate_review(rid: str, user: dict = Depends(require_roles(*ROLE
     }})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Pending review not found")
+    await security.audit(db, user, "review.reject", rid)
     return {"ok": True}
 
 
@@ -2307,8 +2455,17 @@ async def get_storage_stats(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAG
 
 # ===================== Startup =====================
 async def seed_admin():
-    existing = await db.users.find_one({"email": ADMIN_EMAIL})
-    if existing is None:
+    """Create the first admin from .env on a fresh install — and only then.
+
+    Once any admin exists the database owns the password: restarts never reset
+    it, and ADMIN_PASSWORD in .env is ignored (change passwords in the app).
+    """
+    if await db.users.find_one({"role": "admin"}, {"_id": 1}):
+        return
+    problem = security.password_problem(ADMIN_PASSWORD)
+    if problem:
+        raise RuntimeError(f"Refusing to create the first admin: ADMIN_PASSWORD is not acceptable ({problem}).")
+    if await db.users.find_one({"email": ADMIN_EMAIL}, {"_id": 1}) is None:
         await db.users.insert_one({
             "email": ADMIN_EMAIL,
             "password_hash": hash_password(ADMIN_PASSWORD),
@@ -2319,12 +2476,23 @@ async def seed_admin():
             "last_login": now_utc().isoformat(),
         })
         logger.info("Seeded admin user: %s", ADMIN_EMAIL)
-    elif not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
-        await db.users.update_one({"email": ADMIN_EMAIL},
-                                  {"$set": {"password_hash": hash_password(ADMIN_PASSWORD), "role": "admin"}})
+    else:
+        logger.warning("No admin exists and %s is already a non-admin user — promote a user to admin manually.", ADMIN_EMAIL)
 
 
 GOOGLE_ADMIN_EMAIL = os.environ.get("GOOGLE_ADMIN_EMAIL", "")
+AGENT_BOOTSTRAP_ID = os.environ.get("AGENT_BOOTSTRAP_ID", "").strip()
+
+
+async def seed_bootstrap_agent():
+    """Local development: pre-register one agent that uses the shared VASHU_AGENT_SECRET."""
+    if not AGENT_BOOTSTRAP_ID or not os.environ.get("VASHU_AGENT_SECRET", ""):
+        return
+    r = await db.agents.update_one({"agent_id": AGENT_BOOTSTRAP_ID},
+                                   {"$setOnInsert": {"agent_id": AGENT_BOOTSTRAP_ID, "status": "offline",
+                                                     "created_at": now_utc().isoformat()}}, upsert=True)
+    if r.upserted_id:
+        logger.info("Pre-registered development agent %s (shared secret)", AGENT_BOOTSTRAP_ID)
 
 
 async def seed_google_admin():
@@ -2365,10 +2533,10 @@ async def ensure_indexes():
 @app.on_event("startup")
 async def startup():
     await ensure_indexes()
+    await security.ensure_indexes(db)
     await seed_admin()
     await seed_google_admin()
-    if ADMIN_PASSWORD.lower() in _WEAK_PASSWORDS or len(ADMIN_PASSWORD) < 10:
-        logger.warning("ADMIN_PASSWORD in .env is weak — anyone who guesses it gets full admin access. Change it, then restart.")
+    await seed_bootstrap_agent()
     # NOTE: YOLO/OCR now runs on the showroom PC via /app/local_agent —
     # the backend only persists `plate_detected` messages arriving on
     # /api/agent/ws (see _persist_entry). No ML runs here.
@@ -2614,7 +2782,7 @@ app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=security.cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )

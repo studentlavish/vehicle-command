@@ -7,6 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
+import AgentManager from "@/components/AgentManager";
 import { ErrorState } from "@/components/common/EmptyState";
 import {
   Building2, Camera, Database, Settings as SettingsIcon, MessageSquare, HardDrive,
@@ -115,6 +116,8 @@ export default function SettingsPage() {
         </div>
         <WhatsAppTester dirty={dirty} />
       </SectionCard>
+
+      <AgentManager />
 
       <SectionCard icon={HardDrive} title="Backup">
         <ToggleField label="Automatic daily backup" description="Database snapshot every night" checked={!!data.backup_enabled} onChange={(v) => update("backup_enabled", v)} test="setting-backup-enabled" />

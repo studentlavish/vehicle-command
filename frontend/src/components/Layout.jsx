@@ -12,8 +12,9 @@ import {
 import {
   LayoutDashboard, Radio, Car, LogIn as LogInIcon, LogOut, BarChart3, FileBarChart,
   Settings as SettingsIcon, Users as UsersIcon, Search, Bell, Menu, ChevronDown,
-  ShieldCheck, CarFront, CheckCheck, ScanEye,
+  ShieldCheck, CarFront, CheckCheck, ScanEye, KeyRound,
 } from "lucide-react";
+import ChangePasswordDialog from "@/components/ChangePasswordDialog";
 import Logo from "@/components/common/Logo";
 import StatusBadge from "@/components/common/StatusBadge";
 import useLiveEvents from "@/hooks/useLiveEvents";
@@ -210,6 +211,7 @@ export default function Layout({ children }) {
   const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [pwOpen, setPwOpen] = useState(false);
   const [pendingReviews, setPendingReviews] = useState(0);
 
   const refreshReviews = useCallback(async () => {
@@ -312,11 +314,15 @@ export default function Layout({ children }) {
                       <SettingsIcon className="mr-2 h-4 w-4" /> Settings
                     </DropdownMenuItem>
                   )}
+                  <DropdownMenuItem onSelect={() => setPwOpen(true)} data-testid="menu-change-password">
+                    <KeyRound className="mr-2 h-4 w-4" /> Change password
+                  </DropdownMenuItem>
                   <DropdownMenuItem onSelect={logout} className="text-destructive focus:bg-destructive/10 focus:text-destructive" data-testid="menu-logout">
                     <LogOut className="mr-2 h-4 w-4" /> Sign out
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+              <ChangePasswordDialog open={pwOpen} onOpenChange={setPwOpen} />
             </div>
           </div>
         </header>

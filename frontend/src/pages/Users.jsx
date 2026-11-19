@@ -9,9 +9,10 @@ import { toast } from "sonner";
 import PageHeader from "@/components/common/PageHeader";
 import StatusBadge from "@/components/common/StatusBadge";
 import ConfirmDialog from "@/components/common/ConfirmDialog";
+import SecretRevealDialog from "@/components/common/SecretRevealDialog";
 import { EmptyState, ErrorState } from "@/components/common/EmptyState";
 import { TableSkeletonRows } from "@/components/common/Loaders";
-import { Users, UserPlus, Trash2, Search, Loader2, Info } from "lucide-react";
+import { Users, UserPlus, Trash2, Search, Loader2, Info, KeyRound } from "lucide-react";
 import { formatDateTime, relativeAgo } from "@/lib/time";
 
 const EMPTY = { name: "", email: "", role: "manager", status: "active" };
@@ -32,6 +33,8 @@ export default function UsersPage() {
   const [formErr, setFormErr] = useState({});
   const [saving, setSaving] = useState(false);
   const [toDelete, setToDelete] = useState(null);
+  const [toReset, setToReset] = useState(null);
+  const [revealed, setRevealed] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,8 +65,9 @@ export default function UsersPage() {
     if (Object.keys(errs).length) return;
     setSaving(true);
     try {
-      await api.post("/users", { ...form, name: form.name.trim(), email: form.email.trim() });
+      const { data } = await api.post("/users", { ...form, name: form.name.trim(), email: form.email.trim() });
       toast.success("User added", { description: form.email });
+      if (data?.temporary_password) setRevealed({ label: data.email, value: data.temporary_password });
       setOpen(false);
       setForm(EMPTY);
       load();
@@ -81,6 +85,15 @@ export default function UsersPage() {
       load();
     } catch (err) {
       toast.error("Couldn't remove user", { description: errorMessage(err) });
+    }
+  };
+
+  const resetPassword = async () => {
+    try {
+      const { data } = await api.post(`/users/${toReset.id}/password`, {});
+      setRevealed({ label: toReset.email, value: data.temporary_password });
+    } catch (err) {
+      toast.error("Couldn't reset password", { description: errorMessage(err) });
     }
   };
 
@@ -152,7 +165,12 @@ export default function UsersPage() {
                           {u.last_login ? relativeAgo(u.last_login) : "Never"}
                         </td>
                         {canManage && (
-                          <td className="text-right">
+                          <td className="whitespace-nowrap text-right">
+                            {!isMe && (
+                              <Button size="icon-sm" variant="ghost" onClick={() => setToReset(u)} aria-label={`Reset password for ${u.name}`} title="Reset password" data-testid={`reset-password-${u.email}`}>
+                                <KeyRound />
+                              </Button>
+                            )}
                             {!isMe && (
                               <Button size="icon-sm" variant="ghost-danger" onClick={() => setToDelete(u)} aria-label={`Remove ${u.name}`} data-testid={`delete-user-${u.email}`}>
                                 <Trash2 />
@@ -217,7 +235,7 @@ export default function UsersPage() {
             </div>
             <div className="flex items-start gap-2 rounded-lg bg-info/10 px-3 py-2.5 text-xs text-info">
               <Info className="mt-px h-3.5 w-3.5 shrink-0" />
-              New users sign in with Google using this email address.
+              A temporary password is shown after you add the user. They can also sign in with Google using this email.
             </div>
             <DialogFooter className="gap-2">
               <Button type="button" variant="outline" onClick={() => setOpen(false)} disabled={saving}>Cancel</Button>
@@ -236,6 +254,23 @@ export default function UsersPage() {
         description="They will lose access to the dashboard immediately."
         confirmLabel="Remove user"
         onConfirm={remove}
+      />
+
+      <ConfirmDialog
+        open={!!toReset}
+        onOpenChange={(v) => !v && setToReset(null)}
+        title={`Reset password for ${toReset?.name || "user"}?`}
+        description="Their current password stops working. You'll see a new temporary password to give them."
+        confirmLabel="Reset password"
+        destructive={false}
+        onConfirm={resetPassword}
+      />
+
+      <SecretRevealDialog
+        secret={revealed}
+        title="Temporary password"
+        description="Give this to the user. They should change it after signing in (menu → Change password)."
+        onClose={() => setRevealed(null)}
       />
     </div>
   );

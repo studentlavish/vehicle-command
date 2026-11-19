@@ -28,7 +28,25 @@ Ctrl+C stops it. If a port is left busy: `./stop.sh` (`./stop.sh --mongo` also s
 
 ## 3. Logins (seeded automatically on first backend start)
 
-The admin account comes from `backend/.env` (`ADMIN_EMAIL`, `ADMIN_PASSWORD`, default `admin@rdx.com` / `admin123`) and is re-applied on every start. **Change `ADMIN_PASSWORD` to something strong** — the backend logs a warning while it's weak.
+On a fresh (empty) database the first admin is created from `backend/.env`
+(`ADMIN_EMAIL`, `ADMIN_PASSWORD` — at least 10 characters, not a common
+password, or the backend refuses to start). After that the database owns the
+password: restarts never reset it. Change it from the user menu → **Change
+password**; an admin resets other users' passwords on the **Users** page.
+
+Five wrong passwords for the same email from the same address lock sign-in
+for 15 minutes (`LOGIN_MAX_FAILURES`, `LOGIN_LOCK_MINUTES`).
+
+For local `http://` development set `COOKIE_SECURE="false"` in `backend/.env`;
+keep it `true` (the default) in production behind HTTPS.
+
+### Camera agents
+
+Each showroom PC is registered in **Settings → Camera agents**, which shows its
+secret once. Put it in that PC's `local_agent/.env` as `VASHU_AGENT_SECRET`
+(with the same `VASHU_AGENT_ID`). Unregistered agent IDs are refused. Agents
+registered before this existed keep using the shared `VASHU_AGENT_SECRET` until
+you press **Rotate secret**.
 
 The app never creates demo users or fake vehicles.
 

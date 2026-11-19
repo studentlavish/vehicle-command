@@ -38,7 +38,7 @@ def test_no_leaked_secrets_or_preview_urls():
 
 
 def test_no_hardcoded_default_passwords_outside_weak_list():
-    hits = [h for h in _hits(r"""["']admin123["']|["']demo1234["']""", _app_files()) if "_WEAK_PASSWORDS" not in h]
+    hits = [h for h in _hits(r"""["']admin123["']|["']demo1234["']""", _app_files()) if "WEAK_PASSWORDS" not in h]
     assert not hits, hits
 
 

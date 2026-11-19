@@ -60,9 +60,13 @@ fi
 say "Creating .env files"
 if [ ! -f "$ROOT/backend/.env" ]; then
   JWT="$(openssl rand -hex 32)"; AGENT="$(openssl rand -hex 24)"; CRON="$(openssl rand -hex 24)"
+  ADMIN_PW="$(openssl rand -base64 18 | tr -d '/+=')"
   sed -e "s|^JWT_SECRET=.*|JWT_SECRET=\"$JWT\"|" \
+      -e "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=\"$ADMIN_PW\"|" \
       -e "s|^VASHU_AGENT_SECRET=.*|VASHU_AGENT_SECRET=\"$AGENT\"|" \
+      -e "s|^AGENT_BOOTSTRAP_ID=.*|AGENT_BOOTSTRAP_ID=\"local-mac-01\"|" \
       -e "s|^WEBHOOK_CRON_SECRET=.*|WEBHOOK_CRON_SECRET=\"$CRON\"|" \
+      -e "s|^COOKIE_SECURE=.*|COOKIE_SECURE=\"false\"|" \
       "$ROOT/backend/.env.example" > "$ROOT/backend/.env"
   if [ ! -f "$ROOT/local_agent/.env" ]; then
     sed -e "s|^VASHU_AGENT_SECRET=.*|VASHU_AGENT_SECRET=$AGENT|" \
@@ -104,5 +108,5 @@ mkdir -p logs
 chmod +x "$ROOT/start.sh" "$ROOT/stop.sh" "$ROOT/local_agent/start_agent.sh" 2>/dev/null || true
 
 say "Setup complete!  Run:  ./start.sh"
-echo "   Dashboard: http://localhost:3000   (admin@rdx.com / admin123)"
+echo "   Dashboard: http://localhost:3000   (sign in with ADMIN_EMAIL / ADMIN_PASSWORD from backend/.env)"
 echo "   API docs:  http://localhost:8001/docs"

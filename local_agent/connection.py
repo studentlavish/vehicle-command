@@ -28,9 +28,9 @@ class CloudConnection:
     _BACKOFF_STEPS = [5, 10, 20, 30]
 
     def __init__(self, ws_url: str, agent_id: str, agent_secret: str) -> None:
-        base = ws_url.rstrip("?/&")
-        sep = "&" if "?" in base else "?"
-        self.url = f"{base}{sep}agent_id={agent_id}&secret={agent_secret}"
+        # The secret travels in a header, never in the URL (URLs end up in proxy logs).
+        self.url = ws_url.rstrip("?/&")
+        self.headers = {"x-agent-id": agent_id, "x-agent-secret": agent_secret}
         self.agent_id = agent_id
         self.agent_secret = agent_secret
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -50,6 +50,7 @@ class CloudConnection:
         # ping_interval=15 keeps Cloudflare from killing idle WS
         async with websockets.connect(
             self.url,
+            additional_headers=self.headers,
             max_size=20 * 1024 * 1024,
             ping_interval=15,
             ping_timeout=20,
@@ -132,7 +133,7 @@ class CloudConnection:
 
     # ---- test-mode helpers ----
     async def probe(self, agent_id: str) -> None:
-        async with websockets.connect(self.url, ping_interval=None) as ws:
+        async with websockets.connect(self.url, additional_headers=self.headers, ping_interval=None) as ws:
             hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
             if hello.get("type") == "error":
                 raise RuntimeError(hello.get("message"))
@@ -147,7 +148,7 @@ class CloudConnection:
                 pass
 
     async def probe_send_frame(self, camera_id: str, camera_name: str, jpeg: bytes) -> None:
-        async with websockets.connect(self.url, ping_interval=None) as ws:
+        async with websockets.connect(self.url, additional_headers=self.headers, ping_interval=None) as ws:
             await asyncio.wait_for(ws.recv(), timeout=5)  # hello
             await ws.send(json.dumps({
                 "type": "agent_register", "agent_id": self.agent_id, "hostname": "probe", "platform": "windows", "version": "1.0.0",
