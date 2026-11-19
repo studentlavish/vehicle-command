@@ -1,2 +1,1 @@
-/* App-level custom styles (theme in index.css) */
-.App { min-height: 100vh; background: #0f172a; }
+/* Theme lives in src/index.css (tokens) and tailwind.config.js. */

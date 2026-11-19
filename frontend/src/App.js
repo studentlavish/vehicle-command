@@ -16,6 +16,8 @@ import SettingsPage from "@/pages/Settings";
 import UsersPage from "@/pages/Users";
 import VehicleDetail from "@/pages/VehicleDetail";
 import SearchResults from "@/pages/SearchResults";
+import NotFound from "@/pages/NotFound";
+import Reviews from "@/pages/Reviews";
 import { Toaster } from "@/components/ui/sonner";
 import "@/App.css";
 
@@ -39,6 +41,7 @@ function AppRouter() {
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<Guarded><Dashboard /></Guarded>} />
       <Route path="/live" element={<Guarded><LiveMonitoring /></Guarded>} />
+      <Route path="/reviews" element={<Guarded><Reviews /></Guarded>} />
       <Route path="/vehicles" element={<Guarded><VehicleRecords /></Guarded>} />
       <Route path="/entry-history" element={<Guarded><EntryHistory /></Guarded>} />
       <Route path="/exit-history" element={<Guarded><ExitHistory /></Guarded>} />
@@ -48,6 +51,7 @@ function AppRouter() {
       <Route path="/users" element={<Guarded><UsersPage /></Guarded>} />
       <Route path="/search" element={<Guarded><SearchResults /></Guarded>} />
       <Route path="/vehicle/:vehicleNumber" element={<Guarded><VehicleDetail /></Guarded>} />
+      <Route path="*" element={<Guarded><NotFound /></Guarded>} />
     </Routes>
   );
 }
@@ -58,7 +62,7 @@ export default function App() {
       <BrowserRouter>
         <AppRouter />
       </BrowserRouter>
-      <Toaster richColors position="top-right" theme="dark" />
+      <Toaster richColors closeButton position="top-right" />
     </AuthProvider>
   );
 }

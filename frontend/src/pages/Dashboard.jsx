@@ -1,296 +1,274 @@
-import React, { useEffect, useState } from "react";
-import { motion } from "framer-motion";
+import React, { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import api from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
 import StatCard from "@/components/StatCard";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
 import AgentHealthCard from "@/components/AgentHealthCard";
 import LiveOccupancyChart from "@/components/LiveOccupancyChart";
-import {
-  LogIn as LogInIcon,
-  LogOut,
-  Car,
-  Database,
-  Users as UsersIcon,
-  CalendarRange,
-  Camera,
-  RadioTower,
-  Eye,
-  Sparkles,
-} from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import PageHeader from "@/components/common/PageHeader";
+import SectionCard from "@/components/common/SectionCard";
+import StatusBadge from "@/components/common/StatusBadge";
+import VehiclePlate from "@/components/common/VehiclePlate";
+import { EmptyState, ErrorState } from "@/components/common/EmptyState";
+import { CardSkeleton, TableSkeletonRows } from "@/components/common/Loaders";
+import useLiveEvents from "@/hooks/useLiveEvents";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  LogIn as LogInIcon, LogOut, Car, Database, Users as UsersIcon, CalendarRange,
+  Video, VideoOff, Eye, ArrowRight, Clock, RefreshCw, LayoutDashboard,
+} from "lucide-react";
+import { formatDateTime, elapsed, greeting } from "@/lib/time";
 
-function formatTime(iso) {
-  if (!iso) return "—";
-  try { return new Date(iso).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" }); } catch { return iso; }
+function CamerasCard() {
+  const [cams, setCams] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const { data } = await api.get("/cameras");
+        if (alive) setCams(Object.values(data || {}));
+      } catch {
+        if (alive) setCams((c) => c || []);
+      }
+    };
+    load();
+    const t = setInterval(load, 10000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  const online = (cams || []).filter((c) => c.status === "online").length;
+
+  return (
+    <SectionCard
+      icon={Video}
+      title="Cameras"
+      description={cams ? `${online} of ${cams.length} online` : "Checking camera status…"}
+      actions={
+        <Button asChild variant="ghost" size="sm">
+          <Link to="/live">Live view <ArrowRight className="h-3.5 w-3.5" /></Link>
+        </Button>
+      }
+      data-testid="live-camera-card"
+    >
+      {cams === null ? (
+        <div className="space-y-2">{[0, 1, 2].map((i) => <Skeleton key={i} className="h-12 w-full" />)}</div>
+      ) : cams.length === 0 ? (
+        <EmptyState
+          compact
+          icon={VideoOff}
+          title="No cameras connected"
+          description="Connect a camera from Live Monitoring or start the local camera agent."
+          action={<Button asChild size="sm" variant="outline"><Link to="/live">Open Live Monitoring</Link></Button>}
+        />
+      ) : (
+        <ul className="space-y-2">
+          {cams.slice(0, 5).map((c) => (
+            <li key={c.camera_id} className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5">
+              <div className="flex min-w-0 items-center gap-3">
+                <div className={c.status === "online" ? "icon-tile-sm" : "icon-tile-sm bg-muted text-muted-foreground"}>
+                  {c.status === "online" ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
+                </div>
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium">{c.label || c.camera_id}</div>
+                  <div className="font-mono text-[11px] text-muted-foreground">{c.camera_id}</div>
+                </div>
+              </div>
+              <StatusBadge status={c.status} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </SectionCard>
+  );
 }
 
-const statusStyle = {
-  inside: "bg-emerald-500/15 text-emerald-300 border-emerald-500/25",
-  exited: "bg-slate-500/15 text-slate-300 border-slate-500/25",
-  pending: "bg-amber-500/15 text-amber-300 border-amber-500/25",
-};
-
 export default function Dashboard() {
+  const { user } = useAuth();
   const [stats, setStats] = useState(null);
   const [recent, setRecent] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [selected, setSelected] = useState(null);
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const [s, v] = await Promise.all([
-          api.get("/dashboard/stats"),
-          api.get("/vehicles", { params: { limit: 8 } }),
-        ]);
-        setStats(s.data);
-        setRecent(v.data);
-      } catch (e) {
-        if (process.env.NODE_ENV === "development") {
-          console.error("Dashboard load error:", e);
-        }
-      } finally {
-        setLoading(false);
-      }
-    })();
+  const load = useCallback(async (soft = false) => {
+    soft ? setRefreshing(true) : setLoading(true);
+    setError(false);
+    try {
+      const [s, v] = await Promise.all([
+        api.get("/dashboard/stats"),
+        api.get("/vehicles", { params: { limit: 8 } }),
+      ]);
+      setStats(s.data);
+      setRecent(Array.isArray(v.data) ? v.data : v.data?.items || []);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   }, []);
 
-  // Live updates: subscribe to /api/ws/events and reactively update stats + recent
-  useEffect(() => {
-    const base = process.env.REACT_APP_BACKEND_URL;
-    if (!base) return;
-    const wsUrl = base.replace(/^http/, "ws") + "/api/ws/events";
-    let ws;
-    let closed = false;
+  useEffect(() => { load(); }, [load]);
 
-    const open = () => {
-      ws = new WebSocket(wsUrl);
-      ws.onmessage = (ev) => {
-        let msg;
-        try { msg = JSON.parse(ev.data); } catch { return; }
-        if (msg.type !== "entry.recorded") return;
-
-        const s = msg.session || {};
-        const owner = msg.owner || {};
-
-        // 1. Prepend to Recent Vehicles table (keep 8)
-        setRecent((prev) => {
-          const row = {
-            id: s.id,
-            vehicle_number: msg.vehicle_number,
-            owner_name: owner.owner_name || "Unknown Owner",
-            contact_number: owner.phone_number || "",
-            vehicle_model: owner.vehicle_model || "",
-            entry_time: s.entry_time,
-            exit_time: null,
-            status: "inside",
-            visit_date: s.visit_date,
-            entry_image: s.entry_image,
-            live: true,
-          };
-          const deduped = (prev || []).filter((r) => r.id !== row.id);
-          return [row, ...deduped].slice(0, 8);
-        });
-
-        // 2. Bump counters in-place without a full refetch
-        setStats((prev) => {
-          if (!prev) return prev;
-          const bump = (k) => ({ ...prev[k], value: (prev[k]?.value || 0) + 1 });
-          return {
-            ...prev,
-            today_entries: bump("today_entries"),
-            visitors_today: bump("visitors_today"),
-            monthly_visitors: bump("monthly_visitors"),
-            cars_inside: bump("cars_inside"),
-            total_vehicles:
-              msg.owner_status === "new" ? bump("total_vehicles") : prev.total_vehicles,
-          };
-        });
+  // Live updates from the event bus
+  useLiveEvents((msg) => {
+    if (msg.type !== "entry.recorded") return;
+    const s = msg.session || {};
+    const owner = msg.owner || {};
+    setRecent((prev) => {
+      const row = {
+        id: s.id,
+        vehicle_number: msg.vehicle_number,
+        owner_name: owner.owner_name || "Unknown owner",
+        contact_number: owner.phone_number || "",
+        vehicle_model: owner.vehicle_model || "",
+        entry_time: s.entry_time,
+        exit_time: null,
+        status: "inside",
+        visit_date: s.visit_date,
+        entry_image: s.entry_image,
+        live: true,
       };
-      ws.onclose = () => { if (!closed) setTimeout(open, 3000); };
-      ws.onerror = (err) => {
-        if (process.env.NODE_ENV === "development") console.error("[events ws] error", err);
-        try { ws.close(); } catch (e) {
-          if (process.env.NODE_ENV === "development") console.error("[events ws] close after error failed", e);
-        }
+      return [row, ...(prev || []).filter((r) => r.id !== row.id)].slice(0, 8);
+    });
+    setStats((prev) => {
+      if (!prev) return prev;
+      const bump = (k) => ({ ...prev[k], value: (prev[k]?.value || 0) + 1 });
+      return {
+        ...prev,
+        today_entries: bump("today_entries"),
+        visitors_today: bump("visitors_today"),
+        monthly_visitors: bump("monthly_visitors"),
+        cars_inside: bump("cars_inside"),
+        total_vehicles: msg.owner_status === "new" ? bump("total_vehicles") : prev.total_vehicles,
       };
-    };
-    open();
-    return () => { closed = true; try { ws && ws.close(); } catch (e) {
-      if (process.env.NODE_ENV === "development") console.error("[events ws] close on unmount failed", e);
-    } };
-  }, []);
+    });
+  });
+
+  const firstName = (user?.name || "").split(" ")[0];
+  const STATS = stats ? [
+    { key: "today_entries", label: "Today's entries", icon: LogInIcon, accent: "blue" },
+    { key: "today_exits", label: "Today's exits", icon: LogOut, accent: "sky" },
+    { key: "cars_inside", label: "Cars inside", icon: Car, accent: "green" },
+    { key: "visitors_today", label: "Visitors today", icon: UsersIcon, accent: "amber" },
+    { key: "monthly_visitors", label: "This month", icon: CalendarRange, accent: "violet", compareLabel: "vs last month" },
+    { key: "total_vehicles", label: "Total vehicles", icon: Database, accent: "blue", compareLabel: "growth" },
+  ] : [];
 
   return (
-    <div className="space-y-8" data-testid="dashboard-root">
-      {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-        <div>
-          <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.25em] text-blue-400/80">
-            <Sparkles className="h-3.5 w-3.5" /> Command Center
-          </div>
-          <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">Dashboard</h1>
-          <p className="mt-2 text-slate-400 text-sm">Real-time view of showroom activity, vehicle flow and monitoring.</p>
-        </div>
-        <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-blue-500/15 border border-blue-500/30 flex items-center justify-center">
-            <CalendarRange className="h-4 w-4 text-blue-400" />
-          </div>
-          <div className="leading-tight">
-            <div className="text-xs text-slate-400">Today</div>
-            <div className="text-sm font-medium">{new Date().toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "short", year: "numeric" })}</div>
-          </div>
-        </div>
-      </div>
+    <div className="space-y-6" data-testid="dashboard-root">
+      <PageHeader
+        icon={LayoutDashboard}
+        title={`${greeting()}${firstName ? `, ${firstName}` : ""}`}
+        description={`Here's what's happening at the showroom today · ${new Date().toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" })}`}
+        actions={
+          <Button variant="outline" onClick={() => load(true)} disabled={refreshing || loading} data-testid="dashboard-refresh">
+            <RefreshCw className={refreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Refresh
+          </Button>
+        }
+      />
 
-      {/* Stat cards */}
-      {loading || !stats ? (
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={`stat-skel-${i}`} className="h-40 bg-white/5 rounded-2xl" />
-          ))}
-        </div>
+      {error && !stats ? (
+        <div className="surface"><ErrorState onRetry={() => load()} /></div>
       ) : (
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-          <StatCard testId="stat-today-entry" label="Today's Entry" value={stats.today_entries.value} change={stats.today_entries.change} trend={stats.today_entries.trend} icon={LogInIcon} accent="blue" delay={0} />
-          <StatCard testId="stat-today-exit" label="Today's Exit" value={stats.today_exits.value} change={stats.today_exits.change} trend={stats.today_exits.trend} icon={LogOut} accent="sky" delay={0.05} />
-          <StatCard testId="stat-cars-inside" label="Cars Inside" value={stats.cars_inside.value} change={stats.cars_inside.change} trend={stats.cars_inside.trend} icon={Car} accent="green" delay={0.1} />
-          <StatCard testId="stat-total-vehicles" label="Total Vehicles" value={stats.total_vehicles.value} change={stats.total_vehicles.change} trend={stats.total_vehicles.trend} icon={Database} accent="violet" delay={0.15} />
-          <StatCard testId="stat-visitors-today" label="Visitors Today" value={stats.visitors_today.value} change={stats.visitors_today.change} trend={stats.visitors_today.trend} icon={UsersIcon} accent="amber" delay={0.2} />
-          <StatCard testId="stat-monthly-visitors" label="Monthly Visitors" value={stats.monthly_visitors.value} change={stats.monthly_visitors.change} trend={stats.monthly_visitors.trend} icon={CalendarRange} accent="blue" delay={0.25} />
-        </div>
+        <>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+            {loading || !stats
+              ? Array.from({ length: 6 }).map((_, i) => <CardSkeleton key={i} />)
+              : STATS.map((s) => (
+                <StatCard
+                  key={s.key}
+                  testId={`stat-${s.key.replace(/_/g, "-")}`}
+                  label={s.label}
+                  value={stats[s.key]?.value}
+                  change={stats[s.key]?.change}
+                  trend={stats[s.key]?.trend}
+                  icon={s.icon}
+                  accent={s.accent}
+                  compareLabel={s.compareLabel}
+                />
+              ))}
+          </div>
+
+          <div className="grid gap-6 xl:grid-cols-3">
+            <SectionCard
+              className="xl:col-span-2"
+              icon={Clock}
+              title="Recent vehicles"
+              description="Latest entries across all cameras"
+              noPadding
+              actions={
+                <Button asChild variant="ghost" size="sm">
+                  <Link to="/vehicles">View all <ArrowRight className="h-3.5 w-3.5" /></Link>
+                </Button>
+              }
+              data-testid="recent-vehicles-card"
+            >
+              <div className="overflow-x-auto">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Vehicle</th>
+                      <th>Owner</th>
+                      <th>Entry</th>
+                      <th>Duration</th>
+                      <th>Status</th>
+                      <th className="text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loading ? (
+                      <TableSkeletonRows rows={6} cols={6} />
+                    ) : recent.length === 0 ? (
+                      <tr className="hover:bg-transparent">
+                        <td colSpan={6}>
+                          <EmptyState icon={Car} title="No vehicles yet" description="Vehicle entries will show up here as soon as they're recorded." />
+                        </td>
+                      </tr>
+                    ) : (
+                      recent.map((v) => (
+                        <tr key={v.id} className={v.live ? "bg-success/5" : ""} data-testid={`recent-row-${v.vehicle_number}`}>
+                          <td><VehiclePlate number={v.vehicle_number} /></td>
+                          <td>
+                            <div className="font-medium">{v.owner_name}</div>
+                            <div className="text-xs text-muted-foreground">{v.vehicle_model || "—"}</div>
+                          </td>
+                          <td className="whitespace-nowrap text-muted-foreground">{formatDateTime(v.entry_time)}</td>
+                          <td className="whitespace-nowrap tabular-nums text-muted-foreground">{elapsed(v.entry_time, v.exit_time)}</td>
+                          <td><StatusBadge status={v.status} /></td>
+                          <td className="text-right">
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => { setSelected(v); setOpen(true); }}
+                              data-testid={`view-vehicle-${v.vehicle_number}`}
+                            >
+                              <Eye className="h-3.5 w-3.5" /> View
+                            </Button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </SectionCard>
+
+            <CamerasCard />
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-2">
+            <LiveOccupancyChart liveValue={stats?.cars_inside?.value} />
+            <AgentHealthCard />
+          </div>
+        </>
       )}
 
-      {/* Live camera + Recent table */}
-      <div className="grid gap-6 lg:grid-cols-3">
-        {/* Live camera */}
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.1 }}
-          className="glass rounded-2xl p-5 lg:col-span-1 relative overflow-hidden"
-          data-testid="live-camera-card"
-        >
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <RadioTower className="h-4 w-4 text-blue-400" />
-              <h3 className="font-semibold">Live Camera</h3>
-            </div>
-            <Badge className="bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
-              <span className="pulse-dot text-emerald-400 mr-1">Online</span>
-            </Badge>
-          </div>
-
-          <div className="relative aspect-video rounded-xl overflow-hidden border border-white/10 bg-gradient-to-br from-slate-800 to-slate-900">
-            <img
-              src="https://images.unsplash.com/photo-1485291571150-772bcfc10da5?auto=format&fit=crop&w=900&q=60"
-              className="w-full h-full object-cover opacity-60"
-              alt="Live feed placeholder"
-            />
-            <div className="absolute inset-0 grid-bg opacity-40" />
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="glass rounded-full p-4">
-                <Camera className="h-8 w-8 text-blue-400" />
-              </div>
-            </div>
-            <div className="absolute top-3 left-3 flex items-center gap-2 text-xs">
-              <span className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
-              <span className="font-mono tracking-wider">REC • CAM 01</span>
-            </div>
-            <div className="absolute bottom-3 right-3 text-[10px] font-mono text-slate-300/80">
-              {new Date().toLocaleTimeString()}
-            </div>
-          </div>
-
-          <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
-            <div className="glass-strong rounded-lg p-3">
-              <div className="text-slate-400">Camera Status</div>
-              <div className="mt-1 text-emerald-300 font-medium">Online</div>
-            </div>
-            <div className="glass-strong rounded-lg p-3">
-              <div className="text-slate-400">Last Scan</div>
-              <div className="mt-1 font-mono">{new Date().toLocaleTimeString()}</div>
-            </div>
-          </div>
-
-          <div className="mt-4 text-[11px] text-slate-500">
-            AI Number Plate Recognition and full CCTV feed integration are prepared for phase-2 rollout.
-          </div>
-        </motion.div>
-
-        {/* Recent Table */}
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.15 }}
-          className="glass rounded-2xl p-5 lg:col-span-2 overflow-hidden"
-          data-testid="recent-vehicles-card"
-        >
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold">Recent Vehicles</h3>
-            <a href="/vehicles" className="text-xs text-blue-400 hover:text-blue-300">View all →</a>
-          </div>
-
-          {loading ? (
-            <div className="space-y-2">
-              {Array.from({ length: 6 }).map((_, i) => <Skeleton key={`recent-skel-${i}`} className="h-11 bg-white/5" />)}
-            </div>
-          ) : recent.length === 0 ? (
-            <div className="text-center text-slate-400 py-10 text-sm">No vehicle records yet.</div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-slate-400 text-[11px] uppercase tracking-widest">
-                    <th className="py-2 font-normal">Vehicle #</th>
-                    <th className="py-2 font-normal">Owner</th>
-                    <th className="py-2 font-normal">Entry</th>
-                    <th className="py-2 font-normal">Status</th>
-                    <th className="py-2 font-normal text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {recent.map((v) => (
-                    <tr key={v.id} className="hover:bg-white/[0.03] transition-colors" data-testid={`recent-row-${v.vehicle_number}`}>
-                      <td className="py-3 font-mono text-white">{v.vehicle_number}</td>
-                      <td className="py-3">
-                        <div className="text-white">{v.owner_name}</div>
-                        <div className="text-[11px] text-slate-500">{v.vehicle_model}</div>
-                      </td>
-                      <td className="py-3 text-slate-300">{formatTime(v.entry_time)}</td>
-                      <td className="py-3">
-                        <Badge className={`${statusStyle[v.status]} border capitalize`}>{v.status}</Badge>
-                      </td>
-                      <td className="py-3 text-right">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => { setSelected(v); setOpen(true); }}
-                          className="h-8 text-blue-400 hover:text-white hover:bg-blue-600/20"
-                          data-testid={`view-vehicle-${v.vehicle_number}`}
-                        >
-                          <Eye className="h-3.5 w-3.5 mr-1" />View
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </motion.div>
-      </div>
-
       <VehicleDetailsDialog vehicle={selected} open={open} onOpenChange={setOpen} />
-
-      {/* Live occupancy sparkline + Local Windows Camera Agents */}
-      <div className="grid gap-6 lg:grid-cols-2">
-        <LiveOccupancyChart liveValue={stats?.cars_inside?.value} />
-        <AgentHealthCard />
-      </div>
     </div>
   );
 }

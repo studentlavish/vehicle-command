@@ -1,0 +1,24 @@
+# On-device number-plate recognition (all free, offline). Install with:  ./install_ocr.sh
+# Plate finder + fallback reader (MIT, ONNX)
+onnxruntime>=1.18
+open-image-models>=0.6,<0.7
+fast-plate-ocr[onnx]>=1.1,<2
+# Awiros Indian-plate reader (Apache-2.0) runs on PaddlePaddle + a PaddleOCR checkout
+paddlepaddle>=3.0,<4
+safetensors>=0.4
+pyyaml
+shapely
+scikit-image
+pyclipper
+lmdb
+rapidfuzz
+requests
+tqdm
+Pillow
+albumentations
+packaging
+
+# Optional extras — NOT installed by default:
+#   easyocr                 last-resort general OCR
+#   ultralytics, torch      only for a custom PLATE_MODEL_PATH (.pt) or VEHICLE_GATE=true
+#                           (note: Ultralytics is AGPL-3.0 licensed)

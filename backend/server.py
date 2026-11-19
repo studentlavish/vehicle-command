@@ -6,14 +6,14 @@ load_dotenv(ROOT_DIR / ".env")
 
 import os
 import io
+import re
 import csv
 import json
 import uuid
 import logging
-import random
 import asyncio
 import secrets as pysecrets
-from datetime import datetime, timezone, timedelta, date as ddate
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict, Any, Tuple
 
 import bcrypt
@@ -25,10 +25,13 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depend
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, EmailStr
 
 from camera_manager import camera_manager, CameraSourceConflict
-from plate_pipeline import _persist_entry, _persist_lock
+from plate_pipeline import _persist_entry, _persist_lock, route_detection, local_date
+import plate_rules
+import local_ocr
+from zoneinfo import ZoneInfo
 from event_bus import event_bus
 
 # Optional integrations
@@ -63,6 +66,10 @@ TWILIO_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
 TWILIO_TO_DEFAULT = os.environ.get("TWILIO_WHATSAPP_TO", "")
 
 RETENTION_DAYS = 180
+
+# Day boundaries ("today", daily reports, visit_date) use the showroom's timezone.
+APP_TZ = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Kolkata"))
+_WEAK_PASSWORDS = {"admin123", "admin", "password", "demo1234", "123456", "12345678", "changeme"}
 
 # Role permissions
 ROLE_ALL = ("admin", "manager", "security")
@@ -146,6 +153,8 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        if user.get("status") == "inactive":
+            raise HTTPException(status_code=401, detail="Account is inactive")
         user["id"] = str(user.pop("_id"))
         user.pop("password_hash", None)
         return user
@@ -176,8 +185,26 @@ def iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+class _LocalDT(datetime):
+    """A datetime in the showroom's timezone whose isoformat() is UTC.
+
+    Timestamps are stored as UTC ISO strings and compared as strings in Mongo
+    queries, so day boundaries computed in local time must serialise to UTC.
+    strftime() still shows local values, so labels (Mon, Tue…) are correct.
+    """
+    def isoformat(self, sep="T", timespec="auto"):
+        return datetime.isoformat(datetime.astimezone(self, timezone.utc), sep, timespec)
+
+
 def start_of_day(dt: datetime) -> datetime:
-    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    """Local midnight (APP_TZ) of the day containing `dt`."""
+    loc = dt.astimezone(APP_TZ)
+    return _LocalDT(loc.year, loc.month, loc.day, tzinfo=APP_TZ)
+
+
+def _local_day(date_str: str) -> datetime:
+    d = datetime.fromisoformat(date_str[:10])
+    return _LocalDT(d.year, d.month, d.day, tzinfo=APP_TZ)
 
 
 def range_bounds(range_key: str, from_str: Optional[str] = None, to_str: Optional[str] = None) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -199,8 +226,8 @@ def range_bounds(range_key: str, from_str: Optional[str] = None, to_str: Optiona
     if range_key == "all":
         return None, None
     if range_key == "custom":
-        start = datetime.fromisoformat(from_str).replace(tzinfo=timezone.utc) if from_str else None
-        end = (datetime.fromisoformat(to_str).replace(tzinfo=timezone.utc) + timedelta(days=1)) if to_str else None
+        start = _local_day(from_str) if from_str else None
+        end = (_local_day(to_str) + timedelta(days=1)) if to_str else None
         return start, end
     # default = all
     return None, None
@@ -479,8 +506,8 @@ async def refresh_token(request: Request, response: Response):
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=401, detail="Invalid token type")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
+        if not user or user.get("status") == "inactive":
+            raise HTTPException(status_code=401, detail="User not found or inactive")
         access = create_access_token(str(user["_id"]), user["email"])
         response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=43200, path="/")
         return {"ok": True}
@@ -559,7 +586,7 @@ async def record_entry(payload: EntryIn, user: dict = Depends(get_current_user))
             "vehicle_number": vn,
             "entry_time": now.isoformat(),
             "exit_time": None,
-            "visit_date": now.strftime("%Y-%m-%d"),
+            "visit_date": local_date(now),
             "duration_seconds": None,
             "entry_camera": payload.entry_camera or "CAM 01",
             "exit_camera": "",
@@ -608,10 +635,10 @@ async def search_masters(q: str, limit: int = 20, user: dict = Depends(get_curre
     up = q_clean.upper()
     query = {
         "$or": [
-            {"vehicle_number": {"$regex": normalize_plate(q_clean), "$options": "i"}},
-            {"phone_number": {"$regex": q_clean, "$options": "i"}},
-            {"owner_name": {"$regex": q_clean, "$options": "i"}},
-            {"customer_id": {"$regex": up, "$options": "i"}},
+            {"vehicle_number": {"$regex": re.escape(normalize_plate(q_clean)), "$options": "i"}},
+            {"phone_number": {"$regex": re.escape(q_clean), "$options": "i"}},
+            {"owner_name": {"$regex": re.escape(q_clean), "$options": "i"}},
+            {"customer_id": {"$regex": re.escape(up), "$options": "i"}},
         ]
     }
     docs = await db.vehicle_masters.find(query).sort("updated_at", -1).to_list(limit)
@@ -750,7 +777,7 @@ async def get_vehicle_sessions_paginated(
 
 
 @api.patch("/vehicles/master/{vehicle_number}")
-async def patch_vehicle_master(vehicle_number: str, payload: MasterPatch, user: dict = Depends(get_current_user)):
+async def patch_vehicle_master(vehicle_number: str, payload: MasterPatch, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     vn = normalize_plate(vehicle_number)
     updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
     if not updates:
@@ -831,14 +858,14 @@ async def list_vehicles(
     if q:
         matching_masters = await db.vehicle_masters.find({
             "$or": [
-                {"vehicle_number": {"$regex": normalize_plate(q), "$options": "i"}},
-                {"owner_name": {"$regex": q, "$options": "i"}},
-                {"phone_number": {"$regex": q, "$options": "i"}},
-                {"customer_id": {"$regex": q.upper(), "$options": "i"}},
+                {"vehicle_number": {"$regex": re.escape(normalize_plate(q)), "$options": "i"}},
+                {"owner_name": {"$regex": re.escape(q), "$options": "i"}},
+                {"phone_number": {"$regex": re.escape(q), "$options": "i"}},
+                {"customer_id": {"$regex": re.escape(q.upper()), "$options": "i"}},
             ]
         }).to_list(1000)
         numbers = [m["vehicle_number"] for m in matching_masters]
-        query["vehicle_number"] = {"$in": numbers} if numbers else {"$regex": normalize_plate(q), "$options": "i"}
+        query["vehicle_number"] = {"$in": numbers} if numbers else {"$regex": re.escape(normalize_plate(q)), "$options": "i"}
     if status and status != "all":
         mapping = {"inside": "active", "exited": "completed", "pending": "pending"}
         query["status"] = mapping.get(status, status)
@@ -885,7 +912,7 @@ async def create_vehicle(payload: VehicleIn, user: dict = Depends(get_current_us
         "vehicle_number": vn,
         "entry_time": entry_dt.isoformat(),
         "exit_time": exit_dt.isoformat() if exit_dt else None,
-        "visit_date": entry_dt.strftime("%Y-%m-%d"),
+        "visit_date": local_date(entry_dt),
         "duration_seconds": duration,
         "entry_camera": "CAM 01",
         "exit_camera": "CAM 02" if exit_dt else "",
@@ -923,7 +950,7 @@ async def get_vehicle(vid: str, user: dict = Depends(get_current_user)):
 
 
 @api.patch("/vehicles/{vid}")
-async def update_vehicle(vid: str, payload: VehiclePatch, user: dict = Depends(get_current_user)):
+async def update_vehicle(vid: str, payload: VehiclePatch, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -961,7 +988,7 @@ async def update_vehicle(vid: str, payload: VehiclePatch, user: dict = Depends(g
 
 
 @api.delete("/vehicles/{vid}")
-async def delete_vehicle(vid: str, user: dict = Depends(get_current_user)):
+async def delete_vehicle(vid: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     result = await db.visit_sessions.delete_one({"id": vid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Vehicle session not found")
@@ -1291,24 +1318,30 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _public_settings(doc: Optional[dict]) -> dict:
+    """Settings for the UI — secrets are never sent back, only whether they're set."""
+    merged = {**DEFAULT_SETTINGS, **(doc or {})}
+    merged.pop("_id", None)
+    merged.pop("key", None)
+    merged["twilio_token_set"] = bool(merged.get("twilio_token") or TWILIO_TOKEN)
+    merged["twilio_token"] = ""
+    return merged
+
+
 @api.get("/settings")
-async def get_settings(user: dict = Depends(get_current_user)):
-    doc = await db.settings.find_one({"key": "app"})
-    if not doc:
-        return DEFAULT_SETTINGS
-    doc.pop("_id", None)
-    doc.pop("key", None)
-    return {**DEFAULT_SETTINGS, **doc}
+async def get_settings(user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    return _public_settings(await db.settings.find_one({"key": "app"}))
 
 
 @api.put("/settings")
 async def update_settings(payload: SettingsIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    # A blank token means "keep the saved one" (the UI never receives it).
+    if not (updates.get("twilio_token") or "").strip():
+        updates.pop("twilio_token", None)
+    updates.pop("database_url_display", None)
     await db.settings.update_one({"key": "app"}, {"$set": updates}, upsert=True)
-    doc = await db.settings.find_one({"key": "app"})
-    doc.pop("_id", None)
-    doc.pop("key", None)
-    return {**DEFAULT_SETTINGS, **doc}
+    return _public_settings(await db.settings.find_one({"key": "app"}))
 
 
 # ===================== Retention purge =====================
@@ -1358,7 +1391,7 @@ async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: f
             r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
             removed_files = 0
             failed_files = 0
-            snap_dir = os.path.join(os.path.dirname(__file__), "snapshots")
+            from plate_pipeline import SNAPSHOTS_DIR as snap_dir
             for field, name in snapshots_to_delete:
                 fpath = os.path.join(snap_dir, name)
                 try:
@@ -1385,7 +1418,7 @@ async def _retention_loop(interval_hours: float = 24.0, startup_grace_seconds: f
 
 
 @api.post("/maintenance/purge-expired")
-async def purge_expired(user: dict = Depends(get_current_user)):
+async def purge_expired(user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
     """Delete visit sessions older than RETENTION_DAYS."""
     cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
     r = await db.visit_sessions.delete_many({"entry_time": {"$lt": cutoff}})
@@ -1394,7 +1427,6 @@ async def purge_expired(user: dict = Depends(get_current_user)):
 
 # ===================== AI Number Plate Recognition =====================
 import re as _re
-import base64 as _base64
 
 _PLATE_RE = _re.compile(r"[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}")
 
@@ -1426,15 +1458,8 @@ def _extract_plate(text: str) -> Optional[str]:
     return None
 
 
-@api.post("/vehicles/scan-plate")
-async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*ROLE_ALL))):
-    if not HAS_LLM or not EMERGENT_LLM_KEY:
-        raise HTTPException(status_code=503, detail="AI plate recognition is not configured. Set EMERGENT_LLM_KEY.")
-
-    b64 = _strip_data_url(payload.image_base64).strip()
-    if not b64:
-        raise HTTPException(status_code=400, detail="image_base64 is required")
-
+async def _gemini_plate_read(b64: str) -> str:
+    """Optional cloud reader (SCAN_ENGINE=gemini): Google Gemini via Emergent."""
     prompt = (
         "You are an OCR system for vehicle license plates. "
         "Read ONLY the license plate text from this image. "
@@ -1442,35 +1467,66 @@ async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*R
         "If no plate is visible or you are unsure, respond with the single word: UNKNOWN. "
         "Do not add any explanation or extra words. Example valid output: UP21AB1234"
     )
+    chat = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"plate-{uuid.uuid4()}",
+        system_message="You are a precise OCR engine. Output only the requested text.",
+    ).with_model("gemini", "gemini-3-flash-preview")
+    msg = UserMessage(text=prompt, file_contents=[ImageContent(image_base64=b64)])
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"plate-{uuid.uuid4()}",
-            system_message="You are a precise OCR engine. Output only the requested text.",
-        ).with_model("gemini", "gemini-3-flash-preview")
-
-        image = ImageContent(image_base64=b64)
-        msg = UserMessage(text=prompt, file_contents=[image])
+        resp = await chat.send_message(msg)
+        return resp if isinstance(resp, str) else str(resp)
+    except Exception:
+        from emergentintegrations.llm.chat import TextDelta, StreamDone
         raw = ""
-        try:
-            resp = await chat.send_message(msg)
-            raw = resp if isinstance(resp, str) else str(resp)
-        except Exception:
-            # streaming fallback
-            from emergentintegrations.llm.chat import TextDelta, StreamDone
-            async for ev in chat.stream_message(msg):
-                if isinstance(ev, TextDelta):
-                    raw += ev.content
-                elif isinstance(ev, StreamDone):
-                    break
+        async for ev in chat.stream_message(msg):
+            if isinstance(ev, TextDelta):
+                raw += ev.content
+            elif isinstance(ev, StreamDone):
+                break
+        return raw
+
+
+@api.post("/vehicles/scan-plate")
+async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*ROLE_ALL))):
+    # Default: free offline readers on this machine. SCAN_ENGINE=gemini switches
+    # to Google Gemini via Emergent (needs EMERGENT_LLM_KEY, paid per call).
+    use_cloud = os.environ.get("SCAN_ENGINE", "local").strip().lower() == "gemini"
+    if use_cloud and (not HAS_LLM or not EMERGENT_LLM_KEY):
+        raise HTTPException(status_code=503, detail="SCAN_ENGINE=gemini needs EMERGENT_LLM_KEY. Remove SCAN_ENGINE to use the free offline reader.")
+
+    b64 = _strip_data_url(payload.image_base64).strip()
+    if not b64:
+        raise HTTPException(status_code=400, detail="image_base64 is required")
+
+    engine_note = "gemini"
+    try:
+        if use_cloud:
+            raw = await _gemini_plate_read(b64)
+        else:
+            try:
+                local = await asyncio.to_thread(local_ocr.read_base64, b64)
+            except RuntimeError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            engine_note = local["engine"]
+            if not local["plate"]:
+                return {"plate": None, "confidence": "low", "raw": "", "action": None, "engine": engine_note,
+                        "reason": "Found a plate but couldn't read a valid Indian number" if local["plate_found"]
+                                  else "No number plate found in the photo — try a closer, straighter shot"}
+            raw = local["plate"]
 
         cleaned = (raw or "").strip().upper()
         if cleaned == "UNKNOWN" or not cleaned:
-            return {"plate": None, "confidence": "low", "raw": raw, "action": None}
+            return {"plate": None, "confidence": "low", "raw": raw, "action": None,
+                    "reason": "No plate visible in the photo"}
 
-        plate = _extract_plate(cleaned) or "".join(c for c in cleaned if c.isalnum())
-        if not plate or len(plate) < 5:
-            return {"plate": None, "confidence": "low", "raw": raw, "action": None}
+        # Only accept text that is (or can be corrected into) a valid Indian plate.
+        plate, corrected = plate_rules.extract(cleaned)
+        if not plate:
+            return {"plate": None, "confidence": "low", "raw": raw, "action": None,
+                    "reason": f"Read “{cleaned[:24]}”, which isn't a valid Indian number plate"}
 
         # Optional auto entry/exit
         action_result: Optional[Dict[str, Any]] = None
@@ -1493,7 +1549,7 @@ async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*R
                         "vehicle_number": vn_entry,
                         "entry_time": now.isoformat(),
                         "exit_time": None,
-                        "visit_date": now.strftime("%Y-%m-%d"),
+                        "visit_date": local_date(now),
                         "duration_seconds": None,
                         "entry_camera": cam,
                         "exit_camera": "",
@@ -1525,7 +1581,11 @@ async def scan_plate(payload: PlateScanIn, user: dict = Depends(require_roles(*R
             else:
                 action_result = {"type": "exit", "error": "No active session to close for this plate"}
 
-        return {"plate": plate, "confidence": "high", "raw": raw, "action": action_result}
+        # A single AI read of one photo is never "high" — corrected reads are flagged.
+        # One photo is never "high". Readers disagreeing or characters corrected → "low".
+        conf_label = "low" if (corrected or "≠" in engine_note) else "medium"
+        return {"plate": plate, "confidence": conf_label, "corrected": corrected,
+                "raw": raw, "action": action_result, "engine": engine_note}
 
     except HTTPException:
         raise
@@ -1973,41 +2033,41 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 await _handle_frame(cam_id, jpeg, msg.get("name", ""))
 
             elif mtype == "plate_detected":
-                # Local agent ran YOLO+OCR at the edge and is telling us a
-                # plate was detected — persist + broadcast (no ML needed here).
-                cam_id_raw = msg.get("camera_id", "")
-                cam_id = str(cam_id_raw).strip().upper()
-                plate = (msg.get("plate") or "").upper().strip()
-                b64 = msg.get("crop_jpeg_b64", "")
-                plate_b64 = msg.get("plate_jpeg_b64", "")
-                confidence = msg.get("confidence", "medium")
-                # NO PLATE rule: empty/invalid/OCR-unconfirmed plates are ignored
-                # entirely — no ENTRY, no EXIT, no session change.
-                if not cam_id or not plate or len(plate) < 5 or not plate.isalnum():
+                # Local agent ran YOLO+OCR at the edge. Validate the plate and
+                # either save it or put it in the Review queue for a person.
+                cam_id = str(msg.get("camera_id", "")).strip().upper()
+                raw_plate = (msg.get("plate") or "").upper().strip()
+                if not cam_id or not raw_plate:
                     continue
+                def _b64_or_empty(v):
+                    try:
+                        return _b64.b64decode(v) if v else b""
+                    except Exception:
+                        return b""
                 try:
-                    crop_jpeg = _b64.b64decode(b64) if b64 else b""
-                except Exception:
-                    crop_jpeg = b""
-                try:
-                    plate_jpeg = _b64.b64decode(plate_b64) if plate_b64 else b""
-                except Exception:
-                    plate_jpeg = b""
-                try:
-                    persistence = await _persist_entry(
-                        db, cam_id, plate, crop_jpeg,
-                        plate_jpeg=plate_jpeg, confidence=confidence,
+                    persistence = await route_detection(
+                        db,
+                        camera_id=cam_id,
+                        raw_plate=raw_plate,
+                        confidence=str(msg.get("confidence") or "medium"),
+                        jpeg_frame=_b64_or_empty(msg.get("crop_jpeg_b64")),
+                        plate_jpeg=_b64_or_empty(msg.get("plate_jpeg_b64")),
+                        candidates=msg.get("candidates") or [],
+                        reads=int(msg.get("reads") or 0),
+                        support=float(msg.get("support") or 0),
                     )
                     await websocket.send_json({
                         "type": "plate_ack",
-                        "plate": plate,
+                        "plate": persistence.get("plate", raw_plate),
+                        "queued_for_review": persistence.get("queued_for_review", False),
+                        "review_id": persistence.get("review_id"),
                         "duplicate": persistence.get("duplicate", False),
                         "event": persistence.get("event"),
                         "owner_status": persistence.get("owner_status"),
                         "session_id": (persistence.get("session") or {}).get("id"),
                     })
                 except Exception:
-                    logger.exception("[agent] persistence failed for plate=%s", plate)
+                    logger.exception("[agent] persistence failed for plate=%s", raw_plate)
 
             else:
                 await websocket.send_json({"type": "error", "message": f"unknown type: {mtype}"})
@@ -2135,6 +2195,78 @@ async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] =
         logger.info("[ws camera %s] client disconnected", camera_id)
 
 
+# ===================== Plate review queue =====================
+class ReviewAcceptIn(BaseModel):
+    plate: str
+
+
+def _review_public(doc: dict) -> dict:
+    doc = dict(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/plate-reviews")
+async def list_plate_reviews(status: str = "pending", limit: int = 100,
+                             user: dict = Depends(require_roles(*ROLE_ALL))):
+    q = {} if status == "all" else {"status": status}
+    docs = await db.plate_reviews.find(q).sort("created_at", -1).to_list(min(max(limit, 1), 500))
+    return [_review_public(d) for d in docs]
+
+
+@api.get("/plate-reviews/count")
+async def count_plate_reviews(user: dict = Depends(require_roles(*ROLE_ALL))):
+    return {"pending": await db.plate_reviews.count_documents({"status": "pending"})}
+
+
+@api.post("/plate-reviews/{rid}/accept")
+async def accept_plate_review(rid: str, payload: ReviewAcceptIn, user: dict = Depends(require_roles(*ROLE_ALL))):
+    review = await db.plate_reviews.find_one({"id": rid})
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    if review.get("status") != "pending":
+        raise HTTPException(status_code=409, detail=f"Already {review.get('status')}")
+    plate, _ = plate_rules.correct(payload.plate)
+    if not plate:
+        raise HTTPException(status_code=400, detail="That isn't a valid Indian number plate (e.g. KA05MG9999 or 22BH1234AA)")
+    # Claim the review first so two people can't accept it twice.
+    claimed = await db.plate_reviews.update_one({"id": rid, "status": "pending"}, {"$set": {"status": "processing"}})
+    if claimed.modified_count == 0:
+        raise HTTPException(status_code=409, detail="Someone else is handling this review")
+    seen_at = datetime.fromisoformat(review["seen_at"]) if review.get("seen_at") else now_utc()
+    try:
+        result = await _persist_entry(db, review.get("camera_id", ""), plate, b"", plate_jpeg=b"",
+                                      confidence="confirmed", at=seen_at, source="review")
+    except Exception:
+        await db.plate_reviews.update_one({"id": rid}, {"$set": {"status": "pending"}})
+        raise
+    # Reuse the review's images on the visit it created / closed.
+    sess = result.get("session") or {}
+    if sess.get("id") and not result.get("duplicate"):
+        prefix = "exit" if result.get("event") == "exit" else "entry"
+        img_updates = {k: v for k, v in {f"{prefix}_image": review.get("image"),
+                                         f"{prefix}_plate_image": review.get("plate_image")}.items() if v}
+        if img_updates:
+            await db.visit_sessions.update_one({"id": sess["id"]}, {"$set": img_updates})
+    await db.plate_reviews.update_one({"id": rid}, {"$set": {
+        "status": "accepted", "final_plate": plate, "result_event": result.get("event"),
+        "duplicate": result.get("duplicate", False),
+        "resolved_by": user.get("email"), "resolved_at": now_utc().isoformat(),
+    }})
+    return {"ok": True, "plate": plate, "event": result.get("event"), "duplicate": result.get("duplicate", False),
+            "duplicate_reason": result.get("duplicate_reason")}
+
+
+@api.post("/plate-reviews/{rid}/reject")
+async def reject_plate_review(rid: str, user: dict = Depends(require_roles(*ROLE_ALL))):
+    r = await db.plate_reviews.update_one({"id": rid, "status": "pending"}, {"$set": {
+        "status": "rejected", "resolved_by": user.get("email"), "resolved_at": now_utc().isoformat(),
+    }})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Pending review not found")
+    return {"ok": True}
+
+
 @api.get("/")
 async def root():
     return {"service": "RDX Car Showroom API", "ok": True}
@@ -2216,165 +2348,6 @@ async def seed_google_admin():
     logger.info("Seeded Google admin user: %s", email)
 
 
-async def seed_demo():
-    # Seed additional demo users
-    demo_users = [
-        {"name": "Rakesh Kumar", "email": "manager@rdx.com", "role": "manager"},
-        {"name": "Priya Sharma", "email": "security@rdx.com", "role": "security"},
-        {"name": "Aditya Patel", "email": "security2@rdx.com", "role": "security", "status": "inactive"},
-    ]
-    for u in demo_users:
-        if not await db.users.find_one({"email": u["email"]}):
-            await db.users.insert_one({
-                "name": u["name"],
-                "email": u["email"],
-                "role": u["role"],
-                "status": u.get("status", "active"),
-                "password_hash": hash_password("demo1234"),
-                "created_at": now_utc().isoformat(),
-                "last_login": (now_utc() - timedelta(hours=random.randint(1, 200))).isoformat(),
-            })
-        else:
-            # Ensure demo users always have the known 'demo1234' password (idempotent seed refresh)
-            existing = await db.users.find_one({"email": u["email"]})
-            if not verify_password("demo1234", existing["password_hash"]):
-                await db.users.update_one({"_id": existing["_id"]}, {"$set": {"password_hash": hash_password("demo1234")}})
-
-    # Legacy 'vehicles' collection migration was completed on the initial
-    # production deploy; the destructive drop_collection has been removed to
-    # ensure no future startup can accidentally delete data. If any stray
-    # legacy collection ever needs to be removed, do it via the mongo shell
-    # as an explicit, one-shot admin action.
-
-    if await db.vehicle_masters.count_documents({}) >= 15:
-        return
-
-    # Fresh seed of masters + rich session history
-    car_images = [
-        "https://images.unsplash.com/photo-1580273916550-e323be2ae537?auto=format&fit=crop&w=600&q=70",
-        "https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=600&q=70",
-        "https://images.unsplash.com/photo-1544636331-e26879cd4d9b?auto=format&fit=crop&w=600&q=70",
-        "https://images.unsplash.com/photo-1550355291-bbee04a92027?auto=format&fit=crop&w=600&q=70",
-        "https://images.unsplash.com/photo-1494976388531-d1058494cdd8?auto=format&fit=crop&w=600&q=70",
-        "https://images.unsplash.com/photo-1592840062661-eb6a4ef00cb4?auto=format&fit=crop&w=600&q=70",
-    ]
-    models = ["Hyundai Creta", "Hyundai Verna", "Hyundai i20", "Hyundai Tucson", "Hyundai Venue", "Hyundai Kona EV", "Hyundai Alcazar", "Hyundai Santro"]
-    first = ["Arjun", "Neha", "Rohit", "Kavya", "Vikram", "Sanya", "Aman", "Ishita", "Karan", "Meera", "Dev", "Anaya", "Raj", "Zara", "Yash"]
-    last = ["Sharma", "Verma", "Patel", "Singh", "Nair", "Iyer", "Khan", "Gupta", "Bose", "Chopra"]
-    states = ["KA", "MH", "DL", "TN", "UP", "HR", "KL", "GJ"]
-    cameras = ["CAM 01", "CAM 02", "CAM 03", "CAM 04"]
-
-    masters: List[Dict[str, Any]] = []
-    plates_seen = set()
-    for _ in range(22):
-        while True:
-            plate = f"{random.choice(states)}{random.randint(1, 99):02d}{random.choice(['AB','MH','KL','TN','DL','HR'])}{random.randint(1000, 9999)}"
-            if plate not in plates_seen:
-                plates_seen.add(plate)
-                break
-        masters.append({
-            "id": str(uuid.uuid4()),
-            "vehicle_number": plate,
-            "owner_name": f"{random.choice(first)} {random.choice(last)}",
-            "phone_number": f"+91 {random.randint(70, 99)}{random.randint(10000000, 99999999)}",
-            "vehicle_model": random.choice(models),
-            "vehicle_image": random.choice(car_images),
-            "customer_id": f"CUS-{pysecrets.token_hex(3).upper()}",
-            "created_at": (now_utc() - timedelta(days=random.randint(30, 170))).isoformat(),
-            "updated_at": now_utc().isoformat(),
-        })
-    # Include the demo plate from the problem statement (UP21AB1234) with the exact same schedule
-    showcase_number = "UP21AB1234"
-    if showcase_number not in plates_seen:
-        masters.insert(0, {
-            "id": str(uuid.uuid4()),
-            "vehicle_number": showcase_number,
-            "owner_name": "Aarav Malhotra",
-            "phone_number": "+91 9876543210",
-            "vehicle_model": "Hyundai Creta",
-            "vehicle_image": car_images[0],
-            "customer_id": "CUS-DEMO01",
-            "created_at": (now_utc() - timedelta(days=120)).isoformat(),
-            "updated_at": now_utc().isoformat(),
-        })
-
-    await db.vehicle_masters.insert_many(masters)
-
-    # Generate sessions: each master gets 3-25 completed sessions plus optionally an active session today
-    sessions: List[Dict[str, Any]] = []
-    today = start_of_day(now_utc())
-
-    for m in masters:
-        vn = m["vehicle_number"]
-        if vn == showcase_number:
-            # Exact schedule from the problem statement — 4 completed sessions today
-            plan = [
-                (8, 30, 9, 15),
-                (10, 20, 11, 10),
-                (13, 45, 15, 0),
-                (17, 10, 18, 30),
-            ]
-            for eh, em, xh, xm in plan:
-                e = today + timedelta(hours=eh, minutes=em)
-                x = today + timedelta(hours=xh, minutes=xm)
-                sessions.append(_make_session(vn, e, x, cameras))
-            # extra history
-            for d in range(1, 45):
-                base = today - timedelta(days=d)
-                for _ in range(random.randint(0, 3)):
-                    eh = random.randint(8, 18)
-                    em = random.randint(0, 59)
-                    length = random.randint(15, 180)
-                    e = base + timedelta(hours=eh, minutes=em)
-                    x = e + timedelta(minutes=length)
-                    sessions.append(_make_session(vn, e, x, cameras))
-            continue
-
-        # regular vehicles
-        history_days = random.randint(30, 170)
-        for d in range(0, history_days):
-            base = today - timedelta(days=d)
-            visits_this_day = random.choices([0, 1, 2, 3, 4], weights=[5, 4, 2, 1, 1])[0]
-            last_exit = None
-            for _ in range(visits_this_day):
-                eh = random.randint(8, 19) if last_exit is None else min(19, last_exit.hour + random.randint(1, 3))
-                em = random.randint(0, 59)
-                length = random.randint(10, 180)
-                e = base + timedelta(hours=eh, minutes=em)
-                x = e + timedelta(minutes=length)
-                last_exit = x
-                sessions.append(_make_session(vn, e, x, cameras))
-
-        # 20% chance of an active session today
-        if random.random() < 0.2:
-            e = today + timedelta(hours=random.randint(9, 17), minutes=random.randint(0, 59))
-            sessions.append(_make_session(vn, e, None, cameras))
-
-    # bulk insert in chunks
-    BATCH = 500
-    for i in range(0, len(sessions), BATCH):
-        await db.visit_sessions.insert_many(sessions[i:i + BATCH])
-    logger.info("Seeded %d masters and %d visit sessions", len(masters), len(sessions))
-
-
-def _make_session(vehicle_number: str, entry: datetime, exit_: Optional[datetime], cameras: List[str]) -> Dict[str, Any]:
-    duration = int((exit_ - entry).total_seconds()) if exit_ else None
-    return {
-        "id": str(uuid.uuid4()),
-        "vehicle_number": vehicle_number,
-        "entry_time": entry.isoformat(),
-        "exit_time": exit_.isoformat() if exit_ else None,
-        "visit_date": entry.strftime("%Y-%m-%d"),
-        "duration_seconds": duration,
-        "entry_camera": random.choice(cameras),
-        "exit_camera": random.choice(cameras) if exit_ else "",
-        "entry_image": "",
-        "exit_image": "",
-        "status": "completed" if exit_ else "active",
-        "created_at": entry.isoformat(),
-    }
-
-
 async def ensure_indexes():
     await db.users.create_index("email", unique=True)
     await db.vehicle_masters.create_index("vehicle_number", unique=True)
@@ -2385,6 +2358,8 @@ async def ensure_indexes():
     await db.visit_sessions.create_index("visit_date")
     await db.visit_sessions.create_index("status")
     await db.visit_sessions.create_index([("vehicle_number", 1), ("entry_time", -1)])
+    await db.plate_reviews.create_index([("status", 1), ("created_at", -1)])
+    await db.plate_reviews.create_index("id", unique=True)
 
 
 @app.on_event("startup")
@@ -2392,7 +2367,8 @@ async def startup():
     await ensure_indexes()
     await seed_admin()
     await seed_google_admin()
-    await seed_demo()
+    if ADMIN_PASSWORD.lower() in _WEAK_PASSWORDS or len(ADMIN_PASSWORD) < 10:
+        logger.warning("ADMIN_PASSWORD in .env is weak — anyone who guesses it gets full admin access. Change it, then restart.")
     # NOTE: YOLO/OCR now runs on the showroom PC via /app/local_agent —
     # the backend only persists `plate_detected` messages arriving on
     # /api/agent/ws (see _persist_entry). No ML runs here.

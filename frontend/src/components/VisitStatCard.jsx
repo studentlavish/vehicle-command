@@ -1,33 +1,27 @@
 import React from "react";
-import { motion } from "framer-motion";
+import { cn } from "@/lib/utils";
 
-export default function VisitStatCard({ label, value, sub, icon: Icon, tone = "blue", delay = 0, testId }) {
-  const tones = {
-    blue: "from-blue-500/25 to-blue-500/0 text-blue-300",
-    sky: "from-sky-500/25 to-sky-500/0 text-sky-300",
-    emerald: "from-emerald-500/25 to-emerald-500/0 text-emerald-300",
-    violet: "from-violet-500/25 to-violet-500/0 text-violet-300",
-    amber: "from-amber-500/25 to-amber-500/0 text-amber-300",
-  };
+const TONES = {
+  blue: "bg-primary/10 text-primary",
+  sky: "bg-info/10 text-info",
+  emerald: "bg-success/10 text-success",
+  violet: "bg-violet-50 text-violet-600",
+  amber: "bg-warning/10 text-warning",
+};
+
+export default function VisitStatCard({ label, value, sub, icon: Icon, tone = "blue", testId }) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay }}
-      className="glass rounded-2xl p-5 relative overflow-hidden hover:-translate-y-0.5 transition-all duration-300"
-      data-testid={testId}
-    >
-      <div className={`absolute inset-0 bg-gradient-to-br ${tones[tone].split(" ")[0]} ${tones[tone].split(" ")[1]} pointer-events-none`} />
-      <div className="relative flex items-start justify-between">
-        <div>
-          <div className="text-[11px] uppercase tracking-widest text-slate-400">{label}</div>
-          <div className="mt-2 text-3xl font-bold tracking-tight text-white leading-tight">{value}</div>
-          {sub ? <div className={`mt-1 text-xs ${tones[tone].split(" ")[2]}`}>{sub}</div> : null}
+    <div className="surface p-4" data-testid={testId}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-medium text-muted-foreground">{label}</div>
+          <div className="mt-1.5 text-2xl font-semibold leading-tight tabular-nums">{value}</div>
+          {sub ? <div className="mt-1 text-xs text-muted-foreground">{sub}</div> : null}
         </div>
-        <div className="h-10 w-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center">
-          {Icon ? <Icon className={`h-5 w-5 ${tones[tone].split(" ")[2]}`} /> : null}
+        <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-lg", TONES[tone] || TONES.blue)}>
+          {Icon ? <Icon className="h-[18px] w-[18px]" /> : null}
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }

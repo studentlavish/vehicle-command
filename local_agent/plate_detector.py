@@ -1,29 +1,30 @@
-"""Local YOLO license-plate detector + EasyOCR (only).
+"""Number-plate detection for the showroom camera agent.
 
-Pipeline on the showroom PC:
-    JPEG frame  →  YOLO (dedicated license-plate model)  →  plate crop
-                →  EasyOCR (English)  →  normalized plate
+Pipeline (per camera, every DETECTION_INTERVAL_SECONDS):
 
-The OCR engine is strictly EasyOCR — no other engine, no cloud fallback. If a dedicated license-plate model
-is not configured (`PLATE_MODEL_PATH`), the detector runs in **audit mode**:
-it will still identify vehicles for logging + the crop is sent as-is, but
-`process_jpeg` returns `None` (i.e. no `plate_detected` message is emitted)
-so we NEVER fake a plate read from a heuristic ROI.
+    frame ─► plate finder (open-image-models YOLOv9, free/MIT) ─► plate crop
+          ─► plate reader (Awiros Indian-plate OCR, cross-checked by
+             fast-plate-ocr; EasyOCR only as a last resort)       ─► text
+          ─► Indian-format check + look-alike fixes (plate_rules)  ─► read
+          ─► reads collected per vehicle, character-level vote     ─► plate
+          ─► sent to the backend with confidence high / medium / low
+             (low and uncertain reads land in the Plate Review queue)
 
-Config (env vars, all optional):
-    PLATE_MODEL_PATH        Absolute path to a YOLO .pt trained on plates.
-                            The model classes MUST include a name matching
-                            /plate|license/i. If missing/invalid the
-                            detector logs a WARNING and stays in audit mode.
-    VEHICLE_MODEL_PATH      Path to a vehicle-class YOLO (default: yolov8n.pt
-                            in this directory). Only used to gate OCR (we
-                            require a vehicle in-frame before spending OCR
-                            cycles).
-    EASYOCR_LANGS           Comma-separated language codes (default: en)
-    EASYOCR_GPU             1/true to enable GPU (default: 0)
-    CONFIRM_FRAMES          Consecutive matches required before a plate is
-                            emitted (default: 3)
-    CONFIRM_WINDOW_SECONDS  Roll-back window for the buffer (default: 15)
+Every component is free and runs offline. See plate_ocr.py for the engines
+and install_ocr.sh to install them.
+
+Optional (legacy) components, used only if configured:
+    PLATE_MODEL_PATH   a custom Ultralytics YOLO .pt trained on plates — used
+                       instead of the open-image-models finder.
+    VEHICLE_GATE=true  require an Ultralytics COCO vehicle detection before
+                       looking for plates (off by default; needs ultralytics,
+                       which is AGPL-licensed).
+
+Voting config (env):
+    VOTE_MIN_READS          reads needed before a plate is emitted (default 3)
+    VOTE_AGREEMENT          share of reads that must agree for "medium" (0.6)
+    CONFIRM_WINDOW_SECONDS  max seconds collecting reads for one vehicle (15)
+    VEHICLE_GONE_FRAMES     frames without a plate before finalising (2)
 """
 from __future__ import annotations
 
@@ -32,76 +33,36 @@ import os
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+import plate_rules
+
 log = logging.getLogger("vashu_agent.detector")
 
-# COCO vehicle classes (car, motorcycle, bus, truck) — used only to gate OCR.
-VEHICLE_CLASS_IDS = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-PLATE_RE = re.compile(r"[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}")
-
-# Multi-frame confirmation config
-CONFIRM_FRAMES = int(os.environ.get("CONFIRM_FRAMES", "3"))
+VOTE_MIN_READS = int(os.environ.get("VOTE_MIN_READS", os.environ.get("CONFIRM_FRAMES", "3")))
+VOTE_AGREEMENT = float(os.environ.get("VOTE_AGREEMENT", "0.6"))
 CONFIRM_WINDOW_SECONDS = float(os.environ.get("CONFIRM_WINDOW_SECONDS", "15"))
+VEHICLE_GONE_FRAMES = int(os.environ.get("VEHICLE_GONE_FRAMES", "2"))
 
-# HIGH-CONFIDENCE fast path: a single strong plate-model detection whose OCR
-# text is a structurally valid Indian registration bypasses the multi-frame
-# confirmation gate entirely.
-HIGH_CONF_YOLO_THRESHOLD = float(os.environ.get("HIGH_CONF_YOLO_THRESHOLD", "0.78"))
-# Full structural validation: SS-D(D)-L(LL)-NNNN (e.g. DL24ZB8987, KA05MG9999)
-_STRICT_INDIAN_PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$")
-
-# Model paths
 _HERE = os.path.dirname(__file__)
-VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", os.path.join(_HERE, "yolov8n.pt"))
-# If PLATE_MODEL_PATH is not set, look for local_agent/best.pt (typical filename
-# for a trained license-plate YOLO). If that file doesn't exist we fall back to
-# audit / vehicle-crop-OCR mode — plate_detector.py explains both paths in the
-# module docstring.
 _default_plate_path = os.path.join(_HERE, "best.pt")
 PLATE_MODEL_PATH = os.environ.get(
-    "PLATE_MODEL_PATH",
-    _default_plate_path if os.path.isfile(_default_plate_path) else "",
+    "PLATE_MODEL_PATH", _default_plate_path if os.path.isfile(_default_plate_path) else "",
 ).strip()
-
-# EasyOCR config
-EASYOCR_LANGS = [s.strip() for s in os.environ.get("EASYOCR_LANGS", "en").split(",") if s.strip()]
-EASYOCR_GPU = os.environ.get("EASYOCR_GPU", "0").strip().lower() in ("1", "true", "yes", "on")
-
-# When no dedicated plate model is available, run EasyOCR directly on the
-# vehicle crop. To prevent false positives the fallback ONLY emits a plate
-# when the OCR result matches the strict Indian plate regex AND passes the
-# multi-frame confirmation gate. Set to "false" to keep hard-audit mode.
-ALLOW_VEHICLE_CROP_OCR = os.environ.get("ALLOW_VEHICLE_CROP_OCR", "true").strip().lower() in ("1", "true", "yes", "on")
-
-# Regex to accept a class name as a plate class. Real-world exports use
-# a variety of names — "plate", "license_plate", "License Plate", or even
-# the stringified list "['plate']" — so we match `plate|license|^lp$`
-# anywhere inside the class name.
+VEHICLE_GATE = os.environ.get("VEHICLE_GATE", "false").strip().lower() in ("1", "true", "yes", "on")
+VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", os.path.join(_HERE, "yolov8n.pt"))
+VEHICLE_CLASS_IDS = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 _PLATE_CLASS_RE = re.compile(r"(plate|license|\blp\b)", re.I)
 
 
 def _normalize_plate(raw: str) -> Optional[str]:
-    """Conservative normalization: uppercase, strip whitespace and dashes.
-
-    Deliberately does NOT do OCR-mistake character swaps (O↔0, I↔1, S↔5,
-    B↔8) — those require a validated plate-format rule which we don't have.
-    """
-    if not raw:
-        return None
-    txt = raw.upper().replace("-", "").replace(".", " ")
-    m = PLATE_RE.search(txt)
-    if m:
-        return "".join(m.group(0).split())
-    for line in txt.splitlines():
-        cleaned = "".join(c for c in line if c.isalnum())
-        if 6 <= len(cleaned) <= 12 and any(c.isdigit() for c in cleaned) and any(c.isalpha() for c in cleaned):
-            return cleaned
-    return None
+    """Return a valid Indian plate (with look-alike characters fixed) or None."""
+    plate, _ = plate_rules.correct(raw)
+    return plate
 
 
 @dataclass
@@ -112,333 +73,265 @@ class LocalDetection:
     plate_jpeg: bytes
     vehicle_class: str
     vehicle_conf: float
+    reads: int = 1
+    support: float = 1.0
+    candidates: Optional[List[str]] = None
 
 
 @dataclass
-class _CandidateState:
-    plate: str = ""
-    count: int = 0
+class _Read:
+    plate: str
+    conf: float
+    crop: bytes
+    plate_crop: bytes
+    vehicle_class: str
+    vehicle_conf: float
+
+
+@dataclass
+class _VoteState:
+    reads: List[_Read] = field(default_factory=list)
     first_seen: float = 0.0
-    best_crop: bytes = b""
-    best_plate_crop: bytes = b""
-    best_conf: float = 0.0
-    best_vehicle_class: str = ""
+    missing: int = 0
+
+    def reset(self) -> None:
+        self.reads = []
+        self.first_seen = 0.0
+        self.missing = 0
+
+
+def vote(reads: List[_Read]) -> Tuple[Optional[str], float, List[str]]:
+    """Character-level, confidence-weighted majority vote.
+
+    Returns (winner, support, distinct_candidates). `support` is the share of
+    total confidence held by reads that equal the winner (or differ from it by
+    a single character, which is the usual OCR slip).
+    """
+    if not reads:
+        return None, 0.0, []
+    # Vote only among reads of the most common length (weighted).
+    by_len: Dict[int, float] = defaultdict(float)
+    for r in reads:
+        by_len[len(r.plate)] += r.conf
+    L = max(by_len, key=by_len.get)
+    same = [r for r in reads if len(r.plate) == L]
+    chars = []
+    for i in range(L):
+        tally: Dict[str, float] = defaultdict(float)
+        for r in same:
+            tally[r.plate[i]] += r.conf
+        chars.append(max(tally, key=tally.get))
+    winner, _ = plate_rules.correct("".join(chars))
+    if not winner:
+        # Fall back to the single most-confident read.
+        winner = max(reads, key=lambda r: r.conf).plate
+    total = sum(r.conf for r in reads) or 1.0
+    agree = sum(r.conf for r in reads if plate_rules.distance(r.plate, winner) <= 1)
+    exact = sum(r.conf for r in reads if r.plate == winner)
+    support = round(min(agree, exact * 1.25) / total, 3)
+    distinct = sorted({r.plate for r in reads}, key=lambda p: -sum(r.conf for r in reads if r.plate == p))
+    return winner, support, distinct[:5]
 
 
 class LocalPlateDetector:
-    """Loads YOLO + EasyOCR once, then processes JPEG frames on demand.
+    """Finds and reads number plates; emits one voted detection per vehicle."""
 
-    Emits a confirmed `LocalDetection` only when:
-      1. a vehicle is present (via vehicle YOLO), AND
-      2. a dedicated plate model returns a plate bounding box, AND
-      3. EasyOCR reads a plate on ≥ CONFIRM_FRAMES consecutive frames.
-    """
+    def __init__(self) -> None:
+        from plate_ocr import PlateFinder, PlateReader
 
-    def __init__(
-        self,
-        plate_model_path: Optional[str] = None,
-        vehicle_model_path: Optional[str] = None,
-    ) -> None:
-        from ultralytics import YOLO
-
-        # Vehicle model — always required as an OCR gate.
-        v_path = vehicle_model_path or VEHICLE_MODEL_PATH
-        self._vehicle_model = YOLO(v_path)
-        v_names = list(self._vehicle_model.names.values()) if hasattr(self._vehicle_model, "names") else []
-        v_plate_hits = [n for n in v_names if _PLATE_CLASS_RE.search(n or "")]
-        log.info("[DETECTOR] vehicle YOLO loaded: %s (classes=%d, plate_class=%s)",
-                 v_path, len(v_names), v_plate_hits or "NONE")
-
-        # Plate model — optional. If missing or its classes don't include a
-        # plate class, stay in audit mode: we will NOT emit plate detections.
-        self._plate_model = None
-        self._plate_class_indices: List[int] = []
-        p_path = (plate_model_path or PLATE_MODEL_PATH or "").strip()
-        if p_path and os.path.isfile(p_path):
+        # 1. Plate finder — custom Ultralytics model if configured, else the free ONNX finder.
+        self._ul_plate = None
+        self._ul_plate_ids: List[int] = []
+        self._finder = None
+        if PLATE_MODEL_PATH and os.path.isfile(PLATE_MODEL_PATH):
             try:
-                cand = YOLO(p_path)
-                names = cand.names if hasattr(cand, "names") else {}
-                # Accept model where at least one class name looks like a plate.
-                plate_ids = [i for i, n in names.items() if _PLATE_CLASS_RE.search(str(n))]
-                if plate_ids:
-                    self._plate_model = cand
-                    self._plate_class_indices = plate_ids
-                    log.info("[DETECTOR] plate YOLO loaded: %s (plate class indices=%s, names=%s)",
-                             p_path, plate_ids, [names[i] for i in plate_ids])
+                from ultralytics import YOLO
+                m = YOLO(PLATE_MODEL_PATH)
+                ids = [i for i, n in (m.names or {}).items() if _PLATE_CLASS_RE.search(str(n))]
+                if ids:
+                    self._ul_plate, self._ul_plate_ids = m, ids
+                    log.info("[DETECTOR] custom plate model: %s", PLATE_MODEL_PATH)
                 else:
-                    log.warning(
-                        "[DETECTOR] %s has no license-plate class (classes=%s) — "
-                        "detector will stay in audit mode (no plate_detected emitted).",
-                        p_path, list(names.values())[:12],
-                    )
+                    log.warning("[DETECTOR] %s has no plate class — ignoring it", PLATE_MODEL_PATH)
             except Exception as e:
-                log.warning("[DETECTOR] failed to load PLATE_MODEL_PATH=%s: %s", p_path, e)
-        else:
-            if p_path:
-                log.warning("[DETECTOR] PLATE_MODEL_PATH=%s does not exist — audit mode", p_path)
-            else:
-                log.warning(
-                    "[DETECTOR] No PLATE_MODEL_PATH configured. The current YOLO model "
-                    "(%s) is a VEHICLE detector (COCO classes), NOT a license-plate detector. "
-                    "Set PLATE_MODEL_PATH to a dedicated plate YOLO .pt to enable "
-                    "plate recognition. Running in AUDIT MODE (no plate_detected emitted).",
-                    v_path,
-                )
+                log.warning("[DETECTOR] could not load PLATE_MODEL_PATH=%s: %s", PLATE_MODEL_PATH, e)
+        if self._ul_plate is None:
+            self._finder = PlateFinder()
 
-        # EasyOCR — single reader reused across calls.
-        self._easyocr = None
-        try:
-            import easyocr
-            self._easyocr = easyocr.Reader(EASYOCR_LANGS, gpu=EASYOCR_GPU, verbose=False)
-            log.info("[DETECTOR] EasyOCR reader ready (langs=%s, gpu=%s)", EASYOCR_LANGS, EASYOCR_GPU)
-        except Exception as e:
-            log.warning("[DETECTOR] EasyOCR unavailable — plate recognition disabled: %s", e)
+        # 2. Optional vehicle gate (Ultralytics COCO model).
+        self._vehicle_model = None
+        if VEHICLE_GATE:
+            try:
+                from ultralytics import YOLO
+                self._vehicle_model = YOLO(VEHICLE_MODEL_PATH)
+                log.info("[DETECTOR] vehicle gate on: %s", VEHICLE_MODEL_PATH)
+            except Exception as e:
+                log.warning("[DETECTOR] vehicle gate unavailable (%s) — continuing without it", e)
 
-        self._confirmation: Dict[str, _CandidateState] = defaultdict(_CandidateState)
-        log.info("[DETECTOR] confirmation config: frames=%d window=%.1fs",
-                 CONFIRM_FRAMES, CONFIRM_WINDOW_SECONDS)
+        # 3. Plate reader(s).
+        self._reader = PlateReader()
+        self._votes: Dict[str, _VoteState] = defaultdict(_VoteState)
+        log.info("[DETECTOR] ready: finder=%s reader=%s vote(min_reads=%d agreement=%.2f window=%.0fs)",
+                 "custom-yolo" if self._ul_plate else self._finder.model, self._reader.description,
+                 VOTE_MIN_READS, VOTE_AGREEMENT, CONFIRM_WINDOW_SECONDS)
 
     # ---------- introspection ----------
     def status(self) -> Dict[str, object]:
         return {
-            "vehicle_model": VEHICLE_MODEL_PATH,
-            "plate_model": PLATE_MODEL_PATH or None,
-            "plate_model_loaded": self._plate_model is not None,
-            "plate_class_indices": self._plate_class_indices,
-            "easyocr_ready": self._easyocr is not None,
-            "audit_mode": self._plate_model is None,
-            "confirm_frames": CONFIRM_FRAMES,
+            "plate_finder": PLATE_MODEL_PATH if self._ul_plate else (self._finder.model if self._finder else None),
+            "plate_reader": self._reader.description,
+            "vehicle_gate": self._vehicle_model is not None,
+            "vote_min_reads": VOTE_MIN_READS,
+            "vote_agreement": VOTE_AGREEMENT,
             "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
         }
 
-    # ---------- YOLO helpers ----------
-    def detect_vehicles(self, frame_bgr: np.ndarray, min_conf: float = 0.35) -> List[dict]:
-        if frame_bgr is None or frame_bgr.size == 0:
-            return []
-        h, w = frame_bgr.shape[:2]
-        scale = 1.0
-        max_side = 640
-        if max(h, w) > max_side:
-            scale = max_side / max(h, w)
-            small = cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))
-        else:
-            small = frame_bgr
-        results = self._vehicle_model.predict(small, verbose=False, imgsz=640, conf=min_conf)
-        out: List[dict] = []
-        if not results:
-            return out
-        r = results[0]
-        if r.boxes is None:
-            return out
-        boxes = r.boxes
-        for i in range(len(boxes)):
-            cls_id = int(boxes.cls[i].item())
-            if cls_id not in VEHICLE_CLASS_IDS:
-                continue
-            conf = float(boxes.conf[i].item())
-            x1, y1, x2, y2 = [float(v) for v in boxes.xyxy[i].tolist()]
-            if scale != 1.0:
-                x1 /= scale; y1 /= scale; x2 /= scale; y2 /= scale
-            x1 = max(0, int(x1)); y1 = max(0, int(y1))
-            x2 = min(w - 1, int(x2)); y2 = min(h - 1, int(y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            out.append({
-                "bbox": (x1, y1, x2 - x1, y2 - y1),
-                "cls_name": VEHICLE_CLASS_IDS[cls_id],
-                "conf": conf,
-                "area": (x2 - x1) * (y2 - y1),
-            })
-        out.sort(key=lambda d: d["area"], reverse=True)
-        return out
-
-    def detect_plates(self, frame_bgr: np.ndarray, min_conf: float = 0.30) -> List[dict]:
-        """Run the dedicated plate YOLO. Returns [] if no plate model loaded."""
-        if self._plate_model is None or frame_bgr is None or frame_bgr.size == 0:
-            return []
-        results = self._plate_model.predict(frame_bgr, verbose=False, imgsz=640, conf=min_conf)
-        if not results:
-            return []
-        r = results[0]
-        if r.boxes is None:
-            return []
-        out: List[dict] = []
-        h, w = frame_bgr.shape[:2]
-        for i in range(len(r.boxes)):
-            cls_id = int(r.boxes.cls[i].item())
-            if self._plate_class_indices and cls_id not in self._plate_class_indices:
-                continue
-            conf = float(r.boxes.conf[i].item())
-            x1, y1, x2, y2 = [float(v) for v in r.boxes.xyxy[i].tolist()]
-            x1 = max(0, int(x1)); y1 = max(0, int(y1))
-            x2 = min(w - 1, int(x2)); y2 = min(h - 1, int(y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            out.append({"bbox": (x1, y1, x2 - x1, y2 - y1), "conf": conf, "area": (x2 - x1) * (y2 - y1)})
-        out.sort(key=lambda d: d["conf"], reverse=True)
-        return out
-
-    @staticmethod
-    def crop(frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int], pad: float = 0.05) -> np.ndarray:
-        x, y, w, h = bbox
-        H, W = frame_bgr.shape[:2]
-        px = int(w * pad); py = int(h * pad)
-        x1 = max(0, x - px); y1 = max(0, y - py)
-        x2 = min(W, x + w + px); y2 = min(H, y + h + py)
-        return frame_bgr[y1:y2, x1:x2].copy()
-
+    # ---------- helpers ----------
     @staticmethod
     def encode_jpeg(img: np.ndarray, quality: int = 82) -> Optional[bytes]:
+        if img is None or img.size == 0:
+            return None
         ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-        if not ok:
-            return None
-        return bytes(buf)
+        return bytes(buf) if ok else None
 
-    # ---------- OCR ----------
-    def read_plate(self, plate_bgr: np.ndarray) -> Optional[Tuple[str, float]]:
-        """Read a plate crop with EasyOCR. Returns (plate, confidence) or None."""
-        if self._easyocr is None or plate_bgr is None or plate_bgr.size == 0:
-            return None
-        try:
-            gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
-        except Exception:
-            gray = plate_bgr
-        try:
-            rows = self._easyocr.readtext(gray, detail=1, paragraph=False)
-        except Exception as e:
-            log.warning("[DETECTOR] easyocr.readtext failed: %s", e)
-            return None
-        best_txt, best_conf = "", 0.0
-        for row in rows or []:
-            try:
-                _bbox, text, conf = row
-            except Exception:
+    @staticmethod
+    def _context_crop(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+        """Area around the plate (roughly the vehicle front/back) for the snapshot."""
+        H, W = frame.shape[:2]
+        w, h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        hw, hh = max(w * 3, 200), max(h * 6, 160)
+        return frame[max(0, cy - hh * 2 // 3):min(H, cy + hh // 3 + h), max(0, cx - hw):min(W, cx + hw)]
+
+    def _has_vehicle(self, frame: np.ndarray) -> Tuple[bool, str, float]:
+        if self._vehicle_model is None:
+            return True, "vehicle", 1.0
+        r = self._vehicle_model.predict(frame, verbose=False, imgsz=640, conf=0.35)
+        for b in (r[0].boxes if r and r[0].boxes is not None else []):
+            cid = int(b.cls.item())
+            if cid in VEHICLE_CLASS_IDS:
+                return True, VEHICLE_CLASS_IDS[cid], float(b.conf.item())
+        return False, "", 0.0
+
+    def _find_plate(self, frame: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], float]]:
+        """Return (plate_crop, (x1,y1,x2,y2), confidence) for the best plate in frame."""
+        if self._finder is not None:
+            boxes = self._finder.find(frame)
+            if not boxes:
+                return None
+            b = boxes[0]
+            return self._finder.crop(frame, b), (b.x1, b.y1, b.x2, b.y2), b.conf
+        res = self._ul_plate.predict(frame, verbose=False, imgsz=640, conf=0.30)
+        best = None
+        for bx in (res[0].boxes if res and res[0].boxes is not None else []):
+            if int(bx.cls.item()) not in self._ul_plate_ids:
                 continue
-            cand = _normalize_plate(text)
-            if cand and float(conf) > best_conf and len(cand) >= 5:
-                best_txt, best_conf = cand, float(conf)
-        if not best_txt or best_conf < 0.35:
+            c = float(bx.conf.item())
+            if best is None or c > best[1]:
+                best = ([int(v) for v in bx.xyxy[0].tolist()], c)
+        if not best:
             return None
-        return best_txt, best_conf
+        (x1, y1, x2, y2), c = best
+        H, W = frame.shape[:2]
+        px, py = int((x2 - x1) * 0.06), int((y2 - y1) * 0.12)
+        crop = frame[max(0, y1 - py):min(H, y2 + py), max(0, x1 - px):min(W, x2 + px)].copy()
+        return crop, (x1, y1, x2, y2), c
+
+    def read_plate(self, plate_bgr: np.ndarray) -> Optional[Tuple[str, float]]:
+        """Read one plate crop → (valid_plate, confidence) or None. Used by self-tests."""
+        r = self._reader.read(plate_bgr)
+        return (r[0], r[1]) if r else None
 
     # ---------- Frame pipeline ----------
+    def _finalise(self, camera_id: str, reason: str) -> Optional[LocalDetection]:
+        """Vote over the collected reads for this camera and emit a detection."""
+        st = self._votes[camera_id]
+        reads = list(st.reads)
+        st.reset()
+        if not reads:
+            return None
+        winner, support, distinct = vote(reads)
+        if not winner:
+            return None
+        n = len(reads)
+        mean_conf = sum(r.conf for r in reads) / n
+        if n >= VOTE_MIN_READS and support >= 0.8 and mean_conf >= 0.5:
+            confidence = "high"
+        elif n >= VOTE_MIN_READS and support >= VOTE_AGREEMENT:
+            confidence = "medium"
+        else:
+            confidence = "low"  # → Review queue on the backend
+        best = max((r for r in reads if r.plate == winner), key=lambda r: r.conf, default=max(reads, key=lambda r: r.conf))
+        log.info("[DETECTOR] %s plate=%s conf=%s reads=%d support=%.2f mean_ocr=%.2f (%s) candidates=%s",
+                 camera_id, winner, confidence, n, support, mean_conf, reason, distinct)
+        return LocalDetection(
+            plate=winner,
+            confidence=confidence,
+            crop_jpeg=best.crop,
+            plate_jpeg=best.plate_crop,
+            vehicle_class=best.vehicle_class,
+            vehicle_conf=best.vehicle_conf,
+            reads=n,
+            support=support,
+            candidates=distinct,
+        )
+
     async def process_jpeg(self, jpeg: bytes, camera_id: str = "CAM-01") -> Optional[LocalDetection]:
         arr = np.frombuffer(jpeg, dtype=np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
             return None
+        st = self._votes[camera_id]
+        now = time.time()
 
-        # Vehicle gate — no vehicle → no OCR
-        vehicles = self.detect_vehicles(frame)
-        if not vehicles:
-            self._decay(camera_id)
+        # Window expired → finalise whatever we have (sent as low/medium).
+        if st.reads and (now - st.first_seen) > CONFIRM_WINDOW_SECONDS:
+            return self._finalise(camera_id, "window expired")
+
+        has_vehicle, vclass, vconf = self._has_vehicle(frame)
+        found = self._find_plate(frame) if has_vehicle else None
+        if not found:
+            if st.reads:
+                st.missing += 1
+                if st.missing >= VEHICLE_GONE_FRAMES:
+                    return self._finalise(camera_id, "vehicle left")
             return None
-        top_v = vehicles[0]
-        vehicle_crop = self.crop(frame, top_v["bbox"])
+        st.missing = 0
+        plate_crop, (x1, y1, x2, y2), box_conf = found
 
-        # Plate detection: prefer the dedicated plate YOLO. If not configured,
-        # optionally fall back to OCR-ing the vehicle crop directly. The strict
-        # PLATE_RE regex + multi-frame confirmation gate prevent false emits.
-        plate_crop: np.ndarray
-        strict_regex_required = False
-        if self._plate_model is not None:
-            plates = self.detect_plates(vehicle_crop)
-            if not plates:
-                self._decay(camera_id)
-                return None
-            top_p = plates[0]
-            plate_crop = self.crop(vehicle_crop, top_p["bbox"], pad=0.02)
-        elif ALLOW_VEHICLE_CROP_OCR:
-            # Fallback: OCR the whole vehicle crop with a strict regex guard.
-            plate_crop = vehicle_crop
-            strict_regex_required = True
-        else:
-            log.debug("[DETECTOR] hard-audit mode — no plate model, fallback disabled; skipping OCR")
-            return None
-
-        read = self.read_plate(plate_crop)
+        read = self._reader.read(plate_crop)
         if not read:
             return None
-        plate, ocr_conf = read
-        if strict_regex_required and not PLATE_RE.search(plate):
-            log.debug("[DETECTOR] fallback rejected non-regex plate=%s", plate)
-            return None
+        plate, ocr_conf, note = read
 
-        # HIGH-CONFIDENCE fast path — a single strong, structurally-valid read
-        # is emitted immediately instead of waiting for the confirmation gate.
-        # (Only when the dedicated plate YOLO is active; fallback OCR mode has
-        # no plate-localisation confidence and always uses the slow path.)
-        yolo_plate_conf = top_p["conf"] if self._plate_model is not None else 0.0
-        if yolo_plate_conf >= HIGH_CONF_YOLO_THRESHOLD and _STRICT_INDIAN_PLATE_RE.match(plate):
-            fast_state = self._confirmation[camera_id]
-            fast_state.plate = ""
-            fast_state.count = 0
-            fast_state.first_seen = 0.0
-            log.info("[PLATE] HIGH-CONFIDENCE AUTO-CONFIRMED plate=%s yolo_conf=%.2f ocr_conf=%.2f cam=%s",
-                     plate, yolo_plate_conf, ocr_conf, camera_id)
-            return LocalDetection(
-                plate=plate,
-                confidence="high",
-                crop_jpeg=self.encode_jpeg(vehicle_crop, quality=78) or jpeg,
-                plate_jpeg=self.encode_jpeg(plate_crop, quality=85) or b"",
-                vehicle_class=top_v["cls_name"],
-                vehicle_conf=top_v["conf"],
-            )
+        st.reads.append(_Read(
+            plate=plate,
+            conf=ocr_conf * (0.6 + 0.4 * box_conf),
+            crop=self.encode_jpeg(self._context_crop(frame, x1, y1, x2, y2), quality=78) or jpeg,
+            plate_crop=self.encode_jpeg(plate_crop, quality=88) or b"",
+            vehicle_class=vclass,
+            vehicle_conf=vconf,
+        ))
+        if len(st.reads) == 1:
+            st.first_seen = now
+        log.debug("[DETECTOR] cam=%s read=%s ocr=%.2f box=%.2f via %s (n=%d)",
+                  camera_id, plate, ocr_conf, box_conf, note, len(st.reads))
 
-        # Multi-frame confirmation
-        state = self._confirmation[camera_id]
-        now = time.time()
-        if state.plate != plate or (now - state.first_seen) > CONFIRM_WINDOW_SECONDS:
-            state.plate = plate
-            state.count = 0
-            state.first_seen = now
-            state.best_crop = b""
-            state.best_plate_crop = b""
-            state.best_conf = 0.0
-            state.best_vehicle_class = top_v["cls_name"]
-
-        state.count += 1
-        if ocr_conf > state.best_conf:
-            state.best_conf = ocr_conf
-            state.best_crop = self.encode_jpeg(vehicle_crop, quality=78) or jpeg
-            state.best_plate_crop = self.encode_jpeg(plate_crop, quality=85) or b""
-            state.best_vehicle_class = top_v["cls_name"]
-
-        log.debug("[DETECTOR] cam=%s plate=%s count=%d conf=%.2f", camera_id, plate, state.count, ocr_conf)
-        if state.count < CONFIRM_FRAMES:
-            return None
-
-        confirmed = LocalDetection(
-            plate=state.plate,
-            confidence="high" if state.best_conf >= 0.7 else "medium",
-            crop_jpeg=state.best_crop or (self.encode_jpeg(vehicle_crop, quality=78) or jpeg),
-            plate_jpeg=state.best_plate_crop,
-            vehicle_class=state.best_vehicle_class or top_v["cls_name"],
-            vehicle_conf=top_v["conf"],
-        )
-        state.plate = ""
-        state.count = 0
-        state.first_seen = 0.0
-        state.best_crop = b""
-        state.best_plate_crop = b""
-        state.best_conf = 0.0
-        log.info("[DETECTOR] confirmed plate=%s (%d frames, ocr_conf=%.2f) cam=%s",
-                 confirmed.plate, CONFIRM_FRAMES, ocr_conf, camera_id)
-        return confirmed
-
-    def _decay(self, camera_id: str) -> None:
-        state = self._confirmation.get(camera_id)
-        if state and state.count > 0:
-            state.count = max(0, state.count - 1)
-            if state.count == 0:
-                state.plate = ""
+        # Enough agreeing reads → emit now instead of waiting for the window.
+        if len(st.reads) >= VOTE_MIN_READS:
+            winner, support, _ = vote(st.reads)
+            if winner and support >= 0.8:
+                return self._finalise(camera_id, "votes agree")
+            if len(st.reads) >= VOTE_MIN_READS * 3:
+                return self._finalise(camera_id, "max reads")
+        return None
 
 
 _detector: Optional[LocalPlateDetector] = None
 
 
 def get_detector() -> Optional[LocalPlateDetector]:
-    """Lazily construct the singleton — returns None if YOLO or EasyOCR won't load."""
+    """Lazily construct the singleton — returns None if no plate finder / reader can load."""
     global _detector
     if _detector is None:
         try:

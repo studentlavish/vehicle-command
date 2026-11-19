@@ -8,6 +8,8 @@ from typing import Optional, Union
 
 import cv2
 
+from mjpeg_reader import open_video
+
 log = logging.getLogger("vashu_agent.camera")
 
 
@@ -26,25 +28,22 @@ class CameraCapture:
         self.width = width
         self.height = height
         self.target_fps = target_fps
-        self._cap: Optional[cv2.VideoCapture] = None
+        self._cap = None  # cv2.VideoCapture or mjpeg_reader.MjpegCapture
         self._lock = threading.Lock()
         self._last_open_attempt = 0.0
 
     def _open(self) -> bool:
         try:
-            backend = cv2.CAP_ANY
-            if isinstance(self.source, str) and (self.source.startswith("rtsp://") or self.source.startswith("http")):
-                backend = cv2.CAP_FFMPEG
-            cap = cv2.VideoCapture(self.source, backend)
+            # HTTP MJPEG (e.g. Android IP Webcam) is read with Python's own
+            # networking; RTSP / USB still use OpenCV. See mjpeg_reader.py.
+            cap = open_video(self.source)
+            if cap is None:
+                return False
             try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             except Exception:
                 pass
-            if not cap.isOpened():
-                cap.release()
-                return False
             self._cap = cap
             log.info("[CAMERA] opened source=%s", self.source if isinstance(self.source, int) else "***")
             return True

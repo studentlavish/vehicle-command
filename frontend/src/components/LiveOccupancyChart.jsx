@@ -1,101 +1,84 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import React, { useEffect, useRef, useState } from "react";
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import { Car, TrendingUp } from "lucide-react";
+import api from "@/lib/api";
+import SectionCard from "@/components/common/SectionCard";
+import { EmptyState } from "@/components/common/EmptyState";
+import { chartTheme, colors } from "@/lib/theme";
 
-/** Small live sparkline of cars-inside over the last ~2 hours.
- *  Updates every 30s (poll) + immediately on each live 'entry.recorded' bump. */
+/** Cars-inside over the last ~2 hours. Polls every 30s and reacts to live bumps. */
 export default function LiveOccupancyChart({ liveValue }) {
-  const [samples, setSamples] = useState([]); // {t, v}
+  const [samples, setSamples] = useState([]);
   const lastLiveRef = useRef(null);
 
-  // Poll cars-inside every 30s
+  const push = (v) =>
+    setSamples((prev) => [...prev, { t: Date.now(), v: Number(v) || 0 }].slice(-240));
+
   useEffect(() => {
     let cancelled = false;
-    const push = (v) => setSamples((prev) => {
-      const next = [...prev, { t: Date.now(), v: Number(v) || 0 }];
-      // Keep ~2h of samples @ 30s = 240 points cap
-      return next.slice(-240);
-    });
     const tick = async () => {
       try {
-        // Reuse api base URL from env — no import needed to keep this tiny.
-        const base = process.env.REACT_APP_BACKEND_URL;
-        const res = await fetch(`${base}/api/dashboard/stats`, { credentials: "include" });
-        if (!res.ok) return;
-        const data = await res.json();
+        const { data } = await api.get("/dashboard/stats");
         if (!cancelled) push(data?.cars_inside?.value ?? 0);
-      } catch { /* ignore */ }
+      } catch { /* ignore — card shows last known value */ }
     };
     tick();
     const i = setInterval(tick, 30000);
     return () => { cancelled = true; clearInterval(i); };
   }, []);
 
-  // React to live entry bump — pushes an extra point immediately.
   useEffect(() => {
-    if (liveValue == null) return;
-    if (lastLiveRef.current === liveValue) return;
+    if (liveValue == null || lastLiveRef.current === liveValue) return;
     lastLiveRef.current = liveValue;
-    setSamples((prev) => [...prev, { t: Date.now(), v: Number(liveValue) || 0 }].slice(-240));
+    push(liveValue);
   }, [liveValue]);
 
-  const { path, area, current, peak, min } = useMemo(() => buildPath(samples), [samples]);
+  const values = samples.map((s) => s.v);
+  const current = values.length ? values[values.length - 1] : 0;
+  const peak = values.length ? Math.max(...values) : 0;
+  const low = values.length ? Math.min(...values) : 0;
+  const data = samples.map((s) => ({ ...s, label: new Date(s.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }));
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay: 0.18 }}
-      className="glass rounded-2xl p-5"
+    <SectionCard
+      icon={TrendingUp}
+      title="Live occupancy"
+      description="Cars inside the showroom · rolling 2 hours"
       data-testid="live-occupancy-card"
     >
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <TrendingUp className="h-4 w-4 text-blue-400" />
-          <h3 className="font-semibold">Live Occupancy</h3>
-        </div>
-        <div className="text-[11px] text-slate-400">Rolling · last 2h</div>
-      </div>
-      <div className="flex items-end justify-between">
+      <div className="mb-4 flex items-end gap-6">
         <div>
-          <div className="text-4xl font-bold tracking-tight flex items-baseline gap-2" data-testid="occupancy-current">
-            <Car className="h-6 w-6 text-emerald-400" />
-            {current}
+          <div className="flex items-center gap-2 text-3xl font-semibold tabular-nums" data-testid="occupancy-current">
+            <Car className="h-6 w-6 text-success" /> {current}
           </div>
-          <div className="text-[11px] text-slate-400 mt-1">
-            peak {peak} · low {min}
-          </div>
+          <div className="text-xs text-muted-foreground">inside right now</div>
         </div>
-        <svg viewBox="0 0 240 64" className="w-2/3 h-16" preserveAspectRatio="none" data-testid="occupancy-spark">
-          <defs>
-            <linearGradient id="occ-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.6" />
-              <stop offset="100%" stopColor="#22d3ee" stopOpacity="0" />
-            </linearGradient>
-          </defs>
-          {area ? <path d={area} fill="url(#occ-fill)" /> : null}
-          {path ? <path d={path} fill="none" stroke="#22d3ee" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /> : null}
-        </svg>
+        <div className="flex gap-4 text-sm">
+          <div><div className="text-xs text-muted-foreground">Peak</div><div className="font-semibold tabular-nums">{peak}</div></div>
+          <div><div className="text-xs text-muted-foreground">Low</div><div className="font-semibold tabular-nums">{low}</div></div>
+        </div>
       </div>
-    </motion.div>
+      {data.length < 2 ? (
+        <EmptyState compact icon={TrendingUp} title="Collecting data" description="The chart fills in as samples arrive every 30 seconds." />
+      ) : (
+        <div className="h-40" data-testid="occupancy-spark">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={data} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+              <defs>
+                <linearGradient id="occ-fill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={colors.success} stopOpacity={0.2} />
+                  <stop offset="100%" stopColor={colors.success} stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid {...chartTheme.grid} />
+              <XAxis dataKey="label" {...chartTheme.axis} minTickGap={40} />
+              <YAxis allowDecimals={false} {...chartTheme.axis} />
+              <Tooltip {...chartTheme.tooltip} formatter={(v) => [v, "Inside"]} />
+              <Area type="monotone" dataKey="v" stroke={colors.success} strokeWidth={2} fill="url(#occ-fill)" isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </SectionCard>
   );
-}
-
-function buildPath(samples) {
-  if (!samples || samples.length === 0) {
-    return { path: "", area: "", current: 0, peak: 0, min: 0 };
-  }
-  const values = samples.map((s) => s.v);
-  const peak = Math.max(...values);
-  const min = Math.min(...values);
-  const current = values[values.length - 1];
-  const w = 240, h = 64, pad = 2;
-  const n = samples.length;
-  const dx = n === 1 ? 0 : (w - pad * 2) / (n - 1);
-  const range = Math.max(1, peak - min);
-  const y = (v) => h - pad - ((v - min) / range) * (h - pad * 2);
-  const pts = samples.map((s, i) => `${pad + i * dx},${y(s.v).toFixed(1)}`);
-  const path = "M" + pts.join(" L");
-  const area = `${path} L${pad + (n - 1) * dx},${h} L${pad},${h} Z`;
-  return { path, area, current, peak, min };
 }

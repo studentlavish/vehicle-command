@@ -1,0 +1,5 @@
+# Test and lint tools. Install into BOTH virtualenvs:
+#   backend/.venv/bin/pip install -r requirements-dev.txt
+#   local_agent/.venv/bin/pip install -r requirements-dev.txt
+pytest>=8.0
+ruff>=0.6

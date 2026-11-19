@@ -1,130 +1,117 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import api from "@/lib/api";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { LogIn as LogInIcon, LogOut, ChevronLeft, ChevronRight } from "lucide-react";
+import PageHeader from "@/components/common/PageHeader";
+import StatusBadge from "@/components/common/StatusBadge";
+import VehiclePlate from "@/components/common/VehiclePlate";
+import Pagination from "@/components/common/Pagination";
+import { EmptyState, ErrorState } from "@/components/common/EmptyState";
+import { TableSkeletonRows } from "@/components/common/Loaders";
+import { LogIn as LogInIcon, LogOut } from "lucide-react";
+import { formatDate, formatTime, elapsed } from "@/lib/time";
 
 const PAGE_SIZE = 50;
-
-function formatTime(iso) {
-  if (!iso) return "—";
-  try { return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }); } catch { return iso; }
-}
 
 export default function HistoryPage({ mode = "entry" }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
   const [page, setPage] = useState(1);
-  const [total, setTotal] = useState(0);
-  const [hasNext, setHasNext] = useState(false);
-  const [hasPrev, setHasPrev] = useState(false);
+  const [meta, setMeta] = useState({ total: 0, hasNext: false, hasPrev: false });
+  const isExit = mode === "exit";
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      setLoading(true);
-      try {
-        // For "exit" mode we only want completed sessions; entry mode shows every session.
-        const params = { page, page_size: PAGE_SIZE };
-        if (mode === "exit") params.status = "exited";
-        const { data } = await api.get("/vehicles", { params });
-        if (cancelled) return;
-        const items = data.items || [];
-        setRows(items);
-        setTotal(data.total || 0);
-        setHasNext(!!data.has_next);
-        setHasPrev(!!data.has_prev);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [mode, page]);
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(false);
+    try {
+      const params = { page, page_size: PAGE_SIZE };
+      if (isExit) params.status = "exited";
+      const { data } = await api.get("/vehicles", { params });
+      setRows(data.items || []);
+      setMeta({ total: data.total || 0, hasNext: !!data.has_next, hasPrev: !!data.has_prev });
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, [isExit, page]);
 
-  const Icon = mode === "exit" ? LogOut : LogInIcon;
-  const title = mode === "exit" ? "Exit History" : "Entry History";
-  const subtitle = mode === "exit"
-    ? "Chronological log of every vehicle exit from the showroom."
-    : "Chronological log of every vehicle entry into the showroom.";
+  useEffect(() => { setPage(1); }, [mode]);
+  useEffect(() => { load(); }, [load]);
 
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const Icon = isExit ? LogOut : LogInIcon;
 
   return (
     <div className="space-y-6" data-testid={`${mode}-history-page`}>
-      <div>
-        <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.25em] text-blue-400/80">
-          <Icon className="h-3.5 w-3.5" /> {mode === "exit" ? "Log Out" : "Log In"}
-        </div>
-        <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">{title}</h1>
-        <p className="text-slate-400 mt-2 text-sm">{subtitle}</p>
-      </div>
+      <PageHeader
+        icon={Icon}
+        title={isExit ? "Exit history" : "Entry history"}
+        description={isExit ? "Every vehicle that has left the showroom, newest first." : "Every vehicle that has entered the showroom, newest first."}
+      />
 
-      <div className="glass rounded-2xl overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-400 text-[11px] uppercase tracking-widest border-b border-white/5">
-                <th className="px-5 py-3 font-normal">Vehicle #</th>
-                <th className="px-5 py-3 font-normal">Owner</th>
-                <th className="px-5 py-3 font-normal">Contact</th>
-                <th className="px-5 py-3 font-normal">{mode === "exit" ? "Exit Time" : "Entry Time"}</th>
-                <th className="px-5 py-3 font-normal">Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {loading ? (
-                Array.from({ length: 8 }).map((_, i) => (
-                  <tr key={`h-skel-${i}`}><td colSpan={5} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
-                ))
-              ) : rows.length === 0 ? (
-                <tr><td colSpan={5} className="text-center py-14 text-slate-400">No records yet.</td></tr>
-              ) : (
-                rows.map((v) => (
-                  <tr key={v.id} className="hover:bg-white/[0.03]">
-                    <td className="px-5 py-3 font-mono text-white">{v.vehicle_number}</td>
-                    <td className="px-5 py-3">{v.owner_name}<div className="text-[11px] text-slate-500">{v.vehicle_model}</div></td>
-                    <td className="px-5 py-3 text-slate-300">{v.contact_number || "—"}</td>
-                    <td className="px-5 py-3 text-slate-300">{formatTime(mode === "exit" ? v.exit_time : v.entry_time)}</td>
-                    <td className="px-5 py-3">
-                      <Badge className="border capitalize bg-white/5 text-slate-200 border-white/10">{v.status}</Badge>
-                    </td>
+      <div className="surface overflow-hidden">
+        {error ? (
+          <ErrorState onRetry={load} />
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Vehicle</th>
+                    <th>Owner</th>
+                    <th>Contact</th>
+                    <th>Date</th>
+                    <th>{isExit ? "Exit time" : "Entry time"}</th>
+                    <th>Duration</th>
+                    <th>Status</th>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {!loading && total > 0 && (
-          <div className="flex items-center justify-between px-5 py-3 border-t border-white/5 text-xs text-slate-400" data-testid={`${mode}-history-pagination`}>
-            <div>
-              Showing <span className="text-slate-200">{(page - 1) * PAGE_SIZE + 1}</span>–
-              <span className="text-slate-200">{(page - 1) * PAGE_SIZE + rows.length}</span> of{" "}
-              <span className="text-slate-200">{total.toLocaleString()}</span>
+                </thead>
+                <tbody>
+                  {loading ? (
+                    <TableSkeletonRows rows={8} cols={7} />
+                  ) : rows.length === 0 ? (
+                    <tr className="hover:bg-transparent">
+                      <td colSpan={7}>
+                        <EmptyState icon={Icon} title={isExit ? "No exits recorded" : "No entries recorded"} description="Records appear here as vehicles pass the cameras." />
+                      </td>
+                    </tr>
+                  ) : (
+                    rows.map((v) => {
+                      const t = isExit ? v.exit_time : v.entry_time;
+                      return (
+                        <tr key={v.id}>
+                          <td><VehiclePlate number={v.vehicle_number} /></td>
+                          <td>
+                            <div className="font-medium">{v.owner_name}</div>
+                            <div className="text-xs text-muted-foreground">{v.vehicle_model || "—"}</div>
+                          </td>
+                          <td className="whitespace-nowrap text-muted-foreground">{v.contact_number || "—"}</td>
+                          <td className="whitespace-nowrap text-muted-foreground">{formatDate(t)}</td>
+                          <td className="whitespace-nowrap font-medium tabular-nums">
+                            <span className="inline-flex items-center gap-1.5">
+                              <Icon className={isExit ? "h-3.5 w-3.5 text-info" : "h-3.5 w-3.5 text-primary"} />
+                              {formatTime(t)}
+                            </span>
+                          </td>
+                          <td className="whitespace-nowrap tabular-nums text-muted-foreground">{elapsed(v.entry_time, v.exit_time)}</td>
+                          <td><StatusBadge status={v.status} /></td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
             </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm" variant="outline"
-                className="h-8 px-2 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
-                disabled={!hasPrev}
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                data-testid={`${mode}-history-prev`}
-              >
-                <ChevronLeft className="h-3.5 w-3.5" /> Prev
-              </Button>
-              <span className="tabular-nums">Page {page} / {totalPages}</span>
-              <Button
-                size="sm" variant="outline"
-                className="h-8 px-2 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
-                disabled={!hasNext}
-                onClick={() => setPage((p) => p + 1)}
-                data-testid={`${mode}-history-next`}
-              >
-                Next <ChevronRight className="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          </div>
+            {!loading && (
+              <Pagination
+                page={page} pageSize={PAGE_SIZE} total={meta.total} count={rows.length}
+                hasPrev={meta.hasPrev} hasNext={meta.hasNext}
+                onPrev={() => setPage((p) => Math.max(1, p - 1))}
+                onNext={() => setPage((p) => p + 1)}
+                testIdPrefix={`${mode}-history`}
+              />
+            )}
+          </>
         )}
       </div>
     </div>

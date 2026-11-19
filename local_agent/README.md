@@ -85,3 +85,31 @@ secret) are never logged.
 | Camera not opening                     | Verify `CAMERA_SOURCE` in a browser / VLC first                  |
 | Reconnect loop every 5-30 s            | Cloud backend or laptop internet down — agent will recover       |
 | High CPU                               | Lower `AGENT_FPS` / `FRAME_WIDTH` / `FRAME_HEIGHT` / `JPEG_QUALITY` |
+
+
+## Number-plate recognition (free, offline)
+
+```bash
+./install_ocr.sh                          # one time — installs everything below
+```
+
+| Stage | Engine | Licence | Cost |
+|-------|--------|---------|------|
+| Find the plate | open-image-models YOLOv9 plate detector | MIT | Free |
+| Read the plate | fast-plate-ocr global model (~25 ms) | MIT | Free |
+| Second opinion when unsure | **Awiros ANPR-OCR** (trained on Indian plates; slower, 0.5–4 s on CPU) | Apache-2.0 | Free |
+| Last resort | EasyOCR (optional, not installed by default) | Apache-2.0 | Free |
+
+Each read is format-checked (Indian state codes, BH series, O→0 / I→1 fixes),
+voted across several frames, and sent with a confidence. Uncertain reads go to
+**Plate Review** in the dashboard instead of being saved automatically.
+
+Measure accuracy on your own camera images (name each file after its plate,
+e.g. `KA05MG9999.jpg`):
+
+```bash
+.venv/bin/python benchmark_ocr.py ~/Desktop/plate-photos
+```
+
+To make Awiros read every plate instead, set `OCR_ENGINE=awiros` in `.env` —
+compare both with `benchmark_ocr.py` on your own photos first.

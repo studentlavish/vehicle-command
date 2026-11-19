@@ -26,6 +26,8 @@ from typing import Any, Dict, Optional, Union
 
 import cv2
 
+from mjpeg_reader import open_video
+
 logger = logging.getLogger("rdx.camera")
 logger.setLevel(logging.INFO)
 
@@ -248,22 +250,13 @@ class CameraManager:
                 state.subscribers = max(0, state.subscribers + delta)
 
     # ---------- internal ----------
-    def _open_capture(self, source: Union[str, int]) -> Optional[cv2.VideoCapture]:
-        """Open cv2.VideoCapture with sensible backend + timeout settings."""
-        # For network streams prefer FFMPEG; for USB use default
-        backend = cv2.CAP_ANY
-        if isinstance(source, str) and (source.startswith("rtsp://") or source.startswith("http")):
-            backend = cv2.CAP_FFMPEG
-        cap = cv2.VideoCapture(source, backend)
-        # Reduce buffering so we get near-live frames
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        if not cap.isOpened():
-            cap.release()
-            return None
-        return cap
+    def _open_capture(self, source: Union[str, int]):
+        """Open a camera: HTTP MJPEG via Python networking, RTSP/USB via OpenCV.
+
+        See mjpeg_reader.py — OpenCV's FFmpeg can be blocked by macOS Local
+        Network privacy ("No route to host") while Python itself is allowed.
+        """
+        return open_video(source)
 
     def _capture_loop(self, state: CameraState) -> None:
         """Blocking capture loop with auto-reconnect every 5s on failure."""

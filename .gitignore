@@ -96,3 +96,16 @@ frontend/node_modules/.cache/default-development/1.pack
 .env
 .env.*
 *.env
+
+# Downloaded OCR models (install_ocr.sh)
+local_agent/models/
+
+# Captured vehicle/plate snapshots (runtime data, never commit)
+backend/snapshots/*
+!backend/snapshots/.gitkeep
+
+# Runtime logs (created by start.sh / agent)
+*.log
+/logs/
+local_agent/logs/*
+!local_agent/logs/.gitkeep

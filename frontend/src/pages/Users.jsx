@@ -1,173 +1,242 @@
-import React, { useEffect, useState } from "react";
-import api from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import api, { errorMessage } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Users, UserPlus, Trash2 } from "lucide-react";
+import PageHeader from "@/components/common/PageHeader";
+import StatusBadge from "@/components/common/StatusBadge";
+import ConfirmDialog from "@/components/common/ConfirmDialog";
+import { EmptyState, ErrorState } from "@/components/common/EmptyState";
+import { TableSkeletonRows } from "@/components/common/Loaders";
+import { Users, UserPlus, Trash2, Search, Loader2, Info } from "lucide-react";
+import { formatDateTime, relativeAgo } from "@/lib/time";
 
-const roleStyle = {
-  admin: "bg-blue-500/15 text-blue-300 border-blue-500/30",
-  manager: "bg-violet-500/15 text-violet-300 border-violet-500/30",
-  security: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-};
+const EMPTY = { name: "", email: "", role: "manager", status: "active" };
 
-function formatDate(iso) {
-  if (!iso) return "—";
-  try { return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }); } catch { return iso; }
+function Avatar({ name }) {
+  const initials = (name || "?").split(/\s+/).map((s) => s[0]).join("").slice(0, 2).toUpperCase();
+  return <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">{initials}</div>;
 }
 
 export default function UsersPage() {
+  const { user: me } = useAuth();
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [filter, setFilter] = useState("");
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ name: "", email: "", role: "manager", status: "active" });
+  const [form, setForm] = useState(EMPTY);
+  const [formErr, setFormErr] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [toDelete, setToDelete] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
+    setError(false);
     try {
       const { data } = await api.get("/users");
-      setRows(data);
+      setRows(Array.isArray(data) ? data : []);
+    } catch {
+      setError(true);
     } finally {
       setLoading(false);
     }
-  };
-  useEffect(() => { load(); }, []);
+  }, []);
+  useEffect(() => { load(); }, [load]);
 
-  const submit = async () => {
+  const shown = useMemo(() => {
+    const f = filter.trim().toLowerCase();
+    if (!f) return rows;
+    return rows.filter((u) => `${u.name} ${u.email} ${u.role}`.toLowerCase().includes(f));
+  }, [rows, filter]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    const errs = {};
+    if (!form.name.trim()) errs.name = "Name is required";
+    if (!/^\S+@\S+\.\S+$/.test(form.email.trim())) errs.email = "Enter a valid email address";
+    setFormErr(errs);
+    if (Object.keys(errs).length) return;
+    setSaving(true);
     try {
-      await api.post("/users", form);
-      toast.success("User added");
+      await api.post("/users", { ...form, name: form.name.trim(), email: form.email.trim() });
+      toast.success("User added", { description: form.email });
       setOpen(false);
-      setForm({ name: "", email: "", role: "manager", status: "active" });
+      setForm(EMPTY);
       load();
-    } catch (e) {
-      toast.error("Failed", { description: e.response?.data?.detail || e.message });
+    } catch (err) {
+      toast.error("Couldn't add user", { description: errorMessage(err) });
+    } finally {
+      setSaving(false);
     }
   };
 
-  const remove = async (u) => {
-    if (!window.confirm(`Delete user ${u.name}?`)) return;
+  const remove = async () => {
     try {
-      await api.delete(`/users/${u.id}`);
-      toast.success("User deleted");
+      await api.delete(`/users/${toDelete.id}`);
+      toast.success("User removed", { description: toDelete.email });
       load();
-    } catch (e) {
-      toast.error("Delete failed", { description: e.response?.data?.detail || e.message });
+    } catch (err) {
+      toast.error("Couldn't remove user", { description: errorMessage(err) });
     }
   };
+
+  const canManage = me?.role === "admin";
 
   return (
     <div className="space-y-6" data-testid="users-page">
-      <div className="flex items-end justify-between gap-4 flex-wrap">
-        <div>
-          <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.25em] text-blue-400/80">
-            <Users className="h-3.5 w-3.5" /> Team
-          </div>
-          <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">Users</h1>
-          <p className="text-slate-400 mt-2 text-sm">Manage admins, managers and security personnel.</p>
-        </div>
-        <Button onClick={() => setOpen(true)} className="bg-blue-600 hover:bg-blue-700" data-testid="add-user-btn">
-          <UserPlus className="h-4 w-4 mr-2" /> Add User
-        </Button>
-      </div>
+      <PageHeader
+        icon={Users}
+        title="Users"
+        description="Admins, managers and security staff who can access the system."
+        actions={canManage && (
+          <Button onClick={() => { setForm(EMPTY); setFormErr({}); setOpen(true); }} data-testid="add-user-btn">
+            <UserPlus className="h-4 w-4" /> Add user
+          </Button>
+        )}
+      />
 
-      <div className="glass rounded-2xl overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-400 text-[11px] uppercase tracking-widest border-b border-white/5">
-                <th className="px-5 py-3 font-normal">Name</th>
-                <th className="px-5 py-3 font-normal">Email</th>
-                <th className="px-5 py-3 font-normal">Role</th>
-                <th className="px-5 py-3 font-normal">Status</th>
-                <th className="px-5 py-3 font-normal">Last Login</th>
-                <th className="px-5 py-3 font-normal text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {loading ? (
-                Array.from({ length: 4 }).map((_, i) => (
-                  <tr key={`u-skel-${i}`}><td colSpan={6} className="p-3"><Skeleton className="h-8 bg-white/5" /></td></tr>
-                ))
-              ) : rows.map((u) => (
-                <tr key={u.id} className="hover:bg-white/[0.03]" data-testid={`user-row-${u.email}`}>
-                  <td className="px-5 py-3">
-                    <div className="flex items-center gap-3">
-                      <div className="h-8 w-8 rounded-full bg-gradient-to-br from-blue-500 to-sky-500 flex items-center justify-center text-xs font-semibold">{u.name[0]}</div>
-                      <div className="text-white">{u.name}</div>
-                    </div>
-                  </td>
-                  <td className="px-5 py-3 text-slate-300">{u.email}</td>
-                  <td className="px-5 py-3">
-                    <Badge className={`${roleStyle[u.role] || "bg-white/5 text-slate-300 border-white/10"} border capitalize`}>{u.role}</Badge>
-                  </td>
-                  <td className="px-5 py-3">
-                    {u.status === "active" ? (
-                      <span className="text-emerald-300 pulse-dot text-sm">Active</span>
-                    ) : (
-                      <span className="text-slate-400 text-sm">Inactive</span>
-                    )}
-                  </td>
-                  <td className="px-5 py-3 text-slate-300">{formatDate(u.last_login)}</td>
-                  <td className="px-5 py-3 text-right">
-                    <Button size="icon" variant="ghost" onClick={() => remove(u)} className="h-8 w-8 text-rose-400 hover:bg-rose-500/10" data-testid={`delete-user-${u.email}`}>
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </td>
+      <div className="surface overflow-hidden">
+        <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="relative w-full sm:max-w-xs">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by name, email or role" className="pl-9" />
+          </div>
+          {!loading && <div className="text-sm text-muted-foreground">{rows.length} user{rows.length === 1 ? "" : "s"}</div>}
+        </div>
+
+        {error ? (
+          <ErrorState onRetry={load} />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Last sign-in</th>
+                  {canManage && <th className="text-right">Actions</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <TableSkeletonRows rows={4} cols={canManage ? 5 : 4} />
+                ) : shown.length === 0 ? (
+                  <tr className="hover:bg-transparent">
+                    <td colSpan={5}><EmptyState icon={Users} title={filter ? "No users match" : "No users yet"} /></td>
+                  </tr>
+                ) : (
+                  shown.map((u) => {
+                    const isMe = me?.id === u.id || me?.email === u.email;
+                    return (
+                      <tr key={u.id} data-testid={`user-row-${u.email}`}>
+                        <td>
+                          <div className="flex items-center gap-3">
+                            <Avatar name={u.name} />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 font-medium">
+                                {u.name}
+                                {isMe && <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">You</span>}
+                              </div>
+                              <div className="truncate text-xs text-muted-foreground">{u.email}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td><StatusBadge status={u.role} /></td>
+                        <td><StatusBadge tone={u.status === "active" ? "success" : "neutral"} dot={u.status === "active"}>{u.status === "active" ? "Active" : "Inactive"}</StatusBadge></td>
+                        <td className="whitespace-nowrap text-muted-foreground" title={formatDateTime(u.last_login)}>
+                          {u.last_login ? relativeAgo(u.last_login) : "Never"}
+                        </td>
+                        {canManage && (
+                          <td className="text-right">
+                            {!isMe && (
+                              <Button size="icon-sm" variant="ghost-danger" onClick={() => setToDelete(u)} aria-label={`Remove ${u.name}`} data-testid={`delete-user-${u.email}`}>
+                                <Trash2 />
+                              </Button>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="bg-[#0F172A]/95 border-white/10 text-white" data-testid="user-form-dialog">
-          <DialogHeader><DialogTitle>Add User</DialogTitle></DialogHeader>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="col-span-2">
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Name</Label>
-              <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="mt-2 bg-white/5 border-white/10" data-testid="user-form-name" />
+      <Dialog open={open} onOpenChange={(v) => !saving && setOpen(v)}>
+        <DialogContent data-testid="user-form-dialog">
+          <form onSubmit={submit} className="space-y-5">
+            <DialogHeader>
+              <div className="flex items-center gap-3">
+                <div className="icon-tile"><UserPlus className="h-5 w-5" /></div>
+                <div className="text-left">
+                  <DialogTitle>Add user</DialogTitle>
+                  <DialogDescription>Give a team member access to the dashboard.</DialogDescription>
+                </div>
+              </div>
+            </DialogHeader>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="col-span-2">
+                <label className="field-label">Full name <span className="text-destructive">*</span></label>
+                <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className={formErr.name ? "border-destructive" : ""} data-testid="user-form-name" autoFocus />
+                {formErr.name && <p className="mt-1 text-xs text-destructive">{formErr.name}</p>}
+              </div>
+              <div className="col-span-2">
+                <label className="field-label">Email <span className="text-destructive">*</span></label>
+                <Input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@company.com" className={formErr.email ? "border-destructive" : ""} data-testid="user-form-email" />
+                {formErr.email && <p className="mt-1 text-xs text-destructive">{formErr.email}</p>}
+              </div>
+              <div>
+                <label className="field-label">Role</label>
+                <Select value={form.role} onValueChange={(role) => setForm({ ...form, role })}>
+                  <SelectTrigger data-testid="user-form-role"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="admin">Admin</SelectItem>
+                    <SelectItem value="manager">Manager</SelectItem>
+                    <SelectItem value="security">Security</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="field-label">Status</label>
+                <Select value={form.status} onValueChange={(status) => setForm({ ...form, status })}>
+                  <SelectTrigger data-testid="user-form-status"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Active</SelectItem>
+                    <SelectItem value="inactive">Inactive</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
-            <div className="col-span-2">
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Email</Label>
-              <Input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className="mt-2 bg-white/5 border-white/10" data-testid="user-form-email" />
+            <div className="flex items-start gap-2 rounded-lg bg-info/10 px-3 py-2.5 text-xs text-info">
+              <Info className="mt-px h-3.5 w-3.5 shrink-0" />
+              New users sign in with Google using this email address.
             </div>
-            <div>
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Role</Label>
-              <Select value={form.role} onValueChange={(role) => setForm({ ...form, role })}>
-                <SelectTrigger className="mt-2 bg-white/5 border-white/10 text-white" data-testid="user-form-role"><SelectValue /></SelectTrigger>
-                <SelectContent className="bg-[#0F172A]/95 border-white/10 text-white">
-                  <SelectItem value="admin">Admin</SelectItem>
-                  <SelectItem value="manager">Manager</SelectItem>
-                  <SelectItem value="security">Security Guard</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div>
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Status</Label>
-              <Select value={form.status} onValueChange={(status) => setForm({ ...form, status })}>
-                <SelectTrigger className="mt-2 bg-white/5 border-white/10 text-white" data-testid="user-form-status"><SelectValue /></SelectTrigger>
-                <SelectContent className="bg-[#0F172A]/95 border-white/10 text-white">
-                  <SelectItem value="active">Active</SelectItem>
-                  <SelectItem value="inactive">Inactive</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setOpen(false)} className="text-slate-300">Cancel</Button>
-            <Button onClick={submit} className="bg-blue-600 hover:bg-blue-700" data-testid="user-form-submit">Add User</Button>
-          </DialogFooter>
+            <DialogFooter className="gap-2">
+              <Button type="button" variant="outline" onClick={() => setOpen(false)} disabled={saving}>Cancel</Button>
+              <Button type="submit" disabled={saving} data-testid="user-form-submit">
+                {saving && <Loader2 className="h-4 w-4 animate-spin" />} Add user
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={!!toDelete}
+        onOpenChange={(v) => !v && setToDelete(null)}
+        title={`Remove ${toDelete?.name || "user"}?`}
+        description="They will lose access to the dashboard immediately."
+        confirmLabel="Remove user"
+        onConfirm={remove}
+      />
     </div>
   );
 }

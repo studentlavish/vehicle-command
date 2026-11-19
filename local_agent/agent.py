@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import logging
 import platform
 import socket
@@ -170,8 +171,11 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
     """
     import base64 as _b64
     cam = CameraCapture(spec.source, width=spec.width, height=spec.height, target_fps=spec.fps)
-    last_plate: Optional[str] = None
-    last_plate_at: float = 0.0
+    # Same plate on the same camera within this window is not re-sent — a car
+    # parked in view must not be reported again (the backend also enforces a
+    # minimum visit time before an EXIT).
+    repeat_window = float(os.environ.get("REPEAT_SUPPRESS_SECONDS", "120"))
+    recent: dict = {}
     try:
         while not stop_evt.is_set():
             await asyncio.sleep(interval_seconds)
@@ -179,15 +183,17 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
                 jpeg = await asyncio.to_thread(cam.grab_jpeg, spec.jpeg_quality)
                 if jpeg is None:
                     continue
-                det = await detector.process_jpeg(jpeg)
+                det = await detector.process_jpeg(jpeg, camera_id=spec.id)
                 if det is None:
                     continue
-                # Local dedup — don't spam the cloud if we're still looking at
-                # the same car. Backend has its own 30s dedup as backstop.
                 now = time.time()
-                if det.plate == last_plate and (now - last_plate_at) < 30:
+                last = recent.get(det.plate)
+                if last and (now - last) < repeat_window:
+                    log.info("[DETECTOR] %s suppressed repeat plate=%s (%.0fs ago)", spec.id, det.plate, now - last)
                     continue
-                last_plate, last_plate_at = det.plate, now
+                recent[det.plate] = now
+                for k in [k for k, t in recent.items() if now - t > repeat_window]:
+                    recent.pop(k, None)
                 await conn.safe_send({
                     "type": "plate_detected",
                     "camera_id": spec.id,
@@ -195,16 +201,18 @@ async def _detect_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
                     "plate": det.plate,
                     "plate_text": det.plate,
                     "confidence": det.confidence,
+                    "reads": det.reads,
+                    "support": det.support,
+                    "candidates": det.candidates or [],
                     "vehicle_class": det.vehicle_class,
                     "vehicle_conf": round(det.vehicle_conf, 3),
-                    "crop_jpeg_b64": _b64.b64encode(det.crop_jpeg).decode("ascii"),
+                    "crop_jpeg_b64": _b64.b64encode(det.crop_jpeg).decode("ascii") if det.crop_jpeg else None,
                     "plate_jpeg_b64": _b64.b64encode(det.plate_jpeg).decode("ascii") if det.plate_jpeg else None,
                     "ts": now,
                 })
-                log.info("[PLATE] EVENT SENT plate=%s plate_text=%s cam=%s conf=%s",
-                         det.plate, det.plate, spec.id, det.confidence)
-                log.info("[DETECTOR] %s → plate=%s conf=%s vehicle=%s(%.2f)",
-                         spec.id, det.plate, det.confidence, det.vehicle_class, det.vehicle_conf)
+                log.info("[PLATE] EVENT SENT plate=%s cam=%s conf=%s reads=%d support=%.2f vehicle=%s(%.2f)",
+                         det.plate, spec.id, det.confidence, det.reads, det.support,
+                         det.vehicle_class, det.vehicle_conf)
             except Exception as e:
                 log.warning("[DETECTOR] %s error: %s", spec.id, e)
     finally:

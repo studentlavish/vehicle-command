@@ -142,5 +142,5 @@ class AgentConfig:
             cameras=cameras,
             enable_local_detection=os.environ.get("ENABLE_LOCAL_DETECTION", "false").strip().lower()
                 in ("1", "true", "yes", "on"),
-            detection_interval_seconds=float(os.environ.get("DETECTION_INTERVAL_SECONDS", "3.0")),
+            detection_interval_seconds=float(os.environ.get("DETECTION_INTERVAL_SECONDS", "1.0")),
         )

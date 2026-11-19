@@ -1,105 +1,82 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
-import api from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import api, { errorMessage } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
 import VehicleTable from "@/components/VehicleTable";
 import VehicleFilters from "@/components/VehicleFilters";
 import VehicleFormDialog from "@/components/VehicleFormDialog";
+import PageHeader from "@/components/common/PageHeader";
+import Pagination from "@/components/common/Pagination";
+import ConfirmDialog from "@/components/common/ConfirmDialog";
+import { ErrorState } from "@/components/common/EmptyState";
 import { toast } from "sonner";
-import { Plus } from "lucide-react";
+import { Plus, Car } from "lucide-react";
 
-const EMPTY_FORM = {
-  vehicle_number: "",
-  owner_name: "",
-  contact_number: "",
-  vehicle_model: "",
-  status: "inside",
-  notes: "",
-};
+const EMPTY_FORM = { vehicle_number: "", owner_name: "", contact_number: "", vehicle_model: "", status: "inside", notes: "" };
+const PAGE_SIZE = 50;
 
-function SummaryChips({ rows }) {
-  const s = useMemo(() => ({
-    total: rows.length,
-    inside: rows.filter((r) => r.status === "inside").length,
-    exited: rows.filter((r) => r.status === "exited").length,
-    pending: rows.filter((r) => r.status === "pending").length,
-  }), [rows]);
-
-  const cards = [
-    { label: "Total", value: s.total, color: "text-white" },
-    { label: "Inside", value: s.inside, color: "text-emerald-300" },
-    { label: "Exited", value: s.exited, color: "text-slate-300" },
-    { label: "Pending", value: s.pending, color: "text-amber-300" },
-  ];
-
-  return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-      {cards.map((c) => (
-        <div key={c.label} className="glass rounded-xl p-4">
-          <div className="text-[11px] uppercase tracking-widest text-slate-400">{c.label}</div>
-          <div className={`text-2xl font-bold mt-1 ${c.color}`}>{c.value}</div>
-        </div>
-      ))}
-    </div>
-  );
+function useDebounced(value, ms = 300) {
+  const [v, setV] = useState(value);
+  useEffect(() => { const t = setTimeout(() => setV(value), ms); return () => clearTimeout(t); }, [value, ms]);
+  return v;
 }
 
 export default function VehicleRecords() {
+  const { user } = useAuth();
+  const canManage = user?.role === "admin" || user?.role === "manager";
   const [params, setParams] = useSearchParams();
   const [q, setQ] = useState(params.get("q") || "");
   const [status, setStatus] = useState(params.get("status") || "all");
   const [date, setDate] = useState(null);
+  const dq = useDebounced(q);
 
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
   const [page, setPage] = useState(1);
-  const [total, setTotal] = useState(0);
-  const [hasNext, setHasNext] = useState(false);
-  const [hasPrev, setHasPrev] = useState(false);
+  const [meta, setMeta] = useState({ total: 0, hasNext: false, hasPrev: false });
 
   const [selected, setSelected] = useState(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
-
   const [editOpen, setEditOpen] = useState(false);
   const [editMode, setEditMode] = useState("create");
   const [form, setForm] = useState(EMPTY_FORM);
   const [editing, setEditing] = useState(null);
-
-  const PAGE_SIZE = 100;
+  const [toDelete, setToDelete] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(false);
     try {
       const { data } = await api.get("/vehicles", {
         params: {
-          q: q || undefined,
+          q: dq || undefined,
           status: status !== "all" ? status : undefined,
-          date: date ? new Date(date).toISOString().slice(0, 10) : undefined,
+          date: date ? new Date(date).toLocaleDateString("en-CA") : undefined,
           page,
           page_size: PAGE_SIZE,
         },
       });
       setRows(data.items || []);
-      setTotal(data.total || 0);
-      setHasNext(!!data.has_next);
-      setHasPrev(!!data.has_prev);
-    } catch (e) {
-      toast.error("Failed to load", { description: e.message });
+      setMeta({ total: data.total || 0, hasNext: !!data.has_next, hasPrev: !!data.has_prev });
+    } catch {
+      setError(true);
     } finally {
       setLoading(false);
     }
-  }, [q, status, date, page]);
+  }, [dq, status, date, page]);
 
-  useEffect(() => { setPage(1); }, [q, status, date]);
+  useEffect(() => { setPage(1); }, [dq, status, date]);
   useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
     const next = new URLSearchParams();
-    if (q) next.set("q", q);
+    if (dq) next.set("q", dq);
     if (status !== "all") next.set("status", status);
     setParams(next, { replace: true });
-  }, [q, status, setParams]);
+  }, [dq, status, setParams]);
 
   const openCreate = () => { setEditMode("create"); setForm(EMPTY_FORM); setEditing(null); setEditOpen(true); };
   const openEdit = (v) => {
@@ -107,101 +84,92 @@ export default function VehicleRecords() {
     setEditing(v);
     setForm({
       vehicle_number: v.vehicle_number,
-      owner_name: v.owner_name,
+      owner_name: v.owner_name || "",
       contact_number: v.contact_number || "",
       vehicle_model: v.vehicle_model || "",
-      status: v.status,
+      status: v.status || "inside",
       notes: v.notes || "",
     });
     setEditOpen(true);
   };
-  const openView = (v) => { setSelected(v); setDetailsOpen(true); };
 
   const submitForm = async () => {
     try {
       if (editMode === "create") {
         await api.post("/vehicles", form);
-        toast.success("Vehicle added");
+        toast.success("Vehicle added", { description: form.vehicle_number });
       } else {
         await api.patch(`/vehicles/${editing.id}`, form);
-        toast.success("Vehicle updated");
+        toast.success("Changes saved", { description: form.vehicle_number });
       }
       setEditOpen(false);
       load();
     } catch (e) {
-      toast.error("Save failed", { description: e.response?.data?.detail || e.message });
+      toast.error("Couldn't save vehicle", { description: errorMessage(e) });
     }
   };
 
-  const remove = async (v) => {
-    if (!window.confirm(`Delete ${v.vehicle_number}?`)) return;
+  const remove = async () => {
     try {
-      await api.delete(`/vehicles/${v.id}`);
-      toast.success("Vehicle deleted");
+      await api.delete(`/vehicles/${toDelete.id}`);
+      toast.success("Vehicle deleted", { description: toDelete.vehicle_number });
       load();
     } catch (e) {
-      toast.error("Delete failed", { description: e.message });
+      toast.error("Couldn't delete vehicle", { description: errorMessage(e) });
     }
   };
 
   return (
     <div className="space-y-6" data-testid="vehicles-page">
-      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-        <div>
-          <h1 className="text-4xl md:text-5xl font-bold tracking-tight">Vehicle Records</h1>
-          <p className="text-slate-400 mt-2 text-sm">Full ledger of every vehicle that has passed through the showroom.</p>
-        </div>
-        <Button onClick={openCreate} className="bg-blue-600 hover:bg-blue-700 text-white" data-testid="add-vehicle-btn">
-          <Plus className="h-4 w-4 mr-2" /> Add Vehicle
-        </Button>
-      </div>
+      <PageHeader
+        icon={Car}
+        title="Vehicle records"
+        description={loading ? "Loading records…" : `${meta.total.toLocaleString()} visit record${meta.total === 1 ? "" : "s"} in the last 180 days`}
+        actions={
+          <Button onClick={openCreate} data-testid="add-vehicle-btn">
+            <Plus className="h-4 w-4" /> Add vehicle
+          </Button>
+        }
+      />
 
-      <SummaryChips rows={rows} />
+      <VehicleFilters q={q} setQ={setQ} status={status} setStatus={setStatus} date={date} setDate={setDate} loading={loading && !!q} />
 
-      <VehicleFilters q={q} setQ={setQ} status={status} setStatus={setStatus} date={date} setDate={setDate} />
-
-      <VehicleTable rows={rows} loading={loading} onView={openView} onEdit={openEdit} onDelete={remove} />
-
-      {!loading && total > 0 && (
-        <div className="flex items-center justify-between px-2 text-xs text-slate-400" data-testid="vehicles-pagination">
-          <div>
-            Showing <span className="text-slate-200">{(page - 1) * PAGE_SIZE + 1}</span>–
-            <span className="text-slate-200">{(page - 1) * PAGE_SIZE + rows.length}</span> of{" "}
-            <span className="text-slate-200">{total.toLocaleString()}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm" variant="outline"
-              className="h-8 px-3 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
-              disabled={!hasPrev}
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              data-testid="vehicles-prev"
-            >
-              Prev
-            </Button>
-            <span className="tabular-nums">Page {page} / {Math.max(1, Math.ceil(total / PAGE_SIZE))}</span>
-            <Button
-              size="sm" variant="outline"
-              className="h-8 px-3 border-white/10 bg-white/5 hover:bg-white/10 text-slate-200 disabled:opacity-40"
-              disabled={!hasNext}
-              onClick={() => setPage((p) => p + 1)}
-              data-testid="vehicles-next"
-            >
-              Next
-            </Button>
-          </div>
-        </div>
+      {error ? (
+        <div className="surface"><ErrorState onRetry={load} /></div>
+      ) : (
+        <VehicleTable
+          rows={rows}
+          loading={loading}
+          onView={(v) => { setSelected(v); setDetailsOpen(true); }}
+          onEdit={openEdit}
+          onDelete={setToDelete}
+          canManage={canManage}
+          emptyAction={(q || status !== "all" || date) ? (
+            <Button variant="outline" size="sm" onClick={() => { setQ(""); setStatus("all"); setDate(null); }}>Clear filters</Button>
+          ) : (
+            <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4" /> Add vehicle</Button>
+          )}
+          footer={!loading && (
+            <Pagination
+              page={page} pageSize={PAGE_SIZE} total={meta.total} count={rows.length}
+              hasPrev={meta.hasPrev} hasNext={meta.hasNext}
+              onPrev={() => setPage((p) => Math.max(1, p - 1))}
+              onNext={() => setPage((p) => p + 1)}
+              testIdPrefix="vehicles"
+            />
+          )}
+        />
       )}
 
       <VehicleDetailsDialog vehicle={selected} open={detailsOpen} onOpenChange={setDetailsOpen} />
-
-      <VehicleFormDialog
-        open={editOpen}
-        onOpenChange={setEditOpen}
-        mode={editMode}
-        form={form}
-        onFormChange={setForm}
-        onSubmit={submitForm}
+      <VehicleFormDialog open={editOpen} onOpenChange={setEditOpen} mode={editMode} form={form} onFormChange={setForm} onSubmit={submitForm} />
+      <ConfirmDialog
+        open={!!toDelete}
+        onOpenChange={(v) => !v && setToDelete(null)}
+        title={`Delete ${toDelete?.vehicle_number || "vehicle"}?`}
+        description="This visit record will be permanently removed. This can't be undone."
+        confirmLabel="Delete vehicle"
+        onConfirm={remove}
       />
     </div>
   );

@@ -1,105 +1,81 @@
-import React, { useEffect, useState } from "react";
-import { motion } from "framer-motion";
+import React, { useCallback, useEffect, useState } from "react";
 import api from "@/lib/api";
-import { Cpu, Wifi, WifiOff, Camera } from "lucide-react";
+import { Cpu, Camera, Wifi, WifiOff } from "lucide-react";
+import SectionCard from "@/components/common/SectionCard";
+import StatusBadge from "@/components/common/StatusBadge";
+import { EmptyState, ErrorState } from "@/components/common/EmptyState";
+import { Skeleton } from "@/components/ui/skeleton";
+import { relativeAgo } from "@/lib/time";
 
-function relativeAgo(iso) {
-  if (!iso) return "never";
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "—";
-  const diff = Math.max(0, Date.now() - then);
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
-
-/** Small dashboard card showing which local Windows agents are online,
- *  their last-heartbeat time and how many cameras each is streaming. */
+/** Which showroom camera agents are online, last heartbeat and camera count. */
 export default function AgentHealthCard() {
-  const [agents, setAgents] = useState([]);
+  const [agents, setAgents] = useState(null);
   const [err, setErr] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const { data } = await api.get("/agent/status");
-        if (!cancelled) { setAgents(Array.isArray(data) ? data : []); setErr(false); }
-      } catch {
-        if (!cancelled) setErr(true);
-      }
-    };
-    load();
-    const t = setInterval(load, 15000);
-    return () => { cancelled = true; clearInterval(t); };
+  const load = useCallback(async () => {
+    try {
+      const { data } = await api.get("/agent/status");
+      setAgents(Array.isArray(data) ? data : []);
+      setErr(false);
+    } catch {
+      setErr(true);
+    }
   }, []);
 
-  const onlineCount = agents.filter(a => a.status === "online").length;
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 15000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const list = agents || [];
+  const onlineCount = list.filter((a) => a.status === "online").length;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 12 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay: 0.2 }}
-      className="glass rounded-2xl p-5"
+    <SectionCard
+      icon={Cpu}
+      title="Camera agents"
+      description="Showroom PCs streaming camera feeds"
+      actions={agents ? <span className="text-xs font-medium text-muted-foreground" data-testid="agent-count">{onlineCount}/{list.length} online</span> : null}
       data-testid="agent-health-card"
     >
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Cpu className="h-4 w-4 text-blue-400" />
-          <h3 className="font-semibold">Local Camera Agents</h3>
-        </div>
-        <div className="text-[11px] text-slate-400" data-testid="agent-count">
-          {onlineCount}/{agents.length} online
-        </div>
-      </div>
-
-      {err ? (
-        <div className="text-sm text-slate-400">Unable to load agent status.</div>
-      ) : agents.length === 0 ? (
-        <div className="text-sm text-slate-400" data-testid="agent-empty">
-          No local agents connected yet. Install the Windows agent on a showroom PC to start streaming.
-        </div>
+      {err && !agents ? (
+        <ErrorState onRetry={load} className="py-6" />
+      ) : agents === null ? (
+        <div className="space-y-2">{[0, 1].map((i) => <Skeleton key={i} className="h-14 w-full" />)}</div>
+      ) : list.length === 0 ? (
+        <EmptyState
+          compact
+          icon={WifiOff}
+          title="No agents connected"
+          description="Run the local camera agent on a showroom PC to start streaming."
+          data-testid="agent-empty"
+        />
       ) : (
         <div className="space-y-2" data-testid="agent-list">
-          {agents.map((a) => {
+          {list.map((a) => {
             const online = a.status === "online";
+            const cams = (a.cameras || []).length;
             return (
-              <div
-                key={a.agent_id}
-                className="glass-strong rounded-xl px-3 py-2.5 flex items-center justify-between"
-                data-testid={`agent-row-${a.agent_id}`}
-              >
-                <div className="min-w-0">
-                  <div className="text-sm font-medium truncate">
-                    {a.hostname || a.agent_id}
-                    <span className="text-[11px] font-mono text-slate-500 ml-2">{a.agent_id}</span>
+              <div key={a.agent_id} className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5" data-testid={`agent-row-${a.agent_id}`}>
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className={online ? "icon-tile-sm bg-success/10 text-success" : "icon-tile-sm bg-muted text-muted-foreground"}>
+                    {online ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
                   </div>
-                  <div className="text-[11px] text-slate-400 flex items-center gap-3 mt-0.5">
-                    <span className="inline-flex items-center gap-1">
-                      <Camera className="h-3 w-3" />
-                      {(a.cameras || []).length} cam{(a.cameras || []).length === 1 ? "" : "s"}
-                    </span>
-                    <span>heartbeat {relativeAgo(a.last_heartbeat)}</span>
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">{a.hostname || a.agent_id}</div>
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <span className="inline-flex items-center gap-1"><Camera className="h-3 w-3" />{cams} camera{cams === 1 ? "" : "s"}</span>
+                      <span>Heartbeat {relativeAgo(a.last_heartbeat)}</span>
+                    </div>
                   </div>
                 </div>
-                <div className={`text-[11px] px-2 py-1 rounded-md border inline-flex items-center gap-1 ${
-                  online
-                    ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
-                    : "bg-slate-500/15 text-slate-300 border-slate-500/25"
-                }`}>
-                  {online ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
-                  {online ? "Online" : "Offline"}
-                </div>
+                <StatusBadge status={online ? "online" : "offline"} />
               </div>
             );
           })}
         </div>
       )}
-    </motion.div>
+    </SectionCard>
   );
 }

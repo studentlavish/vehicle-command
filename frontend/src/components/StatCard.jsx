@@ -1,57 +1,64 @@
 import React from "react";
-import { motion } from "framer-motion";
-import { ResponsiveContainer, LineChart, Line, AreaChart, Area, YAxis } from "recharts";
-import { ArrowUpRight, ArrowDownRight } from "lucide-react";
+import { ResponsiveContainer, AreaChart, Area, YAxis } from "recharts";
+import { ArrowUpRight, ArrowDownRight, Minus } from "lucide-react";
+import { colors } from "@/lib/theme";
+import { cn } from "@/lib/utils";
 
-export default function StatCard({ label, value, change, trend, icon: Icon, accent = "blue", testId, delay = 0 }) {
-  const up = change >= 0;
-  const gradient =
-    accent === "green"
-      ? "from-emerald-500/25 to-emerald-500/0"
-      : accent === "amber"
-      ? "from-amber-500/25 to-amber-500/0"
-      : accent === "sky"
-      ? "from-sky-500/25 to-sky-500/0"
-      : accent === "violet"
-      ? "from-violet-500/25 to-violet-500/0"
-      : "from-blue-500/25 to-blue-500/0";
+const TONES = {
+  blue: { tile: "bg-primary/10 text-primary", stroke: colors.primary },
+  sky: { tile: "bg-info/10 text-info", stroke: colors.info },
+  green: { tile: "bg-success/10 text-success", stroke: colors.success },
+  amber: { tile: "bg-warning/10 text-warning", stroke: colors.warning },
+  violet: { tile: "bg-violet-50 text-violet-600", stroke: colors.violet },
+};
+
+export default function StatCard({ label, value, change, trend, icon: Icon, accent = "blue", testId, compareLabel = "vs yesterday" }) {
+  const tone = TONES[accent] || TONES.blue;
+  const hasChange = typeof change === "number" && !Number.isNaN(change);
+  const up = hasChange && change > 0;
+  const flat = hasChange && change === 0;
+  const TrendIcon = flat ? Minus : up ? ArrowUpRight : ArrowDownRight;
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, delay }}
-      className="glass rounded-2xl p-5 relative overflow-hidden hover:-translate-y-0.5 transition-all duration-300"
-      data-testid={testId}
-    >
-      <div className={`absolute inset-0 bg-gradient-to-br ${gradient} pointer-events-none`} />
-      <div className="relative flex items-start justify-between">
-        <div>
-          <div className="text-xs uppercase tracking-widest text-slate-400">{label}</div>
-          <div className="mt-2 text-3xl font-bold tracking-tight text-white">{value}</div>
-          <div className={`mt-1.5 inline-flex items-center gap-1 text-xs font-medium ${up ? "text-emerald-400" : "text-rose-400"}`}>
-            {up ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
-            {Math.abs(change)}% vs yesterday
+    <div className="surface surface-hover flex flex-col p-5" data-testid={testId}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="text-sm font-medium text-muted-foreground">{label}</div>
+        <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-lg", tone.tile)}>
+          {Icon ? <Icon className="h-[18px] w-[18px]" /> : null}
+        </div>
+      </div>
+      <div className="mt-1 text-[28px] font-semibold leading-none tracking-tight tabular-nums">{value ?? "—"}</div>
+      <div className="mt-3 flex items-end justify-between gap-2">
+        {hasChange ? (
+          <div className="flex items-center gap-1.5 text-xs">
+            <span
+              className={cn(
+                "inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 font-medium",
+                flat ? "bg-muted text-muted-foreground" : up ? "bg-success/10 text-success" : "bg-destructive/10 text-destructive",
+              )}
+            >
+              <TrendIcon className="h-3 w-3" />
+              {Math.abs(change)}%
+            </span>
+            <span className="text-muted-foreground">{compareLabel}</span>
           </div>
-        </div>
-        <div className="h-10 w-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center">
-          {Icon ? <Icon className="h-5 w-5 text-blue-400" /> : null}
-        </div>
+        ) : <span />}
+        {trend && trend.length > 1 ? (
+          <div className="h-8 w-20 shrink-0">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={trend} margin={{ top: 2, bottom: 2, left: 0, right: 0 }}>
+                <defs>
+                  <linearGradient id={`grad-${testId}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={tone.stroke} stopOpacity={0.25} />
+                    <stop offset="100%" stopColor={tone.stroke} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <YAxis hide domain={["dataMin", "dataMax + 1"]} />
+                <Area type="monotone" dataKey="value" stroke={tone.stroke} strokeWidth={1.75} fill={`url(#grad-${testId})`} isAnimationActive={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        ) : null}
       </div>
-
-      <div className="relative mt-4 h-14 -mx-1">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={trend || []}>
-            <defs>
-              <linearGradient id={`grad-${testId}`} x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#3B82F6" stopOpacity={0.5} />
-                <stop offset="100%" stopColor="#3B82F6" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <YAxis hide domain={["dataMin", "dataMax + 1"]} />
-            <Area type="monotone" dataKey="value" stroke="#60A5FA" strokeWidth={2} fill={`url(#grad-${testId})`} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-    </motion.div>
+    </div>
   );
 }

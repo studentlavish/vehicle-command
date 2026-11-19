@@ -1,151 +1,151 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import api from "@/lib/api";
 import {
-  ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
+  ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid,
   BarChart, Bar, Legend, PieChart, Pie, Cell,
 } from "recharts";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { BarChart3, Clock, TrendingUp, TrendingDown, Activity } from "lucide-react";
+import PageHeader from "@/components/common/PageHeader";
+import SectionCard from "@/components/common/SectionCard";
+import VisitStatCard from "@/components/VisitStatCard";
+import { ErrorState, EmptyState } from "@/components/common/EmptyState";
+import { CardSkeleton } from "@/components/common/Loaders";
+import { BarChart3, Clock, TrendingUp, TrendingDown, Activity, PieChart as PieIcon, LineChart as LineIcon } from "lucide-react";
 import { formatDurationShort } from "@/lib/time";
+import { chartTheme, chartPalette, colors } from "@/lib/theme";
 
-const COLORS = ["#3B82F6", "#0EA5E9", "#22C55E", "#EAB308"];
+const isEmpty = (arr) => !arr || arr.length === 0 || arr.every((d) => !d.entries && !d.exits && !d.value);
 
-const tooltipStyle = {
-  contentStyle: { background: "rgba(15,23,42,0.95)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, color: "#fff" },
-  labelStyle: { color: "#94A3B8" },
-};
+function TrendChart({ data }) {
+  if (isEmpty(data)) return <EmptyState compact icon={LineIcon} title="No traffic in this period" />;
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <AreaChart data={data} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+        <defs>
+          <linearGradient id="an-entries" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={colors.primary} stopOpacity={0.18} />
+            <stop offset="100%" stopColor={colors.primary} stopOpacity={0} />
+          </linearGradient>
+          <linearGradient id="an-exits" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={colors.info} stopOpacity={0.15} />
+            <stop offset="100%" stopColor={colors.info} stopOpacity={0} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid {...chartTheme.grid} />
+        <XAxis dataKey="label" {...chartTheme.axis} />
+        <YAxis allowDecimals={false} {...chartTheme.axis} />
+        <Tooltip {...chartTheme.tooltip} />
+        <Legend {...chartTheme.legend} iconType="circle" iconSize={8} />
+        <Area type="monotone" name="Entries" dataKey="entries" stroke={colors.primary} strokeWidth={2} fill="url(#an-entries)" />
+        <Area type="monotone" name="Exits" dataKey="exits" stroke={colors.info} strokeWidth={2} fill="url(#an-exits)" />
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function CompareBars({ data, height = 280 }) {
+  if (isEmpty(data)) return <EmptyState compact icon={BarChart3} title="No traffic in this period" />;
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <BarChart data={data} margin={{ top: 8, right: 8, left: -16, bottom: 0 }} barGap={4}>
+        <CartesianGrid {...chartTheme.grid} />
+        <XAxis dataKey="label" {...chartTheme.axis} />
+        <YAxis allowDecimals={false} {...chartTheme.axis} />
+        <Tooltip {...chartTheme.tooltip} />
+        <Legend {...chartTheme.legend} iconType="circle" iconSize={8} />
+        <Bar name="Entries" dataKey="entries" fill={colors.primary} radius={[4, 4, 0, 0]} maxBarSize={28} />
+        <Bar name="Exits" dataKey="exits" fill={colors.info} radius={[4, 4, 0, 0]} maxBarSize={28} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
 
 export default function Analytics() {
   const [data, setData] = useState(null);
-  useEffect(() => {
-    (async () => {
+  const [error, setError] = useState(false);
+
+  const load = useCallback(async () => {
+    setError(false);
+    try {
       const { data } = await api.get("/analytics/overview");
       setData(data);
-    })();
+    } catch {
+      setError(true);
+    }
   }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const header = <PageHeader icon={BarChart3} title="Analytics" description="Showroom traffic patterns across days, weeks and months." />;
+
+  if (error) return <div className="space-y-6">{header}<div className="surface"><ErrorState onRetry={load} /></div></div>;
 
   if (!data) {
     return (
-      <div className="space-y-4">
-        <Skeleton className="h-16 w-64 bg-white/5" />
-        <div className="grid gap-4 md:grid-cols-2">
-          {Array.from({ length: 4 }).map((_, i) => <Skeleton key={`an-skel-${i}`} className="h-72 bg-white/5" />)}
-        </div>
+      <div className="space-y-6">
+        {header}
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">{Array.from({ length: 4 }).map((_, i) => <CardSkeleton key={i} />)}</div>
+        <div className="grid gap-6 lg:grid-cols-2">{[0, 1].map((i) => <Skeleton key={i} className="h-80 rounded-xl" />)}</div>
       </div>
     );
   }
 
+  const pieTotal = (data.pie || []).reduce((a, b) => a + (b.value || 0), 0);
+
   return (
     <div className="space-y-6" data-testid="analytics-page">
-      <div>
-        <div className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.25em] text-blue-400/80">
-          <BarChart3 className="h-3.5 w-3.5" /> Insights
-        </div>
-        <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">Analytics</h1>
-        <p className="text-slate-400 mt-2 text-sm">Track showroom traffic patterns across days, weeks and months.</p>
-      </div>
+      {header}
 
       {data.stay_time ? (
-        <div className="grid gap-4 grid-cols-2 md:grid-cols-4">
-          <StayCard label="Average Stay" value={formatDurationShort(data.stay_time.avg_seconds)} tone="blue" icon={Clock} testId="analytics-avg-stay" />
-          <StayCard label="Longest Stay" value={formatDurationShort(data.stay_time.longest_seconds)} tone="emerald" icon={TrendingUp} testId="analytics-longest-stay" />
-          <StayCard label="Shortest Stay" value={formatDurationShort(data.stay_time.shortest_seconds)} tone="amber" icon={TrendingDown} testId="analytics-shortest-stay" />
-          <StayCard label="Completed Sessions" value={data.stay_time.completed_sessions} tone="violet" icon={Activity} testId="analytics-completed" />
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          <VisitStatCard label="Average stay" value={formatDurationShort(data.stay_time.avg_seconds)} tone="blue" icon={Clock} testId="analytics-avg-stay" />
+          <VisitStatCard label="Longest stay" value={formatDurationShort(data.stay_time.longest_seconds)} tone="emerald" icon={TrendingUp} testId="analytics-longest-stay" />
+          <VisitStatCard label="Shortest stay" value={formatDurationShort(data.stay_time.shortest_seconds)} tone="amber" icon={TrendingDown} testId="analytics-shortest-stay" />
+          <VisitStatCard label="Completed visits" value={(data.stay_time.completed_sessions ?? 0).toLocaleString()} tone="violet" icon={Activity} testId="analytics-completed" />
         </div>
       ) : null}
 
-      <Tabs defaultValue="daily" className="w-full">
-        <TabsList className="bg-white/5 border border-white/10 p-1">
-          <TabsTrigger value="daily" data-testid="tab-daily" className="data-[state=active]:bg-blue-600 data-[state=active]:text-white">Daily (7d)</TabsTrigger>
-          <TabsTrigger value="weekly" data-testid="tab-weekly" className="data-[state=active]:bg-blue-600 data-[state=active]:text-white">Weekly (28d)</TabsTrigger>
-          <TabsTrigger value="monthly" data-testid="tab-monthly" className="data-[state=active]:bg-blue-600 data-[state=active]:text-white">Monthly (12m)</TabsTrigger>
+      <Tabs defaultValue="daily" className="space-y-4">
+        <TabsList>
+          <TabsTrigger value="daily" data-testid="tab-daily">Last 7 days</TabsTrigger>
+          <TabsTrigger value="weekly" data-testid="tab-weekly">Last 4 weeks</TabsTrigger>
+          <TabsTrigger value="monthly" data-testid="tab-monthly">Last 12 months</TabsTrigger>
         </TabsList>
-
         {["daily", "weekly", "monthly"].map((key) => (
-          <TabsContent key={key} value={key}>
-            <div className="grid gap-6 md:grid-cols-2">
-              <div className="glass rounded-2xl p-5">
-                <h3 className="font-semibold mb-4">Traffic Trend</h3>
-                <ResponsiveContainer width="100%" height={280}>
-                  <LineChart data={data[key]}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                    <XAxis dataKey="label" stroke="#94A3B8" fontSize={12} />
-                    <YAxis stroke="#94A3B8" fontSize={12} />
-                    <Tooltip {...tooltipStyle} />
-                    <Legend wrapperStyle={{ color: "#94A3B8" }} />
-                    <Line type="monotone" dataKey="entries" stroke="#3B82F6" strokeWidth={2.5} dot={false} />
-                    <Line type="monotone" dataKey="exits" stroke="#0EA5E9" strokeWidth={2.5} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="glass rounded-2xl p-5">
-                <h3 className="font-semibold mb-4">Entry vs Exit</h3>
-                <ResponsiveContainer width="100%" height={280}>
-                  <BarChart data={data[key]}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                    <XAxis dataKey="label" stroke="#94A3B8" fontSize={12} />
-                    <YAxis stroke="#94A3B8" fontSize={12} />
-                    <Tooltip {...tooltipStyle} />
-                    <Legend wrapperStyle={{ color: "#94A3B8" }} />
-                    <Bar dataKey="entries" fill="#3B82F6" radius={[6, 6, 0, 0]} />
-                    <Bar dataKey="exits" fill="#0EA5E9" radius={[6, 6, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
+          <TabsContent key={key} value={key} className="mt-0">
+            <div className="grid gap-6 lg:grid-cols-2">
+              <SectionCard icon={LineIcon} title="Traffic trend" description="Entries and exits over time"><TrendChart data={data[key]} /></SectionCard>
+              <SectionCard icon={BarChart3} title="Entries vs exits" description="Side-by-side comparison"><CompareBars data={data[key]} /></SectionCard>
             </div>
           </TabsContent>
         ))}
       </Tabs>
 
-      <div className="grid gap-6 md:grid-cols-3">
-        <div className="glass rounded-2xl p-5 md:col-span-1">
-          <h3 className="font-semibold mb-4">Entry vs Exit Split</h3>
-          <ResponsiveContainer width="100%" height={260}>
-            <PieChart>
-              <Pie data={data.pie} cx="50%" cy="50%" innerRadius={60} outerRadius={90} paddingAngle={4} dataKey="value">
-                {data.pie.map((entry, i) => <Cell key={`cell-${entry.name}`} fill={COLORS[i % COLORS.length]} />)}
-              </Pie>
-              <Tooltip {...tooltipStyle} />
-              <Legend wrapperStyle={{ color: "#94A3B8" }} />
-            </PieChart>
-          </ResponsiveContainer>
-        </div>
-        <div className="glass rounded-2xl p-5 md:col-span-2">
-          <h3 className="font-semibold mb-4">Monthly Overview</h3>
-          <ResponsiveContainer width="100%" height={260}>
-            <BarChart data={data.monthly}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-              <XAxis dataKey="label" stroke="#94A3B8" fontSize={12} />
-              <YAxis stroke="#94A3B8" fontSize={12} />
-              <Tooltip {...tooltipStyle} />
-              <Bar dataKey="entries" fill="#3B82F6" radius={[6, 6, 0, 0]} />
-              <Bar dataKey="exits" fill="#0EA5E9" radius={[6, 6, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function StayCard({ label, value, tone, icon: Icon, testId }) {
-  const toneMap = {
-    blue: "text-blue-300",
-    emerald: "text-emerald-300",
-    amber: "text-amber-300",
-    violet: "text-violet-300",
-  };
-  return (
-    <div className="glass rounded-2xl p-4" data-testid={testId}>
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="text-[11px] uppercase tracking-widest text-slate-400">{label}</div>
-          <div className={`text-2xl font-bold mt-1 ${toneMap[tone]}`}>{value}</div>
-        </div>
-        <div className="h-9 w-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center">
-          <Icon className={`h-4 w-4 ${toneMap[tone]}`} />
-        </div>
+      <div className="grid gap-6 lg:grid-cols-3">
+        <SectionCard icon={PieIcon} title="Entry / exit split">
+          {pieTotal === 0 ? (
+            <EmptyState compact icon={PieIcon} title="No data yet" />
+          ) : (
+            <div className="relative">
+              <ResponsiveContainer width="100%" height={260}>
+                <PieChart>
+                  <Pie data={data.pie} cx="50%" cy="45%" innerRadius={62} outerRadius={90} paddingAngle={3} dataKey="value" stroke="none">
+                    {data.pie.map((entry, i) => <Cell key={entry.name} fill={chartPalette[i % chartPalette.length]} />)}
+                  </Pie>
+                  <Tooltip {...chartTheme.tooltip} />
+                  <Legend {...chartTheme.legend} iconType="circle" iconSize={8} />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="pointer-events-none absolute inset-x-0 top-[45%] -translate-y-1/2 text-center">
+                <div className="text-2xl font-semibold tabular-nums">{pieTotal.toLocaleString()}</div>
+                <div className="text-xs text-muted-foreground">total</div>
+              </div>
+            </div>
+          )}
+        </SectionCard>
+        <SectionCard className="lg:col-span-2" icon={BarChart3} title="Monthly overview" description="Last 12 months">
+          <CompareBars data={data.monthly} height={260} />
+        </SectionCard>
       </div>
     </div>
   );
