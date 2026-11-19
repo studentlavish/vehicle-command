@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -38,6 +38,9 @@ class CameraSpec:
     height: int
     fps: int
     jpeg_quality: int
+    # Part of the picture to search for plates, as fractions (x1, y1, x2, y2) of
+    # width/height — e.g. (0.1, 0.4, 0.9, 1.0) = the lane, not the road behind it.
+    roi: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass
@@ -123,6 +126,7 @@ class AgentConfig:
                     height=int(it.get("height", default_height)),
                     fps=int(it.get("fps", default_fps)),
                     jpeg_quality=int(it.get("jpeg_quality", default_quality)),
+                    roi=parse_roi(it.get("roi")),
                 ))
         else:
             # ---- Mode 2: legacy single-camera ----
@@ -134,6 +138,7 @@ class AgentConfig:
                 height=default_height,
                 fps=default_fps,
                 jpeg_quality=default_quality,
+                roi=parse_roi(os.environ.get("CAMERA_ROI")),
             ))
 
         return cls(
@@ -147,6 +152,19 @@ class AgentConfig:
             outbox_path=os.environ.get("OUTBOX_PATH", "").strip()
                 or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "outbox.sqlite3"),
         )
+
+
+def parse_roi(value) -> Optional[Tuple[float, float, float, float]]:
+    """'0.1,0.4,0.9,1' or [0.1, 0.4, 0.9, 1] → (x1, y1, x2, y2) fractions, or None for the whole picture."""
+    if value in (None, "", []):
+        return None
+    parts = [float(v) for v in (value.split(",") if isinstance(value, str) else value)]
+    if len(parts) != 4:
+        raise RuntimeError(f"roi must be four numbers x1,y1,x2,y2 (fractions 0–1), got {value!r}")
+    x1, y1, x2, y2 = parts
+    if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+        raise RuntimeError(f"roi must satisfy 0 ≤ x1 < x2 ≤ 1 and 0 ≤ y1 < y2 ≤ 1, got {value!r}")
+    return (x1, y1, x2, y2)
 
 
 def _detection_fps() -> float:

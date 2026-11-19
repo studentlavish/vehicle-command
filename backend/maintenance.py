@@ -8,6 +8,7 @@ Run from the backend folder with the backend's virtualenv:
     .venv/bin/python maintenance.py close-duplicate-active      # several open visits for one plate
     .venv/bin/python maintenance.py migrate-snapshots           # copy old Emergent snapshots to STORAGE_BACKEND
     .venv/bin/python maintenance.py restore-backup              # test-restore the latest backup into <db>_restore_test
+    .venv/bin/python maintenance.py shadow-compare --log day.csv  # system vs. manual gate log (shadow run)
 
 Every command is a dry run unless you add --apply.
 """
@@ -178,14 +179,57 @@ def restore_backup(apply: bool, key: str = "", into: str = "") -> None:
     print(f"Restored. Documents: {counts}")
 
 
+def shadow_compare(log_path: str, window: float, out_csv: str = "") -> int:
+    """Compare a day's manual gate log with the system's records (see shadow.py)."""
+    import csv as _csv
+    import json as _json
+    from datetime import timedelta
+    import shadow
+    tz = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Kolkata"))
+    manual = shadow.read_manual_log(log_path, tz)
+    if not manual:
+        print("The manual log is empty.")
+        return 1
+    lo = min(m.time for m in manual) - timedelta(minutes=window)
+    hi = max(m.time for m in manual) + timedelta(minutes=window)
+    lo_s, hi_s = lo.astimezone(ZoneInfo("UTC")).isoformat(), hi.astimezone(ZoneInfo("UTC")).isoformat()
+    sessions = db().visit_sessions.find({"$or": [{"entry_time": {"$gte": lo_s, "$lte": hi_s}},
+                                                 {"exit_time": {"$gte": lo_s, "$lte": hi_s}}]}, {"_id": 0})
+    system = [e for e in shadow.system_events(sessions) if lo <= e.time <= hi]
+    rep = shadow.compare(manual, system, window)
+    print(shadow.format_report(rep, tz))
+    print("\n" + _json.dumps(rep.summary()))
+    if out_csv:
+        with open(out_csv, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["result", "manual_time", "manual_plate", "direction", "system_plate", "auto", "session"])
+            for m, s_ in rep.matched:
+                w.writerow(["match", m.time.isoformat(), m.plate, m.direction, s_.plate, s_.auto, s_.ref])
+            for m, s_ in rep.misread:
+                w.writerow(["misread", m.time.isoformat(), m.plate, m.direction, s_.plate, s_.auto, s_.ref])
+            for m in rep.missed:
+                w.writerow(["missed", m.time.isoformat(), m.plate, m.direction, "", "", ""])
+            for s_ in rep.extra:
+                w.writerow(["extra", s_.time.isoformat(), "", s_.direction, s_.plate, s_.auto, s_.ref])
+        print(f"Details written to {out_csv}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["remove-demo-data", "fix-visit-dates", "close-duplicate-active",
-                                        "migrate-snapshots", "restore-backup"])
+                                        "migrate-snapshots", "restore-backup", "shadow-compare"])
     ap.add_argument("--apply", action="store_true", help="actually make the changes (default is a dry run)")
     ap.add_argument("--key", default="", help="restore-backup: storage key (default: latest backup)")
     ap.add_argument("--into", default="", help="restore-backup: target database (default: <DB_NAME>_restore_test)")
+    ap.add_argument("--log", default="", help="shadow-compare: the manual gate log (CSV: time, plate, direction)")
+    ap.add_argument("--window", type=float, default=10, help="shadow-compare: minutes either side to match events")
+    ap.add_argument("--csv", default="", help="shadow-compare: write per-event results to this CSV")
     args = ap.parse_args()
+    if args.command == "shadow-compare":
+        if not args.log:
+            ap.error("shadow-compare needs --log manual.csv")
+        return shadow_compare(args.log, args.window, args.csv)
     if args.command == "restore-backup":
         restore_backup(args.apply, args.key, args.into)
         return 0

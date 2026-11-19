@@ -60,6 +60,15 @@ class FrameBuffer:
         return round((len(recent) - 1) / span, 1) if span > 0 else 0.0
 
 
+def crop_roi(frame: np.ndarray, roi) -> np.ndarray:
+    """The region of interest of a frame (roi = fractions x1, y1, x2, y2), or the frame itself."""
+    if not roi:
+        return frame
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = roi
+    return frame[int(y1 * h):max(int(y2 * h), int(y1 * h) + 1), int(x1 * w):max(int(x2 * w), int(x1 * w) + 1)]
+
+
 class MotionGate:
     """Decides whether a frame is worth running the plate models on."""
 

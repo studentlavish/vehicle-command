@@ -17,6 +17,8 @@ WORKDIR /app/backend
 COPY backend/requirements.txt .
 RUN pip install -r requirements.txt
 COPY backend/ .
+# Source files may arrive owner-only (mode 600); the app user must be able to read them.
+RUN chmod -R a+rX /app/backend
 
 RUN useradd --system --uid 10001 app && mkdir -p /data/snapshots /data/storage && chown -R app /data
 USER app

@@ -106,3 +106,30 @@ def test_motion_gate():
     assert gate.should_process(moved, now=2.0) is True        # motion
     assert gate.should_process(moved, now=3.0) is False
     assert gate.should_process(moved, now=8.5) is True        # periodic check while idle
+
+
+def test_region_of_interest(tmp_path):
+    from config import parse_roi
+    from edge import crop_roi
+    assert parse_roi("0.1,0.5,0.9,1") == (0.1, 0.5, 0.9, 1.0) and parse_roi("") is None
+    for bad in ("0.5,0.5,0.4,1", "0,0,1", "0,0,1.5,1"):
+        with pytest.raises(RuntimeError):
+            parse_roi(bad)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert crop_roi(frame, (0.25, 0.5, 0.75, 1.0)).shape == (240, 320, 3)
+    assert crop_roi(frame, None) is frame
+
+    spec = CameraSpec(id="GATE-IN", name="Entrance", source="0", width=640, height=480, fps=8, jpeg_quality=55,
+                      roi=(0.0, 0.5, 1.0, 1.0))
+    frames = FrameBuffer()
+    frames.put("GATE-IN", frame, ts=1.0)
+    det, delivery, stop = FakeDetector(), Delivery(Outbox(tmp_path / "o.db")), asyncio.Event()
+
+    async def go():
+        task = asyncio.create_task(agent._detect_camera(spec, frames, det, delivery, stop, fps=20, health={}))
+        await asyncio.sleep(0.2)
+        stop.set()
+        await task
+    asyncio.run(go())
+    assert det.frames[0][1].shape == (240, 640, 3)  # only the lane was searched
+    delivery.outbox.close()

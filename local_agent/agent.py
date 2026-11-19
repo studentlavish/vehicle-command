@@ -22,7 +22,7 @@ from typing import Optional
 from config import AgentConfig, CameraSpec
 from camera import CameraCapture
 from connection import CloudConnection, pack_binary_frame
-from edge import Delivery, FrameBuffer, MotionGate
+from edge import Delivery, FrameBuffer, MotionGate, crop_roi
 from outbox import Outbox
 
 AGENT_VERSION = "1.3.0"
@@ -121,6 +121,7 @@ async def _detect_camera(spec: CameraSpec, frames: FrameBuffer, detector, delive
             latest = frames.get(spec.id)
             if latest and latest[0] != last_seq:
                 last_seq, frame, ts = latest
+                frame = crop_roi(frame, spec.roi)  # search only the lane
                 busy = detector.active_tracks(spec.id) > 0
                 if gate.should_process(frame, ts, busy=busy):
                     dets = await asyncio.to_thread(detector.process_frame, frame, spec.id, ts)
@@ -173,8 +174,8 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
              AGENT_VERSION, cfg.agent_id, socket.gethostname(), len(cfg.cameras),
              "ON" if cfg.enable_local_detection else "off")
     for c in cfg.cameras:
-        log.info("[AGENT]  · %s (%s) source=%s @ %dx%d/%dfps q%d",
-                 c.id, c.name, _redact(c.source), c.width, c.height, c.fps, c.jpeg_quality)
+        log.info("[AGENT]  · %s (%s) source=%s @ %dx%d/%dfps q%d roi=%s",
+                 c.id, c.name, _redact(c.source), c.width, c.height, c.fps, c.jpeg_quality, c.roi or "full frame")
 
     conn = CloudConnection(cfg.ws_url, cfg.agent_id, cfg.agent_secret)
 

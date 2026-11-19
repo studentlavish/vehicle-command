@@ -1,0 +1,42 @@
+# Local override: run the full stack on this Mac over plain HTTP.
+#   cd deploy && docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+# Then open http://localhost:8080
+
+services:
+  backend:
+    environment:
+      PUBLIC_URL: http://localhost:8080
+      CORS_ORIGINS: http://localhost:8080
+      COOKIE_SECURE: "false"
+      STORAGE_BACKEND: local
+      # Pre-registers the Docker camera agent below (local use only).
+      AGENT_BOOTSTRAP_ID: docker-agent-01
+      VASHU_AGENT_SECRET: ${AGENT_SECRET:?set AGENT_SECRET in deploy/.env}
+
+  # Camera agent: reads the camera, recognises plates, and creates the records.
+  agent:
+    build:
+      context: ..
+      dockerfile: deploy/agent.Dockerfile
+    restart: unless-stopped
+    environment:
+      VASHU_AGENT_WS_URL: ws://backend:8001/api/agent/ws
+      VASHU_AGENT_ID: docker-agent-01
+      VASHU_AGENT_SECRET: ${AGENT_SECRET}
+      CAMERA_ID: ${CAMERA_ID:-GATE-01}
+      CAMERA_NAME: ${CAMERA_NAME:-Front Gate}
+      CAMERA_SOURCE: ${CAMERA_SOURCE:?set CAMERA_SOURCE in deploy/.env}
+    volumes:
+      - agent-data:/data
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  web:
+    environment:
+      DOMAIN: ":80"          # Caddy: plain HTTP, no certificates
+    ports: !override
+      - "8080:80"
+
+volumes:
+  agent-data:

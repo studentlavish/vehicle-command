@@ -113,3 +113,6 @@ local_agent/logs/*
 
 # Agent outbox (pending detections — runtime data)
 local_agent/data/
+
+# Plate models downloaded for the Docker agent image
+deploy/agent-models/

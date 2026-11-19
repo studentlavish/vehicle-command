@@ -8,8 +8,10 @@
 frontend/build
 backend/snapshots
 backend/storage
-local_agent
 logs
 **/*.log
 tests
 memory
+local_agent/models
+local_agent/data
+local_agent/logs
