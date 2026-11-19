@@ -5,6 +5,7 @@ Run from the backend folder with the backend's virtualenv:
     .venv/bin/python maintenance.py remove-demo-data            # dry run: shows what would go
     .venv/bin/python maintenance.py remove-demo-data --apply    # actually deletes
     .venv/bin/python maintenance.py fix-visit-dates --apply     # recompute visit_date in IST
+    .venv/bin/python maintenance.py close-duplicate-active      # several open visits for one plate
 
 Every command is a dry run unless you add --apply.
 """
@@ -82,12 +83,37 @@ def fix_visit_dates(apply: bool) -> None:
         print("Dry run — re-run with --apply to save.")
 
 
+def close_duplicate_active(apply: bool) -> None:
+    """Keep the newest open visit per plate; mark older open ones exit_missed.
+
+    Needed once on databases created before the one-open-visit-per-plate index.
+    """
+    d = db()
+    dupes = list(d.visit_sessions.aggregate([
+        {"$match": {"status": "active"}},
+        {"$sort": {"entry_time": -1}},
+        {"$group": {"_id": "$vehicle_number", "ids": {"$push": "$id"}, "n": {"$sum": 1}}},
+        {"$match": {"n": {"$gt": 1}}},
+    ]))
+    older = [i for g in dupes for i in g["ids"][1:]]
+    for g in dupes:
+        print(f"   {g['_id']:<12} {g['n']} open visits")
+    print(f"{'Closing' if apply else 'Would close'} {len(older)} older open visit(s) as exit_missed.")
+    if apply and older:
+        stamp = datetime.now(ZoneInfo("UTC")).isoformat()
+        d.visit_sessions.update_many({"id": {"$in": older}, "status": "active"}, {"$set": {
+            "status": "exit_missed", "exit_missed_at": stamp, "notes": "Closed: duplicate open visit"}})
+    elif older:
+        print("Dry run — re-run with --apply to save.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["remove-demo-data", "fix-visit-dates"])
+    ap.add_argument("command", choices=["remove-demo-data", "fix-visit-dates", "close-duplicate-active"])
     ap.add_argument("--apply", action="store_true", help="actually make the changes (default is a dry run)")
     args = ap.parse_args()
-    {"remove-demo-data": remove_demo_data, "fix-visit-dates": fix_visit_dates}[args.command](args.apply)
+    {"remove-demo-data": remove_demo_data, "fix-visit-dates": fix_visit_dates,
+     "close-duplicate-active": close_duplicate_active}[args.command](args.apply)
     return 0
 
 

@@ -29,6 +29,8 @@ from pydantic import BaseModel, EmailStr
 
 from camera_manager import camera_manager, CameraSourceConflict
 from plate_pipeline import _persist_entry, _persist_lock, route_detection, local_date
+import plate_pipeline
+from pymongo.errors import DuplicateKeyError
 import plate_rules
 import local_ocr
 from zoneinfo import ZoneInfo
@@ -613,8 +615,12 @@ async def record_entry(payload: EntryIn, user: dict = Depends(get_current_user))
             "exit_image": "",
             "status": "active",
             "created_at": now.isoformat(),
+            "detected_by": "manual",
         }
-        await db.visit_sessions.insert_one(session)
+        try:
+            await db.visit_sessions.insert_one(session)
+        except DuplicateKeyError:
+            raise HTTPException(status_code=409, detail={"error": "already_inside", "message": f"{vn} already has an active session"})
         session.pop("_id", None)
     return {"master": serialize_master(master), "session": serialize_session(session)}
 
@@ -826,6 +832,16 @@ def _paginate_params(page: Optional[int], page_size: Optional[int], limit_defaul
     p = max(1, int(page))
     ps = min(max(1, int(page_size or 50)), MAX_PAGE_SIZE)
     return p, ps
+
+
+MAX_VISIT_HOURS = float(os.environ.get("MAX_VISIT_HOURS", "24"))
+
+
+@api.get("/visit-sessions/long-open")
+async def list_long_open(hours: Optional[float] = None, user: dict = Depends(require_roles(*ROLE_ALL))):
+    """Visits still open after MAX_VISIT_HOURS — a missed exit or a car kept overnight. Never auto-closed."""
+    h = hours if hours and hours > 0 else MAX_VISIT_HOURS
+    return {"hours": h, "sessions": await plate_pipeline.long_open_sessions(db, h)}
 
 
 @api.get("/visit-sessions")
@@ -1471,7 +1487,10 @@ async def purge_expired_sessions() -> Dict[str, Any]:
     """
     from plate_pipeline import SNAPSHOTS_DIR as snap_dir
     cutoff = (now_utc() - timedelta(days=RETENTION_DAYS)).isoformat()
-    query = {"entry_time": {"$lt": cutoff}, "status": {"$ne": "active"}}
+    query = {"status": {"$ne": "active"}, "$or": [
+        {"entry_time": {"$lt": cutoff}},
+        {"entry_time": None, "exit_time": {"$lt": cutoff}},  # entry_missed visits have no entry time
+    ]}
     files: list[str] = []
     expired = 0
     async for doc in db.visit_sessions.find(query, {k: 1 for k in _RETENTION_IMG_FIELDS}):
@@ -1864,6 +1883,50 @@ async def list_cameras(user: dict = Depends(require_roles(*ROLE_ALL))):
     # when an admin disconnects an obsolete direct-URL camera.
     all_cams = camera_manager.list()
     return {cid: st for cid, st in all_cams.items() if st.get("status") != "stopped"}
+
+
+# ---------- Camera roles (entry / exit / both) ----------
+class CameraConfigIn(BaseModel):
+    role: Literal["entry", "exit", "both"]
+    name: Optional[str] = ""
+    gate: Optional[str] = ""
+    enabled: bool = True
+
+
+@api.get("/camera-config")
+async def list_camera_config(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """Configured cameras plus any live/recent camera that has no role yet."""
+    configured = {d["camera_id"]: d async for d in db.camera_config.find({}, {"_id": 0})}
+    seen = set(camera_manager.list().keys())
+    async for a in db.agents.find({}, {"cameras": 1}):
+        seen.update(c.strip().upper() for c in a.get("cameras", []) if c)
+    out = list(configured.values())
+    for cid in sorted(seen - set(configured)):
+        out.append({"camera_id": cid, "role": "both", "name": "", "gate": "", "enabled": True, "configured": False})
+    for d in out:
+        d.setdefault("configured", True)
+    return sorted(out, key=lambda d: d["camera_id"])
+
+
+@api.put("/camera-config/{camera_id}")
+async def put_camera_config(camera_id: str, payload: CameraConfigIn, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    cid = camera_id.strip().upper()
+    if not cid:
+        raise HTTPException(status_code=400, detail="camera_id required")
+    doc = {"camera_id": cid, **payload.model_dump(), "updated_at": now_utc().isoformat()}
+    await db.camera_config.update_one({"camera_id": cid}, {"$set": doc}, upsert=True)
+    await security.audit(db, user, "camera.config", cid, role=payload.role, enabled=payload.enabled)
+    doc.pop("_id", None)
+    return {**doc, "configured": True}
+
+
+@api.delete("/camera-config/{camera_id}")
+async def delete_camera_config(camera_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    r = await db.camera_config.delete_one({"camera_id": camera_id.strip().upper()})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Camera not configured")
+    await security.audit(db, user, "camera.config_delete", camera_id.strip().upper())
+    return {"ok": True}
 
 
 @api.get("/cameras/{camera_id}")
@@ -2381,7 +2444,7 @@ async def accept_plate_review(rid: str, payload: ReviewAcceptIn, user: dict = De
     seen_at = datetime.fromisoformat(review["seen_at"]) if review.get("seen_at") else now_utc()
     try:
         result = await _persist_entry(db, review.get("camera_id", ""), plate, b"", plate_jpeg=b"",
-                                      confidence="confirmed", at=seen_at, source="review")
+                                      confidence="confirmed", at=seen_at, source="review", confirmed=True)
     except Exception:
         await db.plate_reviews.update_one({"id": rid}, {"$set": {"status": "pending"}})
         raise
@@ -2534,6 +2597,7 @@ async def ensure_indexes():
 async def startup():
     await ensure_indexes()
     await security.ensure_indexes(db)
+    await plate_pipeline.ensure_session_indexes(db)
     await seed_admin()
     await seed_google_admin()
     await seed_bootstrap_agent()
@@ -2590,6 +2654,9 @@ async def _collect_digest_stats() -> dict:
         {"$sort": {"n": -1}}, {"$limit": 1},
     ]
     busiest = await db.visit_sessions.aggregate(cam_pipeline).to_list(1)
+    long_open = await plate_pipeline.long_open_sessions(db, MAX_VISIT_HOURS)
+    exit_missed = await db.visit_sessions.count_documents({"status": "exit_missed", "exit_missed_at": {"$gte": lo, "$lt": hi}})
+    entry_missed = await db.visit_sessions.count_documents({"status": "entry_missed", "exit_time": {"$gte": lo, "$lt": hi}})
     return {
         "date": yday.isoformat(),
         "entries": entries,
@@ -2599,6 +2666,9 @@ async def _collect_digest_stats() -> dict:
         "max_dwell": _fmt_hms(max_dwell),
         "busiest_camera": busiest[0]["_id"] if busiest else "—",
         "busiest_camera_count": busiest[0]["n"] if busiest else 0,
+        "long_open": len(long_open),
+        "long_open_plates": [x["vehicle_number"] for x in long_open[:10]],
+        "missed_events": exit_missed + entry_missed,
     }
 
 
@@ -2628,6 +2698,12 @@ def _render_digest_html(s: dict) -> str:
         + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
         + _metric_cell("Longest Dwell", s["max_dwell"]) + _metric_cell("Busiest Camera", busiest)
         + '</table>'
+        + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
+        + _metric_cell(f"Open > {MAX_VISIT_HOURS:g}h", s.get("long_open", 0))
+        + _metric_cell("Missed entry/exit", s.get("missed_events", 0))
+        + '</table>'
+        + ((f'<p style="margin:10px 6px 0;color:#fbbf24;font-size:12px">Still inside: '
+            f'{_esc(", ".join(s["long_open_plates"]))}</p>') if s.get("long_open_plates") else '')
         + '</td></tr>'
         + '<tr><td style="padding:8px 24px 24px 24px;color:#64748b;font-size:11px;line-height:1.5">'
         + 'Sent by Vashu Hyundai &middot; AI Vehicle Management System. We never ask for your password or payment details by email.'

@@ -5,6 +5,7 @@ import { useAuth } from "@/context/AuthContext";
 import StatCard from "@/components/StatCard";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
 import AgentHealthCard from "@/components/AgentHealthCard";
+import LongOpenCard from "@/components/LongOpenCard";
 import LiveOccupancyChart from "@/components/LiveOccupancyChart";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
@@ -265,6 +266,8 @@ export default function Dashboard() {
             <LiveOccupancyChart liveValue={stats?.cars_inside?.value} />
             <AgentHealthCard />
           </div>
+
+          <LongOpenCard />
         </>
       )}
 

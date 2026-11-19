@@ -5,11 +5,9 @@ The YOLO + OCR pipeline runs on the showroom PC's `local_agent`
 message on `/api/agent/ws` we:
 
     1. Look up the plate in `vehicle_masters` (owner enrichment).
-    2. Decide whether this is an ENTRY or an EXIT based on the vehicle's
-       most recent visit_session (`status == "active"` ⇒ EXIT, else ENTRY).
-    3. Cooldown-dedup so a car sitting in front of the camera does NOT
-       spam records (same event type + same plate within COOLDOWN_SECONDS
-       is treated as a duplicate).
+    2. Decide ENTRY vs EXIT from the camera's role (entry / exit / both —
+       see _persist_entry_locked) and the vehicle's open visit.
+    3. Ignore re-detections of a car still standing in view.
     4. Auto-create a `vehicle_masters` document for brand-new plates.
     5. Save the vehicle-crop snapshot and the plate-crop snapshot to disk.
     6. Insert a new visit_session (entry) or close the active one (exit).
@@ -23,8 +21,10 @@ import os
 import secrets
 import shutil
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple
+
+from pymongo.errors import DuplicateKeyError
 
 from zoneinfo import ZoneInfo
 
@@ -173,6 +173,21 @@ def _master_public(master: dict) -> dict:
     }
 
 
+async def camera_settings(db, camera_id: str) -> Dict[str, Any]:
+    """Role of a camera: entry | exit | both. Unknown cameras act as 'both'."""
+    cid = (camera_id or "").strip().upper()
+    doc = await db.camera_config.find_one({"camera_id": cid}, {"_id": 0}) if cid else None
+    if not doc:
+        if cid and cid not in _warned_unknown_cameras:
+            _warned_unknown_cameras.add(cid)
+            logger.warning("[camera %s] no role configured — treating as entry+exit (set it in Settings → Cameras)", cid)
+        return {"camera_id": cid, "role": "both", "enabled": True, "configured": False}
+    return {"camera_id": cid, "role": doc.get("role", "both"), "enabled": doc.get("enabled", True), "configured": True}
+
+
+_warned_unknown_cameras: set = set()
+
+
 async def _persist_entry(
     db,
     camera_id: str,
@@ -182,14 +197,110 @@ async def _persist_entry(
     confidence: str = "medium",
     at: Optional[datetime] = None,
     source: str = "agent_yolo",
+    confirmed: bool = False,
 ) -> Dict[str, Any]:
-    """Race-safe wrapper: serializes persistence under a process-wide lock so
-    concurrent detections can never double-create an active session.
+    """Race-safe wrapper: serializes persistence under a process-wide lock.
 
     `at` is when the vehicle was actually seen (used when a reviewer confirms
-    a read later, so entry/exit times stay correct)."""
+    a read later, so entry/exit times stay correct). The partial unique index
+    on active sessions (see ensure_session_indexes) also protects against
+    duplicates across several server workers."""
     async with _persist_lock:
-        return await _persist_entry_locked(db, camera_id, plate, jpeg_frame, plate_jpeg, confidence, at, source)
+        return await _persist_entry_locked(db, camera_id, plate, jpeg_frame, plate_jpeg, confidence, at, source,
+                                           confirmed)
+
+
+def _secs_since(now: datetime, iso: Optional[str]) -> Optional[float]:
+    try:
+        return (now - datetime.fromisoformat(iso)).total_seconds() if iso else None
+    except Exception:
+        return None
+
+
+async def _decide(db, role: str, plate: str, now: datetime, confirmed: bool) -> Dict[str, Any]:
+    """Work out what a sighting means. Pure decision — writes nothing.
+
+    Returns {"action": ..., ...} where action is one of
+      entry              open a new visit
+      exit               close `session` (matched exactly or by one character)
+      exit_missed_entry  close `session` as exit_missed, then open a new visit
+      exit_unmatched     record an exit with no known entry (entry_missed)
+      duplicate          ignore (same car still in view)
+      review             ask a person (reason + suggestions)
+    """
+    active = await db.visit_sessions.find_one({"vehicle_number": plate, "status": "active"}, sort=[("entry_time", -1)])
+
+    if role == "exit":
+        if active:
+            return {"action": "exit", "session": active, "matched_by": "exact"}
+        near = [] if confirmed else await _near_active_plates(db, plate)
+        if len(near) == 1:
+            session = await db.visit_sessions.find_one({"vehicle_number": near[0], "status": "active"})
+            if session:
+                return {"action": "exit", "session": session, "matched_by": "fuzzy"}
+        if len(near) > 1:
+            return {"action": "review", "reason": f"Exit read is one character away from several cars inside ({', '.join(near)})",
+                    "suggestions": near}
+        if confirmed:
+            return {"action": "exit_unmatched"}
+        return {"action": "review", "reason": "Exit seen, but this vehicle has no open entry", "suggestions": []}
+
+    if role == "entry":
+        if active:
+            inside_for = _secs_since(now, active.get("entry_time"))
+            if inside_for is not None and inside_for < MIN_VISIT_SECONDS:
+                return {"action": "duplicate", "session": active,
+                        "reason": f"entered {int(inside_for)}s ago (< {MIN_VISIT_SECONDS}s) — same car still at the entry camera"}
+            return {"action": "exit_missed_entry", "session": active}
+        return await _entry_or_cooldown(db, plate, now)
+
+    # role == "both": one camera sees both directions — toggle on the open visit.
+    if active:
+        inside_for = _secs_since(now, active.get("entry_time"))
+        if MIN_VISIT_SECONDS > 0 and inside_for is not None and inside_for < MIN_VISIT_SECONDS:
+            return {"action": "duplicate", "session": active,
+                    "reason": f"inside for {int(inside_for)}s (< {MIN_VISIT_SECONDS}s minimum visit)"}
+        return {"action": "exit", "session": active, "matched_by": "exact"}
+    return await _entry_or_cooldown(db, plate, now)
+
+
+async def _entry_or_cooldown(db, plate: str, now: datetime) -> Dict[str, Any]:
+    """A new ENTRY — unless this plate's last visit ended moments ago (still in view)."""
+    last = await db.visit_sessions.find_one({"vehicle_number": plate}, sort=[("created_at", -1)])
+    if last:
+        since = _secs_since(now, last.get("exit_time") or last.get("entry_time"))
+        if since is not None and since < COOLDOWN_SECONDS:
+            return {"action": "duplicate", "session": last, "reason": f"last activity within {COOLDOWN_SECONDS}s"}
+    return {"action": "entry"}
+
+
+async def _get_or_create_master(db, plate: str, now: datetime) -> Tuple[dict, str]:
+    master = await db.vehicle_masters.find_one({"vehicle_number": plate})
+    if master:
+        return master, "existing"
+    master = {
+        "id": str(uuid.uuid4()),
+        "vehicle_number": plate,
+        "owner_name": "Unknown Owner",
+        "phone_number": "",
+        "vehicle_model": "",
+        "vehicle_image": "",
+        "customer_id": f"CUS-{secrets.token_hex(3).upper()}",
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    try:
+        await db.vehicle_masters.insert_one(master)
+    except Exception:
+        master = await db.vehicle_masters.find_one({"vehicle_number": plate}) or master
+    return master, "new"
+
+
+def _session_public(doc: dict) -> dict:
+    keys = ("id", "vehicle_number", "entry_time", "exit_time", "entry_camera", "exit_camera", "entry_image",
+            "exit_image", "entry_plate_image", "exit_plate_image", "status", "duration_seconds", "visit_date",
+            "detected_by", "exit_matched_by", "exit_plate_read")
+    return {k: doc.get(k) for k in keys if k in doc}
 
 
 async def _persist_entry_locked(
@@ -201,143 +312,103 @@ async def _persist_entry_locked(
     confidence: str = "medium",
     at: Optional[datetime] = None,
     source: str = "agent_yolo",
+    confirmed: bool = False,
 ) -> Dict[str, Any]:
-    """Persist a plate detection sent from the local agent.
+    """Record one plate sighting. ENTRY vs EXIT comes from the camera's role:
 
-    Decides ENTRY vs EXIT based on the vehicle's active visit_session and
-    returns a dict describing what happened. Backwards-compatible with the
-    existing agent WS handler.
+    * entry camera — opens a visit. If the car still has an open visit (its
+      exit was never seen) that visit is closed as `exit_missed` first.
+    * exit camera  — closes the car's open visit, or the single open visit one
+      character away (OCR slip; recorded as exit_matched_by="fuzzy"). Never
+      opens a visit; an exit with no open visit goes to Plate Review (or, once
+      a person confirms it, is stored as `entry_missed`).
+      `confirmed=True` (a person typed the plate in Plate Review) means the plate
+      is taken exactly as given: no one-character matching.
+    * both         — one camera for both directions: toggles on the open visit,
+      with a minimum visit time so a car standing in view isn't flipped.
     """
     now = at or datetime.now(timezone.utc)
     plate = (plate or "").strip().upper()
-    result: Dict[str, Any] = {"plate": plate, "camera_id": camera_id, "confidence": confidence}
+    cam = await camera_settings(db, camera_id)
+    result: Dict[str, Any] = {"plate": plate, "camera_id": cam["camera_id"] or camera_id,
+                              "confidence": confidence, "camera_role": cam["role"]}
+    if not cam["enabled"]:
+        result.update({"ignored": True, "duplicate": True, "event": None, "duplicate_reason": "camera disabled"})
+        return result
 
-    # 1. Master lookup / auto-create for new plates
-    master = await db.vehicle_masters.find_one({"vehicle_number": plate})
-    if master:
-        result["owner_status"] = "existing"
-    else:
-        result["owner_status"] = "new"
-        master = {
-            "id": str(uuid.uuid4()),
-            "vehicle_number": plate,
-            "owner_name": "Unknown Owner",
-            "phone_number": "",
-            "vehicle_model": "",
-            "vehicle_image": "",
-            "customer_id": f"CUS-{secrets.token_hex(3).upper()}",
-            "created_at": now.isoformat(),
-            "updated_at": now.isoformat(),
-        }
-        try:
-            await db.vehicle_masters.insert_one(master)
-        except Exception:
-            master = await db.vehicle_masters.find_one({"vehicle_number": plate}) or master
+    decision = await _decide(db, cam["role"], plate, now, confirmed)
+    action = decision["action"]
+
+    if action == "review":
+        result.update({"needs_review": True, "review_reason": decision["reason"],
+                       "suggestions": decision.get("suggestions", [])})
+        return result
+    if action == "duplicate":
+        s = decision.get("session") or {}
+        result.update({"duplicate": True, "event": "exit" if s.get("status") == "completed" else "entry",
+                       "duplicate_reason": decision["reason"], "session_id": s.get("id")})
+        logger.info("[EVENT] ignored re-detection plate=%s camera=%s (%s)", plate, camera_id, decision["reason"])
+        return result
+
+    target_plate = decision["session"]["vehicle_number"] if action == "exit" else plate
+    master, owner_status = await _get_or_create_master(db, target_plate, now)
+    result["plate"] = target_plate
+    result["owner_status"] = owner_status
     result["owner"] = _master_public(master)
 
-    # 2. Decide entry vs exit — is there an active session for this plate?
-    active = await db.visit_sessions.find_one(
-        {"vehicle_number": plate, "status": "active"},
-        sort=[("entry_time", -1)],
-    )
-    is_exit = active is not None
-    event_kind = "exit" if is_exit else "entry"
+    is_exit = action in ("exit", "exit_unmatched")
+    kind = "exit" if is_exit else "entry"
+    vehicle_snap = await _write_snapshot(kind, target_plate, jpeg_frame) if jpeg_frame else ""
+    plate_snap = await _write_snapshot(f"plate_{kind}", target_plate, plate_jpeg) if plate_jpeg else ""
 
-    # 2b. Minimum visit time — a re-detection soon after ENTRY is the same car
-    #     still in view, not an EXIT.
-    if is_exit and MIN_VISIT_SECONDS > 0:
-        try:
-            inside_for = (now - datetime.fromisoformat(active["entry_time"])).total_seconds()
-        except Exception:
-            inside_for = MIN_VISIT_SECONDS
-        if inside_for < MIN_VISIT_SECONDS:
-            result.update({
-                "duplicate": True,
-                "event": "entry",
-                "duplicate_reason": f"inside for {int(inside_for)}s (< {MIN_VISIT_SECONDS}s minimum visit)",
-                "session_id": active.get("id"),
-            })
-            logger.info("[EVENT] ignored re-detection plate=%s camera=%s (%s)", plate, camera_id, result["duplicate_reason"])
-            return result
-
-    # 3. Cooldown-dedup. ROOT RULE — ACTIVE SESSION WINS: when an active
-    #    session exists, the detection is ALWAYS an EXIT of that same session;
-    #    the cooldown must never convert it into a duplicate/'entry' outcome.
-    #    The cooldown only suppresses a brand-new ENTRY right after a completed EXIT.
-    if not is_exit:
-        last = await db.visit_sessions.find_one(
-            {"vehicle_number": plate},
-            sort=[("entry_time", -1)],
-        )
-        if last:
-            try:
-                # Duplicate suppression uses the most recent activity — exit_time
-                # when the last session already closed, else entry_time — so a car
-                # still sitting in view right after an EXIT cannot spawn a
-                # duplicate ENTRY within the cooldown window.
-                ref = last.get("exit_time") or last.get("entry_time")
-                if ref:
-                    ref_dt = datetime.fromisoformat(ref)
-                    if (now - ref_dt).total_seconds() < COOLDOWN_SECONDS:
-                        result.update({
-                            "duplicate": True,
-                            "event": "entry",
-                            "duplicate_reason": f"last activity within {COOLDOWN_SECONDS}s",
-                            "session_id": last.get("id"),
-                        })
-                        return result
-            except Exception:
-                pass
-
-    # 4. Write snapshots
-    vehicle_snap = await _write_snapshot(f"{event_kind}", plate, jpeg_frame) if jpeg_frame else ""
-    plate_snap = await _write_snapshot(f"plate_{event_kind}", plate, plate_jpeg) if plate_jpeg else ""
-
-    if is_exit:
-        # 5a. Close the active session as EXIT
-        try:
-            entry_dt = datetime.fromisoformat(active["entry_time"])
-            duration = int((now - entry_dt).total_seconds())
-        except Exception:
-            duration = None
+    if action == "exit":
+        active = decision["session"]
+        duration = None
+        since = _secs_since(now, active.get("entry_time"))
+        if since is not None:
+            duration = int(since)
         update_doc = {
             "exit_time": now.isoformat(),
             "exit_camera": camera_id,
             "exit_image": vehicle_snap or active.get("exit_image", ""),
             "exit_plate_image": plate_snap or active.get("exit_plate_image", ""),
             "exit_confidence": confidence,
+            "exit_matched_by": decision.get("matched_by", "exact"),
             "duration_seconds": duration,
             "status": "completed",
         }
-        await db.visit_sessions.update_one({"id": active["id"]}, {"$set": update_doc})
+        if decision.get("matched_by") == "fuzzy":
+            update_doc["exit_plate_read"] = plate
+        r = await db.visit_sessions.update_one({"id": active["id"], "status": "active"}, {"$set": update_doc})
+        if r.modified_count == 0:  # closed by someone else in the meantime
+            result.update({"duplicate": True, "event": "exit", "duplicate_reason": "visit already closed",
+                           "session_id": active["id"]})
+            return result
         session_doc = {**active, **update_doc}
-        session_doc.pop("_id", None)
-        result.update({
-            "duplicate": False,
-            "event": "exit",
-            "session": {
-                "id": session_doc["id"],
-                "vehicle_number": plate,
-                "entry_time": session_doc.get("entry_time"),
-                "exit_time": session_doc["exit_time"],
-                "entry_camera": session_doc.get("entry_camera", ""),
-                "exit_camera": session_doc["exit_camera"],
-                "entry_image": session_doc.get("entry_image", ""),
-                "exit_image": session_doc["exit_image"],
-                "entry_plate_image": session_doc.get("entry_plate_image", ""),
-                "exit_plate_image": session_doc["exit_plate_image"],
-                "status": "completed",
-                "duration_seconds": duration,
-                "visit_date": session_doc.get("visit_date"),
-                "detected_by": session_doc.get("detected_by", "agent_yolo"),
-            },
-        })
+        event_type = "exit.recorded"
+    elif action == "exit_unmatched":
+        session_doc = {
+            "id": str(uuid.uuid4()), "vehicle_number": target_plate,
+            "entry_time": None, "exit_time": now.isoformat(), "visit_date": local_date(now),
+            "duration_seconds": None, "entry_camera": "", "exit_camera": camera_id,
+            "entry_image": "", "exit_image": vehicle_snap, "entry_plate_image": "", "exit_plate_image": plate_snap,
+            "exit_confidence": confidence, "status": "entry_missed", "notes": "Exit recorded without a matching entry",
+            "created_at": now.isoformat(), "detected_by": source,
+        }
+        await db.visit_sessions.insert_one(session_doc)
         event_type = "exit.recorded"
     else:
-        # 5b. Insert a new ENTRY visit_session
+        if action == "exit_missed_entry":
+            stale = decision["session"]
+            await db.visit_sessions.update_one({"id": stale["id"], "status": "active"}, {"$set": {
+                "status": "exit_missed", "exit_missed_at": now.isoformat(),
+                "notes": ((stale.get("notes") or "") + " Exit not seen — closed when the car entered again.").strip(),
+            }})
+            result["closed_exit_missed"] = stale["id"]
+            logger.warning("[EVENT] exit_missed plate=%s session=%s (seen entering again)", target_plate, stale["id"])
         session_doc = {
             "id": str(uuid.uuid4()),
-            "vehicle_number": plate,
+            "vehicle_number": target_plate,
             "entry_time": now.isoformat(),
             "exit_time": None,
             "visit_date": local_date(now),
@@ -354,49 +425,57 @@ async def _persist_entry_locked(
             "created_at": now.isoformat(),
             "detected_by": source,
         }
-        await db.visit_sessions.insert_one(session_doc)
-        session_doc.pop("_id", None)
-        result.update({
-            "duplicate": False,
-            "event": "entry",
-            "session": {
-                "id": session_doc["id"],
-                "vehicle_number": plate,
-                "entry_time": session_doc["entry_time"],
-                "exit_time": None,
-                "entry_camera": camera_id,
-                "exit_camera": "",
-                "entry_image": vehicle_snap,
-                "exit_image": "",
-                "entry_plate_image": plate_snap,
-                "status": "active",
-                "visit_date": session_doc["visit_date"],
-                "detected_by": session_doc["detected_by"],
-            },
-        })
+        try:
+            await db.visit_sessions.insert_one(session_doc)
+        except DuplicateKeyError:
+            existing = await db.visit_sessions.find_one({"vehicle_number": target_plate, "status": "active"}, {"id": 1})
+            result.update({"duplicate": True, "event": "entry", "duplicate_reason": "already inside",
+                           "session_id": (existing or {}).get("id")})
+            return result
         event_type = "entry.recorded"
 
-    # 6. Broadcast on the event bus (dashboard + LiveMonitoring listen here).
+    session_doc.pop("_id", None)
+    result.update({"duplicate": False, "event": "exit" if is_exit else "entry", "session": _session_public(session_doc)})
+    if decision.get("matched_by") == "fuzzy":
+        result["read_plate"] = plate
+
     event_bus.publish({
         "type": event_type,
         "camera_id": camera_id,
-        "vehicle_number": plate,
-        "owner_status": result["owner_status"],
+        "vehicle_number": target_plate,
+        "owner_status": owner_status,
         "owner": result["owner"],
         "session": result["session"],
         "recorded_at": now.isoformat(),
     })
-
-    logger.info(
-        "[EVENT] %s plate=%s camera=%s owner=%s duration=%s conf=%s",
-        event_type,
-        plate,
-        camera_id,
-        result["owner"]["owner_name"],
-        result["session"].get("duration_seconds"),
-        confidence,
-    )
+    logger.info("[EVENT] %s plate=%s camera=%s role=%s owner=%s duration=%s conf=%s%s",
+                event_type, target_plate, camera_id, cam["role"], result["owner"]["owner_name"],
+                session_doc.get("duration_seconds"), confidence,
+                f" (read {plate}, fuzzy match)" if decision.get("matched_by") == "fuzzy" else "")
     return result
+
+
+async def ensure_session_indexes(db) -> None:
+    """At most one open visit per plate, enforced by MongoDB itself."""
+    await db.camera_config.create_index("camera_id", unique=True)
+    try:
+        await db.visit_sessions.create_index(
+            "vehicle_number", name="one_active_per_plate", unique=True,
+            partialFilterExpression={"status": "active"},
+        )
+    except Exception as e:
+        logger.error("[sessions] could not create the one-active-visit-per-plate index — some plates have several "
+                     "open visits. Run `python maintenance.py close-duplicate-active --apply`. (%s)", e)
+
+
+async def long_open_sessions(db, hours: float) -> list:
+    """Visits still open after `hours` (cars possibly inside overnight, or a missed exit)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    out = []
+    async for s in db.visit_sessions.find({"status": "active", "entry_time": {"$lt": cutoff}},
+                                          {"_id": 0}).sort("entry_time", 1):
+        out.append(_session_public(s))
+    return out
 
 
 # ===================== Detection routing + Review queue =====================
@@ -484,5 +563,9 @@ async def route_detection(
 
     result = await _persist_entry(db, camera_id, plate, jpeg_frame, plate_jpeg=plate_jpeg,
                                   confidence=confidence, at=seen_at)
+    if result.get("needs_review"):
+        review = await create_review(db, plate=plate, reason=result["review_reason"],
+                                     suggestions=result.get("suggestions") or [], **common)
+        return {"queued_for_review": True, "review_id": review["id"], "plate": plate}
     result["corrected"] = corrected
     return result

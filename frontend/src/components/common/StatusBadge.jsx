@@ -18,6 +18,8 @@ const STATUS_MAP = {
   exited: { label: "Exited", tone: "neutral" },
   completed: { label: "Completed", tone: "neutral" },
   pending: { label: "Pending", tone: "warning" },
+  exit_missed: { label: "Exit not seen", tone: "warning" },
+  entry_missed: { label: "Entry not seen", tone: "warning" },
   online: { label: "Online", tone: "success", dot: true },
   connecting: { label: "Connecting", tone: "warning" },
   reconnecting: { label: "Reconnecting", tone: "warning" },

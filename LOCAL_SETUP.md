@@ -127,6 +127,25 @@ cd backend && .venv/bin/pytest tests -q
 | `yarn install` fails on `@emergentbase/visual-edits` | Remove that line from `frontend/package.json` devDependencies — it's only Emergent's visual editor |
 | Port 3000/8001 in use | `./stop.sh` |
 
+## Camera roles (entry / exit)
+
+In **Settings → Cameras** set each camera to **Entry**, **Exit** or **Entry + exit**:
+
+- An **entry** camera only opens visits. If the car still has an open visit
+  (its exit was never seen), that visit is marked *Exit not seen*.
+- An **exit** camera only closes visits. A read one character away from a single
+  car inside closes that car's visit (recorded as a fuzzy match). An exit with
+  no open visit goes to Plate Review; once confirmed it is stored as *Entry not seen*.
+- **Entry + exit** (the default for unconfigured cameras) toggles on the open
+  visit, with `MIN_VISIT_SECONDS` so a car standing in view isn't flipped.
+
+Visits open longer than `MAX_VISIT_HOURS` (default 24) are listed on the
+dashboard and in the daily digest. They are never closed automatically.
+
+If the backend logs that it couldn't create the one-open-visit-per-plate index,
+run `backend/.venv/bin/python backend/maintenance.py close-duplicate-active`
+(dry run), then again with `--apply`.
+
 ## Running the tests
 
 ```bash

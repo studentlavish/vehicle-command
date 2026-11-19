@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
 import AgentManager from "@/components/AgentManager";
+import CameraRoles from "@/components/CameraRoles";
 import { ErrorState } from "@/components/common/EmptyState";
 import {
   Building2, Camera, Database, Settings as SettingsIcon, MessageSquare, HardDrive,
@@ -116,6 +117,8 @@ export default function SettingsPage() {
         </div>
         <WhatsAppTester dirty={dirty} />
       </SectionCard>
+
+      <CameraRoles />
 
       <AgentManager />
 
