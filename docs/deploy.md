@@ -119,6 +119,27 @@ visit, which can take up to a minute.
 - [ ] The next morning: the digest email arrived and the backups list shows
       last night's backup.
 
+## Monitoring
+
+- **Built-in alerts:** problems appear as a banner on every dashboard page, and
+  are sent by email (to every admin, or `ALERT_EMAILS`) and WhatsApp (Meta,
+  `ALERT_WHATSAPP_TO`) when those are configured. Each alert is sent when it
+  starts, every 6 hours while it continues, and once when it is fixed. The
+  rules:
+  - a camera or the showroom PC is offline for more than 2 minutes
+  - more than 20 plate reads are waiting to upload
+  - more than 10 reads are waiting in Plate Review, or one has waited over an hour
+  - the snapshot disk is low
+  - a backup failed, or there has been none for 36 hours
+  - cars have been recorded inside for too long
+- **Uptime monitor:** point a free external monitor (UptimeRobot, Better Stack…)
+  at `https://<DOMAIN>/api/ready`. It returns 200 only when the database and the
+  storage both answer, so it also catches the case where the whole server is
+  down and can't send its own alerts.
+- **Logs:** `docker compose logs backend` (JSON lines with `LOG_FORMAT=json`).
+  For error tracking, set `SENTRY_DSN` in `backend.env` and in the agent's
+  `.env` (Sentry's free tier is enough).
+
 ## Updating
 
 ```bash

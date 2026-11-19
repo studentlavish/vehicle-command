@@ -42,6 +42,14 @@ def setup_logging() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+    dsn = os.environ.get("SENTRY_DSN", "").strip()
+    if dsn:  # optional error tracking
+        try:
+            import sentry_sdk
+            sentry_sdk.init(dsn=dsn, environment=os.environ.get("SENTRY_ENVIRONMENT", "showroom"),
+                            traces_sample_rate=0.0, send_default_pii=False)
+        except ImportError:
+            log.warning("SENTRY_DSN is set but sentry-sdk is not installed")
 
 
 async def _stream_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyncio.Event,

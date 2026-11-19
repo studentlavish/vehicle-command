@@ -38,6 +38,9 @@ import security
 import scheduler
 import google_oauth
 import config_check
+import alerts
+import logging_setup
+import storage as storage_mod
 
 # Optional integrations
 try:
@@ -47,8 +50,9 @@ except ImportError:
     HAS_TWILIO = False
 
 # --------- Setup ---------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging_setup.configure()
 logger = logging.getLogger("rdx")
+SERVER_STARTED_AT = datetime.now(timezone.utc)
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
@@ -2576,6 +2580,30 @@ async def health():
     return {"ok": True}
 
 
+@api.get("/ready")
+async def ready():
+    """Readiness: the database answers and snapshot storage works. 503 otherwise (for uptime monitors)."""
+    checks: Dict[str, Any] = {}
+    try:
+        await asyncio.wait_for(db.command("ping"), timeout=3)
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {type(e).__name__}"
+    try:
+        store = storage_mod.get()
+        if store.name == "local":
+            disk = plate_pipeline.snapshot_disk_stats()
+            checks["storage"] = "ok" if disk.get("healthy") else "low disk"
+        else:
+            await asyncio.wait_for(store.list("health"), timeout=5)
+            checks["storage"] = "ok"
+    except Exception as e:
+        checks["storage"] = f"error: {type(e).__name__}"
+    ok = all(v == "ok" for v in checks.values())
+    return Response(content=json.dumps({"ok": ok, "checks": checks}), media_type="application/json",
+                    status_code=200 if ok else 503)
+
+
 @api.get("/")
 async def root():
     return {"service": "RDX Car Showroom API", "ok": True}
@@ -2703,6 +2731,81 @@ async def startup():
         app.state.scheduler = asyncio.create_task(scheduler.run_forever(db, _scheduled_jobs()))
     else:
         logger.info("[scheduler] disabled via SCHEDULER_ENABLED=false")
+    if ALERTS_ENABLED:
+        app.state.alerts = asyncio.create_task(_alert_loop())
+    else:
+        logger.info("[alerts] disabled via ALERTS_ENABLED=false")
+
+
+# ===================== Alerts (see alerts.py) =====================
+ALERTS_ENABLED = os.environ.get("ALERTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+ALERT_CHECK_SECONDS = 60
+_ALERT_PREFIX = {"fired": "ALERT", "repeat": "STILL A PROBLEM", "resolved": "RESOLVED"}
+
+
+async def _alert_recipients() -> List[str]:
+    configured = [e.strip().lower() for e in os.environ.get("ALERT_EMAILS", "").split(",") if e.strip()]
+    if configured:
+        return configured
+    return sorted({(u.get("email") or "").lower() async for u in
+                   db.users.find({"role": "admin", "status": {"$ne": "inactive"}}, {"email": 1}) if u.get("email")})
+
+
+async def _notify_alert(kind: str, doc: dict) -> None:
+    """Push an alert change to the dashboard, email and WhatsApp (whichever are configured)."""
+    event_bus.publish({"type": "alert.changed", "kind": kind, "alert": alerts.public(doc)})
+    text = f"{_ALERT_PREFIX[kind]}: {doc['message']}"
+    if kind == "resolved":
+        logger.info("[alerts] %s", text)
+    else:
+        logger.warning("[alerts] %s", text)
+    if _email_provider():
+        from html import escape as _esc
+        html = (f'<div style="font-family:Arial,sans-serif;font-size:14px"><p><b>{_esc(_ALERT_PREFIX[kind])}</b></p>'
+                f'<p>{_esc(doc["message"])}</p><p style="color:#64748b;font-size:12px">Vehicle Command · automatic '
+                f'alert. Check the dashboard for details.</p></div>')
+        for to in await _alert_recipients():
+            try:
+                await _send_email(to=to, subject=f"[Vehicle Command] {text[:120]}", html=html)
+            except Exception as e:
+                logger.warning("[alerts] email to %s failed: %s", to, e)
+    if wa_meta.meta_whatsapp_enabled():
+        to = os.environ.get("ALERT_WHATSAPP_TO", "").strip() or (await _twilio_config())["to"]
+        if to:
+            try:
+                await wa_meta.send_text(db, to=to, body=text, by="alerts", context="alert")
+            except Exception as e:
+                logger.warning("[alerts] WhatsApp alert failed: %s", e)
+
+
+async def run_alert_check(now: Optional[datetime] = None) -> Dict[str, List[str]]:
+    now = now or datetime.now(timezone.utc)
+    backup_job = next((j for j in _scheduled_jobs() if j.name == "backup"), None)
+    findings = await alerts.evaluate(
+        db, now, cameras=camera_manager.list(), disk=plate_pipeline.snapshot_disk_stats(),
+        started_at=SERVER_STARTED_AT, backups_enabled=bool(SCHEDULER_ENABLED and backup_job and backup_job.enabled),
+        long_open=await plate_pipeline.long_open_sessions(db, MAX_VISIT_HOURS),
+    )
+    return await alerts.reconcile(db, findings, now, _notify_alert)
+
+
+async def _alert_loop() -> None:
+    await db.alerts.create_index([("status", 1), ("key", 1)])
+    while True:
+        try:
+            await run_alert_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[alerts] check failed")
+        await asyncio.sleep(ALERT_CHECK_SECONDS)
+
+
+@api.get("/alerts")
+async def list_alerts(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    firing = await db.alerts.find({"status": "firing"}).sort("first_at", -1).to_list(100)
+    recent = await db.alerts.find({"status": "resolved"}).sort("resolved_at", -1).to_list(20)
+    return {"firing": [alerts.public(d) for d in firing], "resolved": [alerts.public(d) for d in recent]}
 
 
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -2771,6 +2874,13 @@ async def _collect_digest_stats() -> dict:
     ]
     busiest = await db.visit_sessions.aggregate(cam_pipeline).to_list(1)
     long_open = await plate_pipeline.long_open_sessions(db, MAX_VISIT_HOURS)
+    # How hands-free was yesterday: events saved automatically vs. sent to a person.
+    auto_entries = await db.visit_sessions.count_documents({"entry_time": {"$gte": lo, "$lt": hi}, "detected_by": "agent_yolo"})
+    auto_exits = await db.visit_sessions.count_documents({"exit_time": {"$gte": lo, "$lt": hi},
+                                                         "exit_confidence": {"$in": ["high", "medium"]}})
+    reviews = await db.plate_reviews.count_documents({"created_at": {"$gte": lo, "$lt": hi}})
+    corrections = await db.ocr_labels.count_documents({"at": {"$gte": lo, "$lt": hi}, "corrected": True})
+    auto_total = auto_entries + auto_exits
     exit_missed = await db.visit_sessions.count_documents({"status": "exit_missed", "exit_missed_at": {"$gte": lo, "$lt": hi}})
     entry_missed = await db.visit_sessions.count_documents({"status": "entry_missed", "exit_time": {"$gte": lo, "$lt": hi}})
     return {
@@ -2785,6 +2895,10 @@ async def _collect_digest_stats() -> dict:
         "long_open": len(long_open),
         "long_open_plates": [x["vehicle_number"] for x in long_open[:10]],
         "missed_events": exit_missed + entry_missed,
+        "auto_saved": auto_total,
+        "sent_to_review": reviews,
+        "review_rate": f"{100.0 * reviews / (auto_total + reviews):.1f}%" if (auto_total + reviews) else "—",
+        "corrections": corrections,
     }
 
 
@@ -2817,6 +2931,10 @@ def _render_digest_html(s: dict) -> str:
         + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
         + _metric_cell(f"Open > {MAX_VISIT_HOURS:g}h", s.get("long_open", 0))
         + _metric_cell("Missed entry/exit", s.get("missed_events", 0))
+        + '</table>'
+        + '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px">'
+        + _metric_cell("Saved automatically", s.get("auto_saved", 0))
+        + _metric_cell("Sent to review", f'{s.get("sent_to_review", 0)} ({s.get("review_rate", "—")})')
         + '</table>'
         + ((f'<p style="margin:10px 6px 0;color:#fbbf24;font-size:12px">Still inside: '
             f'{_esc(", ".join(s["long_open_plates"]))}</p>') if s.get("long_open_plates") else '')
@@ -2965,9 +3083,10 @@ async def list_backups(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER)))
 
 @app.on_event("shutdown")
 async def shutdown():
-    task = getattr(app.state, "scheduler", None)
-    if task:
-        task.cancel()
+    for name in ("scheduler", "alerts"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
     client.close()
 
 

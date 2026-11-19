@@ -2,3 +2,4 @@ opencv-python-headless>=4.10.0
 websockets>=12.0
 python-dotenv>=1.0.1
 numpy>=1.26.0
+sentry-sdk>=2.0          # optional error tracking (SENTRY_DSN)

@@ -20,4 +20,5 @@ openpyxl==3.1.5
 reportlab==5.1.0
 twilio==9.13.0
 boto3==1.44.6
+sentry-sdk==2.75.0
 tzdata==2026.6

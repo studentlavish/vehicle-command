@@ -15,6 +15,7 @@ import {
   ShieldCheck, CarFront, CheckCheck, ScanEye, KeyRound,
 } from "lucide-react";
 import ChangePasswordDialog from "@/components/ChangePasswordDialog";
+import AlertsBanner from "@/components/AlertsBanner";
 import Logo from "@/components/common/Logo";
 import StatusBadge from "@/components/common/StatusBadge";
 import useLiveEvents from "@/hooks/useLiveEvents";
@@ -329,6 +330,7 @@ export default function Layout({ children }) {
 
         <main className="flex-1 px-4 py-6 md:px-6 lg:px-8 lg:py-8">
           <div key={location.pathname} className="mx-auto w-full max-w-[1440px] animate-fade-in">
+            {(user?.role === "admin" || user?.role === "manager") && <AlertsBanner />}
             {children}
           </div>
         </main>
