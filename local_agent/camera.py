@@ -60,7 +60,8 @@ class CameraCapture:
             ok, _ = self._cap.read()
             return bool(ok)
 
-    def grab_jpeg(self, quality: int = 70) -> Optional[bytes]:
+    def grab_frame(self):
+        """Next frame as a BGR numpy array (resized to width×height), or None."""
         with self._lock:
             if self._cap is None:
                 now = time.time()
@@ -82,8 +83,16 @@ class CameraCapture:
                 h, w = frame.shape[:2]
                 if (w, h) != (self.width, self.height):
                     frame = cv2.resize(frame, (self.width, self.height))
-            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            return bytes(buf) if ok else None
+            return frame
+
+    @staticmethod
+    def encode(frame, quality: int = 70) -> Optional[bytes]:
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return bytes(buf) if ok else None
+
+    def grab_jpeg(self, quality: int = 70) -> Optional[bytes]:
+        frame = self.grab_frame()
+        return self.encode(frame, quality) if frame is not None else None
 
     def release(self) -> None:
         with self._lock:

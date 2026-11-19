@@ -25,12 +25,15 @@ Voting config (env):
     VOTE_AGREEMENT          share of reads that must agree for "medium" (0.6)
     CONFIRM_WINDOW_SECONDS  max seconds collecting reads for one vehicle (15)
     VEHICLE_GONE_FRAMES     frames without a plate before finalising (2)
+    MAX_PLATES_PER_FRAME    plates read per frame — each is tracked separately (4)
+    TRACK_MAX_JUMP          max movement between frames, in plate widths (4)
 """
 from __future__ import annotations
 
 import logging
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -47,6 +50,10 @@ VOTE_MIN_READS = int(os.environ.get("VOTE_MIN_READS", os.environ.get("CONFIRM_FR
 VOTE_AGREEMENT = float(os.environ.get("VOTE_AGREEMENT", "0.6"))
 CONFIRM_WINDOW_SECONDS = float(os.environ.get("CONFIRM_WINDOW_SECONDS", "15"))
 VEHICLE_GONE_FRAMES = int(os.environ.get("VEHICLE_GONE_FRAMES", "2"))
+MAX_PLATES_PER_FRAME = int(os.environ.get("MAX_PLATES_PER_FRAME", "4"))
+# How far (in plate widths) a plate may move between two processed frames and
+# still count as the same vehicle.
+TRACK_MAX_JUMP = float(os.environ.get("TRACK_MAX_JUMP", "4"))
 
 _HERE = os.path.dirname(__file__)
 _default_plate_path = os.path.join(_HERE, "best.pt")
@@ -76,6 +83,7 @@ class LocalDetection:
     reads: int = 1
     support: float = 1.0
     candidates: Optional[List[str]] = None
+    seen_at: float = 0.0  # when this vehicle was first seen (epoch seconds)
 
 
 @dataclass
@@ -86,18 +94,6 @@ class _Read:
     plate_crop: bytes
     vehicle_class: str
     vehicle_conf: float
-
-
-@dataclass
-class _VoteState:
-    reads: List[_Read] = field(default_factory=list)
-    first_seen: float = 0.0
-    missing: int = 0
-
-    def reset(self) -> None:
-        self.reads = []
-        self.first_seen = 0.0
-        self.missing = 0
 
 
 def vote(reads: List[_Read]) -> Tuple[Optional[str], float, List[str]]:
@@ -133,30 +129,68 @@ def vote(reads: List[_Read]) -> Tuple[Optional[str], float, List[str]]:
     return winner, support, distinct[:5]
 
 
+@dataclass
+class _Track:
+    """One plate being followed across frames (one vehicle)."""
+    id: int
+    box: Tuple[int, int, int, int]
+    first_seen: float
+    reads: List[_Read] = field(default_factory=list)
+    missing: int = 0
+    emitted: bool = False   # already reported — keep following, don't report again
+
+
+def _match_score(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    """How likely two boxes in consecutive frames are the same plate (0 = no).
+
+    Uses overlap when there is some, otherwise centre distance measured in plate
+    widths, so a car moving several plate-widths between frames still matches.
+    """
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    if inter > 0 and union > 0:
+        return 1.0 + inter / union
+    width = max(ax2 - ax1, bx2 - bx1, 1)
+    dist = (((ax1 + ax2) - (bx1 + bx2)) ** 2 + ((ay1 + ay2) - (by1 + by2)) ** 2) ** 0.5 / 2
+    plates_apart = dist / width
+    return max(0.0, 1.0 - plates_apart / TRACK_MAX_JUMP)
+
+
 class LocalPlateDetector:
-    """Finds and reads number plates; emits one voted detection per vehicle."""
+    """Finds and reads number plates; emits one voted detection per vehicle.
 
-    def __init__(self) -> None:
-        from plate_ocr import PlateFinder, PlateReader
+    Every plate in the frame is followed as its own track, so two cars in view
+    at once are read and voted on separately.
 
-        # 1. Plate finder — custom Ultralytics model if configured, else the free ONNX finder.
+    `finder` / `reader` can be passed in (anything with the PlateFinder /
+    PlateReader interface); by default the installed engines are loaded.
+    """
+
+    def __init__(self, finder=None, reader=None) -> None:
         self._ul_plate = None
         self._ul_plate_ids: List[int] = []
-        self._finder = None
-        if PLATE_MODEL_PATH and os.path.isfile(PLATE_MODEL_PATH):
-            try:
-                from ultralytics import YOLO
-                m = YOLO(PLATE_MODEL_PATH)
-                ids = [i for i, n in (m.names or {}).items() if _PLATE_CLASS_RE.search(str(n))]
-                if ids:
-                    self._ul_plate, self._ul_plate_ids = m, ids
-                    log.info("[DETECTOR] custom plate model: %s", PLATE_MODEL_PATH)
-                else:
-                    log.warning("[DETECTOR] %s has no plate class — ignoring it", PLATE_MODEL_PATH)
-            except Exception as e:
-                log.warning("[DETECTOR] could not load PLATE_MODEL_PATH=%s: %s", PLATE_MODEL_PATH, e)
-        if self._ul_plate is None:
-            self._finder = PlateFinder()
+        self._finder = finder
+        if self._finder is None:
+            # 1. Plate finder — custom Ultralytics model if configured, else the free ONNX finder.
+            if PLATE_MODEL_PATH and os.path.isfile(PLATE_MODEL_PATH):
+                try:
+                    from ultralytics import YOLO
+                    m = YOLO(PLATE_MODEL_PATH)
+                    ids = [i for i, n in (m.names or {}).items() if _PLATE_CLASS_RE.search(str(n))]
+                    if ids:
+                        self._ul_plate, self._ul_plate_ids = m, ids
+                        log.info("[DETECTOR] custom plate model: %s", PLATE_MODEL_PATH)
+                    else:
+                        log.warning("[DETECTOR] %s has no plate class — ignoring it", PLATE_MODEL_PATH)
+                except Exception as e:
+                    log.warning("[DETECTOR] could not load PLATE_MODEL_PATH=%s: %s", PLATE_MODEL_PATH, e)
+            if self._ul_plate is None:
+                from plate_ocr import PlateFinder
+                self._finder = PlateFinder()
 
         # 2. Optional vehicle gate (Ultralytics COCO model).
         self._vehicle_model = None
@@ -169,22 +203,36 @@ class LocalPlateDetector:
                 log.warning("[DETECTOR] vehicle gate unavailable (%s) — continuing without it", e)
 
         # 3. Plate reader(s).
-        self._reader = PlateReader()
-        self._votes: Dict[str, _VoteState] = defaultdict(_VoteState)
+        if reader is None:
+            from plate_ocr import PlateReader
+            reader = PlateReader()
+        self._reader = reader
+        self._tracks: Dict[str, List[_Track]] = defaultdict(list)
+        self._next_track_id = 0
+        self._lock = threading.Lock()  # one frame at a time through the models
         log.info("[DETECTOR] ready: finder=%s reader=%s vote(min_reads=%d agreement=%.2f window=%.0fs)",
-                 "custom-yolo" if self._ul_plate else self._finder.model, self._reader.description,
+                 self.finder_name, getattr(self._reader, "description", type(self._reader).__name__),
                  VOTE_MIN_READS, VOTE_AGREEMENT, CONFIRM_WINDOW_SECONDS)
 
     # ---------- introspection ----------
+    @property
+    def finder_name(self) -> str:
+        if self._ul_plate is not None:
+            return PLATE_MODEL_PATH
+        return getattr(self._finder, "model", type(self._finder).__name__)
+
     def status(self) -> Dict[str, object]:
         return {
-            "plate_finder": PLATE_MODEL_PATH if self._ul_plate else (self._finder.model if self._finder else None),
-            "plate_reader": self._reader.description,
+            "plate_finder": self.finder_name,
+            "plate_reader": getattr(self._reader, "description", type(self._reader).__name__),
             "vehicle_gate": self._vehicle_model is not None,
             "vote_min_reads": VOTE_MIN_READS,
             "vote_agreement": VOTE_AGREEMENT,
             "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
         }
+
+    def active_tracks(self, camera_id: str) -> int:
+        return len(self._tracks.get(camera_id, []))
 
     # ---------- helpers ----------
     @staticmethod
@@ -213,29 +261,25 @@ class LocalPlateDetector:
                 return True, VEHICLE_CLASS_IDS[cid], float(b.conf.item())
         return False, "", 0.0
 
-    def _find_plate(self, frame: np.ndarray) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int], float]]:
-        """Return (plate_crop, (x1,y1,x2,y2), confidence) for the best plate in frame."""
-        if self._finder is not None:
-            boxes = self._finder.find(frame)
-            if not boxes:
-                return None
-            b = boxes[0]
-            return self._finder.crop(frame, b), (b.x1, b.y1, b.x2, b.y2), b.conf
+    def _find_plates(self, frame: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int, int, int], float]]:
+        """Every plate in the frame as (plate_crop, (x1,y1,x2,y2), confidence)."""
+        if self._ul_plate is None:
+            out = []
+            for b in self._finder.find(frame)[:MAX_PLATES_PER_FRAME]:
+                out.append((self._finder.crop(frame, b), (b.x1, b.y1, b.x2, b.y2), b.conf))
+            return out
         res = self._ul_plate.predict(frame, verbose=False, imgsz=640, conf=0.30)
-        best = None
+        H, W = frame.shape[:2]
+        out = []
         for bx in (res[0].boxes if res and res[0].boxes is not None else []):
             if int(bx.cls.item()) not in self._ul_plate_ids:
                 continue
-            c = float(bx.conf.item())
-            if best is None or c > best[1]:
-                best = ([int(v) for v in bx.xyxy[0].tolist()], c)
-        if not best:
-            return None
-        (x1, y1, x2, y2), c = best
-        H, W = frame.shape[:2]
-        px, py = int((x2 - x1) * 0.06), int((y2 - y1) * 0.12)
-        crop = frame[max(0, y1 - py):min(H, y2 + py), max(0, x1 - px):min(W, x2 + px)].copy()
-        return crop, (x1, y1, x2, y2), c
+            x1, y1, x2, y2 = [int(v) for v in bx.xyxy[0].tolist()]
+            px, py = int((x2 - x1) * 0.06), int((y2 - y1) * 0.12)
+            crop = frame[max(0, y1 - py):min(H, y2 + py), max(0, x1 - px):min(W, x2 + px)].copy()
+            out.append((crop, (x1, y1, x2, y2), float(bx.conf.item())))
+        out.sort(key=lambda p: -p[2])
+        return out[:MAX_PLATES_PER_FRAME]
 
     def read_plate(self, plate_bgr: np.ndarray) -> Optional[Tuple[str, float]]:
         """Read one plate crop → (valid_plate, confidence) or None. Used by self-tests."""
@@ -243,11 +287,9 @@ class LocalPlateDetector:
         return (r[0], r[1]) if r else None
 
     # ---------- Frame pipeline ----------
-    def _finalise(self, camera_id: str, reason: str) -> Optional[LocalDetection]:
-        """Vote over the collected reads for this camera and emit a detection."""
-        st = self._votes[camera_id]
-        reads = list(st.reads)
-        st.reset()
+    def _finalise(self, camera_id: str, track: _Track, reason: str) -> Optional[LocalDetection]:
+        """Vote over one track's reads and emit a detection."""
+        reads = list(track.reads)
         if not reads:
             return None
         winner, support, distinct = vote(reads)
@@ -262,8 +304,8 @@ class LocalPlateDetector:
         else:
             confidence = "low"  # → Review queue on the backend
         best = max((r for r in reads if r.plate == winner), key=lambda r: r.conf, default=max(reads, key=lambda r: r.conf))
-        log.info("[DETECTOR] %s plate=%s conf=%s reads=%d support=%.2f mean_ocr=%.2f (%s) candidates=%s",
-                 camera_id, winner, confidence, n, support, mean_conf, reason, distinct)
+        log.info("[DETECTOR] %s track=%d plate=%s conf=%s reads=%d support=%.2f mean_ocr=%.2f (%s) candidates=%s",
+                 camera_id, track.id, winner, confidence, n, support, mean_conf, reason, distinct)
         return LocalDetection(
             plate=winner,
             confidence=confidence,
@@ -274,57 +316,92 @@ class LocalPlateDetector:
             reads=n,
             support=support,
             candidates=distinct,
+            seen_at=track.first_seen,
         )
 
-    async def process_jpeg(self, jpeg: bytes, camera_id: str = "CAM-01") -> Optional[LocalDetection]:
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return None
-        st = self._votes[camera_id]
-        now = time.time()
+    def _assign(self, tracks: List[_Track], boxes: list) -> List[Tuple[Optional[_Track], tuple]]:
+        """Greedy match of this frame's plates to existing tracks (best score first)."""
+        pairs = sorted(((_match_score(t.box, b[1]), ti, bi) for ti, t in enumerate(tracks) for bi, b in enumerate(boxes)),
+                       reverse=True)
+        used_t, used_b, out = set(), set(), []
+        for score, ti, bi in pairs:
+            if score <= 0 or ti in used_t or bi in used_b:
+                continue
+            used_t.add(ti)
+            used_b.add(bi)
+            out.append((tracks[ti], boxes[bi]))
+        out += [(None, b) for bi, b in enumerate(boxes) if bi not in used_b]
+        return out
 
-        # Window expired → finalise whatever we have (sent as low/medium).
-        if st.reads and (now - st.first_seen) > CONFIRM_WINDOW_SECONDS:
-            return self._finalise(camera_id, "window expired")
+    def process_frame(self, frame: np.ndarray, camera_id: str = "CAM-01",
+                      now: Optional[float] = None) -> List[LocalDetection]:
+        """Feed one camera frame; returns the detections that became final with it (usually none).
+
+        Blocking (runs the models) — call it from a worker thread.
+        """
+        if frame is None or frame.size == 0:
+            return []
+        now = time.time() if now is None else now
+        with self._lock:
+            return self._process_locked(frame, camera_id, now)
+
+    def _process_locked(self, frame: np.ndarray, camera_id: str, now: float) -> List[LocalDetection]:
+        tracks = self._tracks[camera_id]
+        out: List[LocalDetection] = []
 
         has_vehicle, vclass, vconf = self._has_vehicle(frame)
-        found = self._find_plate(frame) if has_vehicle else None
-        if not found:
-            if st.reads:
-                st.missing += 1
-                if st.missing >= VEHICLE_GONE_FRAMES:
-                    return self._finalise(camera_id, "vehicle left")
-            return None
-        st.missing = 0
-        plate_crop, (x1, y1, x2, y2), box_conf = found
+        boxes = self._find_plates(frame) if has_vehicle else []
+        matched: set = set()
+        for track, (plate_crop, box, box_conf) in self._assign(tracks, boxes):
+            if track is None:
+                self._next_track_id += 1
+                track = _Track(id=self._next_track_id, box=box, first_seen=now)
+                tracks.append(track)
+            track.box, track.missing = box, 0
+            matched.add(track.id)
+            if track.emitted:
+                continue
+            read = self._reader.read(plate_crop)
+            if not read:
+                continue
+            plate, ocr_conf, note = read
+            x1, y1, x2, y2 = box
+            track.reads.append(_Read(
+                plate=plate,
+                conf=ocr_conf * (0.6 + 0.4 * box_conf),
+                crop=self.encode_jpeg(self._context_crop(frame, x1, y1, x2, y2), quality=78) or b"",
+                plate_crop=self.encode_jpeg(plate_crop, quality=88) or b"",
+                vehicle_class=vclass,
+                vehicle_conf=vconf,
+            ))
+            log.debug("[DETECTOR] cam=%s track=%d read=%s ocr=%.2f box=%.2f via %s (n=%d)",
+                      camera_id, track.id, plate, ocr_conf, box_conf, note, len(track.reads))
+            # Enough agreeing reads → emit now instead of waiting for the car to leave.
+            if len(track.reads) >= VOTE_MIN_READS:
+                winner, support, _ = vote(track.reads)
+                if (winner and support >= 0.8) or len(track.reads) >= VOTE_MIN_READS * 3:
+                    det = self._finalise(camera_id, track, "votes agree" if support >= 0.8 else "max reads")
+                    track.emitted = True
+                    if det:
+                        out.append(det)
 
-        read = self._reader.read(plate_crop)
-        if not read:
-            return None
-        plate, ocr_conf, note = read
+        for track in list(tracks):
+            if track.id not in matched:
+                track.missing += 1
+            gone = track.missing >= VEHICLE_GONE_FRAMES
+            expired = (now - track.first_seen) > CONFIRM_WINDOW_SECONDS and not track.emitted
+            if (gone or expired) and not track.emitted:
+                det = self._finalise(camera_id, track, "vehicle left" if gone else "window expired")
+                if det:
+                    out.append(det)
+                track.emitted = True
+            if gone:
+                tracks.remove(track)
+        return out
 
-        st.reads.append(_Read(
-            plate=plate,
-            conf=ocr_conf * (0.6 + 0.4 * box_conf),
-            crop=self.encode_jpeg(self._context_crop(frame, x1, y1, x2, y2), quality=78) or jpeg,
-            plate_crop=self.encode_jpeg(plate_crop, quality=88) or b"",
-            vehicle_class=vclass,
-            vehicle_conf=vconf,
-        ))
-        if len(st.reads) == 1:
-            st.first_seen = now
-        log.debug("[DETECTOR] cam=%s read=%s ocr=%.2f box=%.2f via %s (n=%d)",
-                  camera_id, plate, ocr_conf, box_conf, note, len(st.reads))
-
-        # Enough agreeing reads → emit now instead of waiting for the window.
-        if len(st.reads) >= VOTE_MIN_READS:
-            winner, support, _ = vote(st.reads)
-            if winner and support >= 0.8:
-                return self._finalise(camera_id, "votes agree")
-            if len(st.reads) >= VOTE_MIN_READS * 3:
-                return self._finalise(camera_id, "max reads")
-        return None
+    def process_jpeg(self, jpeg: bytes, camera_id: str = "CAM-01", now: Optional[float] = None) -> List[LocalDetection]:
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return self.process_frame(frame, camera_id, now) if frame is not None else []
 
 
 _detector: Optional[LocalPlateDetector] = None

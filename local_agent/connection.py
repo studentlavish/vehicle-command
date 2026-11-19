@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import websockets
 
@@ -36,6 +36,14 @@ class CloudConnection:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._send_lock = asyncio.Lock()
         self._attempt = 0
+        # Optional hooks: on_connect() after each (re)connect, on_message(msg)
+        # for server replies such as plate_ack / plate_nack.
+        self.on_connect: Optional[Callable[[], None]] = None
+        self.on_message: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None
 
     def next_backoff(self) -> int:
         step = self._BACKOFF_STEPS[min(self._attempt, len(self._BACKOFF_STEPS) - 1)]
@@ -60,6 +68,8 @@ class CloudConnection:
             self._reset_backoff()
             log.info("[AGENT] Connected to cloud")
             await self._send_raw(hello_payload)
+            if self.on_connect:
+                self.on_connect()
             try:
                 async for raw in ws:
                     # Ignore binary messages from server (none expected)
@@ -80,6 +90,8 @@ class CloudConnection:
                         log.info("[AGENT] registered agent_id=%s", msg.get("agent_id"))
                     elif mtype == "pong":
                         log.debug("[PONG] app-level")
+                    elif mtype in ("plate_ack", "plate_nack") and self.on_message:
+                        self.on_message(msg)
             finally:
                 self._ws = None
                 log.info("[AGENT] Disconnected")

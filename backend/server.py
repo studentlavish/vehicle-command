@@ -2042,6 +2042,7 @@ def _public_agent(d: dict) -> dict:
         "connected_at": d.get("connected_at"),
         "cameras": d.get("cameras", []),
         "has_own_secret": bool(d.get("secret_hash")),
+        "health": d.get("health") or {},
     }
 
 
@@ -2102,6 +2103,46 @@ async def agent_disconnect_http(agent_id: str, user: dict = Depends(require_role
     for cam_id in doc.get("cameras", []):
         camera_manager.mark_agent_offline(cam_id, "agent disconnect requested")
     return {"ok": True}
+
+
+AGENT_EVENT_STALE_SECONDS = 120
+
+
+async def _claim_agent_event(event_id: str) -> Optional[dict]:
+    """Claim an agent event for processing.
+
+    Returns None when this call owns it (go ahead), the stored ack when it was
+    already processed, or {} when another connection is processing it right now.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        await db.processed_events.insert_one({"event_id": event_id, "status": "processing", "at": now})
+        return None
+    except DuplicateKeyError:
+        prev = await db.processed_events.find_one({"event_id": event_id}) or {}
+        if prev.get("status") == "done":
+            return prev.get("ack") or {}
+        started = prev.get("at")
+        if started is not None and started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        if started is None or (now - started).total_seconds() > AGENT_EVENT_STALE_SECONDS:
+            # A previous attempt died mid-way — take it over.
+            await db.processed_events.update_one({"event_id": event_id}, {"$set": {"status": "processing", "at": now}})
+            return None
+        return {}
+
+
+def _agent_seen_at(ts, agent_id: str = "") -> Optional[datetime]:
+    """The agent's 'seen at' time, if plausible (within the last 7 days, not in the future)."""
+    try:
+        t = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    now = datetime.now(timezone.utc)
+    if t > now + timedelta(seconds=120) or t < now - timedelta(days=7):
+        logger.warning("[agent %s] ignoring implausible detection time %s (check the PC clock)", agent_id, t.isoformat())
+        return None
+    return min(t, now)
 
 
 @app.websocket("/api/agent/ws")
@@ -2216,9 +2257,11 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     }})
 
             elif mtype == "heartbeat":
-                if active_agent_id:
-                    await db.agents.update_one({"agent_id": active_agent_id},
-                                               {"$set": {"last_heartbeat": now_utc().isoformat(), "status": "online"}})
+                update = {"last_heartbeat": now_utc().isoformat(), "status": "online"}
+                health = msg.get("health")
+                if isinstance(health, dict) and len(json.dumps(health, default=str)) <= 8192:
+                    update["health"] = health
+                await db.agents.update_one({"agent_id": active_agent_id}, {"$set": update})
 
             elif mtype == "ping":
                 # App-level keep-alive from the agent — reply so the proxy sees traffic
@@ -2252,6 +2295,13 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     except Exception:
                         return b""
                     return data if len(data) <= MAX_AGENT_JPEG_BYTES else b""
+                event_id = str(msg.get("event_id") or "")[:64]
+                if event_id:
+                    prior = await _claim_agent_event(event_id)
+                    if prior is not None:
+                        if prior:  # already processed — the agent missed our ack; answer again
+                            await websocket.send_json(prior)
+                        continue
                 try:
                     persistence = await route_detection(
                         db,
@@ -2263,9 +2313,11 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                         candidates=msg.get("candidates") or [],
                         reads=int(msg.get("reads") or 0),
                         support=float(msg.get("support") or 0),
+                        seen_at=_agent_seen_at(msg.get("ts"), active_agent_id),
                     )
-                    await websocket.send_json({
+                    ack = {
                         "type": "plate_ack",
+                        "event_id": event_id or None,
                         "plate": persistence.get("plate", raw_plate),
                         "queued_for_review": persistence.get("queued_for_review", False),
                         "review_id": persistence.get("review_id"),
@@ -2273,9 +2325,17 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                         "event": persistence.get("event"),
                         "owner_status": persistence.get("owner_status"),
                         "session_id": (persistence.get("session") or {}).get("id"),
-                    })
-                except Exception:
+                    }
+                    if event_id:
+                        await db.processed_events.update_one({"event_id": event_id},
+                                                             {"$set": {"status": "done", "ack": ack}})
+                    await websocket.send_json(ack)
+                except Exception as e:
                     logger.exception("[agent] persistence failed for plate=%s", raw_plate)
+                    if event_id:
+                        await db.processed_events.delete_one({"event_id": event_id, "status": "processing"})
+                        await websocket.send_json({"type": "plate_nack", "event_id": event_id,
+                                                   "message": type(e).__name__})
 
             else:
                 await websocket.send_json({"type": "error", "message": f"unknown type: {mtype}"})

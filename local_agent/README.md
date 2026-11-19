@@ -55,15 +55,44 @@ Runs 7 checks: camera open, frame capture, JPEG encode, cloud WSS, auth, heartbe
 
 RTSP credentials stay only in `.env` on this PC — never sent to the frontend.
 
-## Auto-start on Windows boot (optional)
+## Run as a Windows service (recommended for production)
 
-Task Scheduler → Create Basic Task → Trigger: *At startup* → Action: *Start a program*
-→ Program: `C:\path\to\local_agent\start_agent.bat`.
+Download [NSSM](https://nssm.cc), put `nssm.exe` next to this file, then from an
+**Administrator** command prompt:
 
-## Backend env var
+```bat
+install_service.bat           :: install + start "VashuCameraAgent"
+install_service.bat remove    :: stop + uninstall
+```
 
-The Vashu backend must have `VASHU_AGENT_SECRET` set to the same value as `.env`.
-Requests without a matching secret are rejected with WS close code 4401.
+The service starts at boot and restarts itself 10 s after any crash. Put the PC
+on a UPS and wired Ethernet.
+
+## Agent ID and secret
+
+Register the agent in the dashboard (**Settings → Camera agents → Register
+agent**). Copy the ID and the secret shown once into `.env`
+(`VASHU_AGENT_ID`, `VASHU_AGENT_SECRET`). Unregistered IDs or a wrong secret are
+rejected (WS close code 4401). The credentials are sent in request headers,
+never in the URL.
+
+## No detection is lost
+
+Every plate detection is written to `data/outbox.sqlite3` first and removed
+only when the server confirms it. If the internet or the server is down, the
+agent keeps the detections and sends them, oldest first, when it reconnects —
+with the time the car was actually seen. The server ignores re-sends it has
+already processed, so a car is never recorded twice. The outbox depth is sent in
+every heartbeat (dashboard → Camera agents).
+
+## Detection speed
+
+Detection reads the same frames as the live stream (no second camera
+connection) at up to `DETECTION_FPS` (default 5) frames per second per camera.
+The models run in a background thread, so streaming never stalls; on a slow PC
+the rate drops on its own. While the gate is empty and nothing moves, the models
+are skipped (`MOTION_THRESHOLD`, checked at least every `IDLE_CHECK_SECONDS`).
+Every plate in view is tracked separately, so two cars at once are both read.
 
 ## Live Monitoring flow
 
@@ -74,7 +103,7 @@ architecture change was required beyond adding this outbound path.
 
 ## Logs
 
-`logs/agent.log` — rotates on run. Sensitive fields (RTSP credentials, agent
+`logs/agent.log` — rotates at 5 MB, keeps 5 files. Sensitive fields (RTSP credentials, agent
 secret) are never logged.
 
 ## Troubleshooting

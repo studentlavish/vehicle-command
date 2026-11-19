@@ -458,6 +458,9 @@ async def _persist_entry_locked(
 async def ensure_session_indexes(db) -> None:
     """At most one open visit per plate, enforced by MongoDB itself."""
     await db.camera_config.create_index("camera_id", unique=True)
+    # Agent detections are processed once per event_id (re-sends are answered from here).
+    await db.processed_events.create_index("event_id", unique=True)
+    await db.processed_events.create_index("at", expireAfterSeconds=7 * 24 * 3600)
     try:
         await db.visit_sessions.create_index(
             "vehicle_number", name="one_active_per_plate", unique=True,
@@ -534,9 +537,13 @@ async def route_detection(
     db, *, camera_id: str, raw_plate: str, confidence: str = "medium",
     jpeg_frame: bytes = b"", plate_jpeg: bytes = b"",
     candidates: Optional[list] = None, reads: int = 0, support: float = 0.0,
+    seen_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Single entry point for automatic reads: validate, then save or queue for review."""
-    seen_at = datetime.now(timezone.utc)
+    """Single entry point for automatic reads: validate, then save or queue for review.
+
+    `seen_at` is when the camera saw the car (the agent's timestamp), so a
+    detection delivered late — after a network outage — keeps its real time."""
+    seen_at = seen_at or datetime.now(timezone.utc)
     plate, corrected = plate_rules.correct(raw_plate)
     common = dict(camera_id=camera_id, raw=raw_plate, confidence=confidence, candidates=candidates,
                   jpeg_frame=jpeg_frame, plate_jpeg=plate_jpeg, reads=reads, support=support, seen_at=seen_at)
