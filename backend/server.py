@@ -2286,8 +2286,11 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                 # Local agent ran YOLO+OCR at the edge. Validate the plate and
                 # either save it or put it in the Review queue for a person.
                 cam_id = str(msg.get("camera_id", "")).strip().upper()
-                raw_plate = (msg.get("plate") or "").upper().strip()
-                if not cam_id or not raw_plate:
+                raw_plate = (msg.get("plate") or "").upper().strip()  # "" = vehicle without a readable plate
+                if not cam_id:
+                    if msg.get("event_id"):  # answer, or the agent would re-send it forever
+                        await websocket.send_json({"type": "plate_ack", "event_id": msg["event_id"],
+                                                   "error": "camera_id missing"})
                     continue
                 def _b64_or_empty(v):
                     try:
@@ -2463,9 +2466,131 @@ async def ws_camera(websocket: WebSocket, camera_id: str, token: Optional[str] =
         logger.info("[ws camera %s] client disconnected", camera_id)
 
 
+# ===================== Labelled data (for measuring and retraining OCR) =====================
+async def _save_ocr_label(review: dict, final_plate: Optional[str], user: dict) -> None:
+    """Every human decision on a review is a labelled example: the plate crop + the true text
+    (or None when the reviewer said it isn't a plate). Corrections are the most valuable ones."""
+    try:
+        await db.ocr_labels.insert_one({
+            "id": str(uuid.uuid4()),
+            "review_id": review.get("id"),
+            "kind": review.get("kind", "plate"),
+            "plate": final_plate,
+            "model_plate": review.get("plate"),
+            "raw": review.get("raw", ""),
+            "candidates": review.get("candidates", []),
+            "corrected": bool(final_plate) and final_plate != review.get("plate"),
+            "camera_id": review.get("camera_id", ""),
+            "plate_image": review.get("plate_image", ""),
+            "image": review.get("image", ""),
+            "seen_at": review.get("seen_at"),
+            "labelled_by": user.get("email"),
+            "at": now_utc().isoformat(),
+        })
+    except Exception:
+        logger.exception("[labels] could not save label for review %s", review.get("id"))
+
+
+async def _snapshot_bytes(url: str) -> Optional[bytes]:
+    """Bytes of a /api/snapshots/<file> image from local disk or object storage."""
+    if not url or not url.startswith("/api/snapshots/"):
+        return None
+    name = os.path.basename(url)
+    fp = os.path.join(plate_pipeline.SNAPSHOTS_DIR, name)
+    if os.path.isfile(fp):
+        with open(fp, "rb") as f:
+            return f.read()
+    try:
+        data, _ = await _objstore.get_object_or_none(f"{_objstore.APP_PREFIX}/snapshots/{name}")
+        return data
+    except Exception:
+        return None
+
+
+@api.get("/ocr-labels/stats")
+async def ocr_label_stats(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    total = await db.ocr_labels.count_documents({})
+    corrected = await db.ocr_labels.count_documents({"corrected": True})
+    rejected = await db.ocr_labels.count_documents({"plate": None})
+    return {"total": total, "corrected": corrected, "rejected": rejected, "confirmed": total - corrected - rejected}
+
+
+@api.get("/ocr-labels/export")
+async def export_ocr_labels(only_corrected: bool = False, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """ZIP of plate crops + labels.csv, for benchmark_ocr.py and model fine-tuning."""
+    import zipfile
+    q: Dict[str, Any] = {"plate_image": {"$ne": ""}}
+    if only_corrected:
+        q["corrected"] = True
+    buf = io.BytesIO()
+    rows = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["file", "plate", "model_plate", "raw", "corrected", "kind", "camera_id", "seen_at"])
+        async for d in db.ocr_labels.find(q, {"_id": 0}).sort("at", 1):
+            data = await _snapshot_bytes(d.get("plate_image", ""))
+            if not data:
+                continue
+            truth = d.get("plate") or "NOTAPLATE"
+            fname = f"images/{truth}_{d['id'][:8]}.jpg"  # benchmark_ocr.py reads the plate from the file name
+            z.writestr(fname, data)
+            w.writerow([fname, d.get("plate") or "", d.get("model_plate") or "", d.get("raw", ""),
+                        int(bool(d.get("corrected"))), d.get("kind", "plate"), d.get("camera_id", ""), d.get("seen_at", "")])
+            rows += 1
+        z.writestr("labels.csv", out.getvalue())
+    await security.audit(db, user, "ocr_labels.export", "", rows=rows, only_corrected=only_corrected)
+    stamp = now_utc().strftime("%Y%m%d")
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="plate-labels-{stamp}.zip"'})
+
+
+# ===================== Known plates (demo, test-drive, trade, staff) =====================
+class KnownPlateIn(BaseModel):
+    plate: str
+    label: Optional[str] = ""
+    kind: Literal["demo", "test_drive", "trade", "staff", "other"] = "other"
+
+
+@api.get("/known-plates")
+async def list_known_plates(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    return await db.known_plates.find({}, {"_id": 0}).sort("plate", 1).to_list(2000)
+
+
+@api.post("/known-plates")
+async def add_known_plate(payload: KnownPlateIn, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """Vehicles the showroom owns or expects. Exact reads of these are trusted more; trade /
+    temporary plates listed here are accepted even though they don't follow the standard format."""
+    fixed, _ = plate_rules.correct(payload.plate)
+    plate = fixed or plate_rules.clean(payload.plate)
+    if not 4 <= len(plate) <= 12:
+        raise HTTPException(status_code=400, detail="Enter the plate as written (4–12 letters/digits)")
+    doc = {"plate": plate, "label": payload.label or "", "kind": payload.kind, "standard": bool(fixed),
+           "created_at": now_utc().isoformat(), "created_by": user.get("email")}
+    try:
+        await db.known_plates.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="That plate is already on the list")
+    await security.audit(db, user, "known_plate.add", plate, kind=payload.kind)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.delete("/known-plates/{plate}")
+async def delete_known_plate(plate: str, user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    p = plate_rules.clean(plate)
+    r = await db.known_plates.delete_one({"plate": p})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not on the list")
+    await security.audit(db, user, "known_plate.delete", p)
+    return {"ok": True}
+
+
 # ===================== Plate review queue =====================
 class ReviewAcceptIn(BaseModel):
     plate: str
+    # Trade / temporary / foreign plates that don't follow the Indian format.
+    nonstandard: bool = False
 
 
 def _review_public(doc: dict) -> dict:
@@ -2494,9 +2619,15 @@ async def accept_plate_review(rid: str, payload: ReviewAcceptIn, user: dict = De
         raise HTTPException(status_code=404, detail="Review not found")
     if review.get("status") != "pending":
         raise HTTPException(status_code=409, detail=f"Already {review.get('status')}")
-    plate, _ = plate_rules.correct(payload.plate)
-    if not plate:
-        raise HTTPException(status_code=400, detail="That isn't a valid Indian number plate (e.g. KA05MG9999 or 22BH1234AA)")
+    if payload.nonstandard:
+        plate = plate_rules.clean(payload.plate)
+        if not 4 <= len(plate) <= 12:
+            raise HTTPException(status_code=400, detail="Enter the plate as written (4–12 letters/digits)")
+    else:
+        plate, _ = plate_rules.correct(payload.plate)
+        if not plate:
+            raise HTTPException(status_code=400, detail="That isn't a valid Indian number plate (e.g. KA05MG9999 or 22BH1234AA). "
+                                                        "For trade or temporary plates tick 'Non-standard plate'.")
     # Claim the review first so two people can't accept it twice.
     claimed = await db.plate_reviews.update_one({"id": rid, "status": "pending"}, {"$set": {"status": "processing"}})
     if claimed.modified_count == 0:
@@ -2518,6 +2649,7 @@ async def accept_plate_review(rid: str, payload: ReviewAcceptIn, user: dict = De
             await db.visit_sessions.update_one({"id": sess["id"]}, {"$set": img_updates})
     await security.audit(db, user, "review.accept", rid, plate=plate, original=review.get("plate"),
                          event=result.get("event"), duplicate=result.get("duplicate", False))
+    await _save_ocr_label(review, plate, user)
     await db.plate_reviews.update_one({"id": rid}, {"$set": {
         "status": "accepted", "final_plate": plate, "result_event": result.get("event"),
         "duplicate": result.get("duplicate", False),
@@ -2535,6 +2667,8 @@ async def reject_plate_review(rid: str, user: dict = Depends(require_roles(*ROLE
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Pending review not found")
     await security.audit(db, user, "review.reject", rid)
+    review = await db.plate_reviews.find_one({"id": rid}) or {}
+    await _save_ocr_label(review, None, user)
     return {"ok": True}
 
 
@@ -2651,6 +2785,8 @@ async def ensure_indexes():
     await db.visit_sessions.create_index([("vehicle_number", 1), ("entry_time", -1)])
     await db.plate_reviews.create_index([("status", 1), ("created_at", -1)])
     await db.plate_reviews.create_index("id", unique=True)
+    await db.known_plates.create_index("plate", unique=True)
+    await db.ocr_labels.create_index([("at", 1)])
 
 
 @app.on_event("startup")

@@ -54,6 +54,9 @@ MAX_PLATES_PER_FRAME = int(os.environ.get("MAX_PLATES_PER_FRAME", "4"))
 # How far (in plate widths) a plate may move between two processed frames and
 # still count as the same vehicle.
 TRACK_MAX_JUMP = float(os.environ.get("TRACK_MAX_JUMP", "4"))
+# With VEHICLE_GATE on: a vehicle in view this many processed frames without any
+# plate is reported once as "no plate" (new / unregistered / covered plate).
+NO_PLATE_FRAMES = int(os.environ.get("NO_PLATE_FRAMES", "10"))
 
 _HERE = os.path.dirname(__file__)
 _default_plate_path = os.path.join(_HERE, "best.pt")
@@ -167,10 +170,11 @@ class LocalPlateDetector:
     at once are read and voted on separately.
 
     `finder` / `reader` can be passed in (anything with the PlateFinder /
-    PlateReader interface); by default the installed engines are loaded.
+    PlateReader interface), and `vehicle_detect` (frame -> (found, class, conf));
+    by default the installed engines are loaded.
     """
 
-    def __init__(self, finder=None, reader=None) -> None:
+    def __init__(self, finder=None, reader=None, vehicle_detect=None) -> None:
         self._ul_plate = None
         self._ul_plate_ids: List[int] = []
         self._finder = finder
@@ -193,11 +197,20 @@ class LocalPlateDetector:
                 self._finder = PlateFinder()
 
         # 2. Optional vehicle gate (Ultralytics COCO model).
-        self._vehicle_model = None
-        if VEHICLE_GATE:
+        self._vehicle_detect = vehicle_detect
+        if self._vehicle_detect is None and VEHICLE_GATE:
             try:
                 from ultralytics import YOLO
-                self._vehicle_model = YOLO(VEHICLE_MODEL_PATH)
+                model = YOLO(VEHICLE_MODEL_PATH)
+
+                def _detect(frame: np.ndarray) -> Tuple[bool, str, float]:
+                    r = model.predict(frame, verbose=False, imgsz=640, conf=0.35)
+                    for b in (r[0].boxes if r and r[0].boxes is not None else []):
+                        cid = int(b.cls.item())
+                        if cid in VEHICLE_CLASS_IDS:
+                            return True, VEHICLE_CLASS_IDS[cid], float(b.conf.item())
+                    return False, "", 0.0
+                self._vehicle_detect = _detect
                 log.info("[DETECTOR] vehicle gate on: %s", VEHICLE_MODEL_PATH)
             except Exception as e:
                 log.warning("[DETECTOR] vehicle gate unavailable (%s) — continuing without it", e)
@@ -208,6 +221,7 @@ class LocalPlateDetector:
             reader = PlateReader()
         self._reader = reader
         self._tracks: Dict[str, List[_Track]] = defaultdict(list)
+        self._no_plate: Dict[str, Dict[str, object]] = defaultdict(lambda: {"frames": 0, "reported": False})
         self._next_track_id = 0
         self._lock = threading.Lock()  # one frame at a time through the models
         log.info("[DETECTOR] ready: finder=%s reader=%s vote(min_reads=%d agreement=%.2f window=%.0fs)",
@@ -225,7 +239,7 @@ class LocalPlateDetector:
         return {
             "plate_finder": self.finder_name,
             "plate_reader": getattr(self._reader, "description", type(self._reader).__name__),
-            "vehicle_gate": self._vehicle_model is not None,
+            "vehicle_gate": self._vehicle_detect is not None,
             "vote_min_reads": VOTE_MIN_READS,
             "vote_agreement": VOTE_AGREEMENT,
             "confirm_window_seconds": CONFIRM_WINDOW_SECONDS,
@@ -252,14 +266,9 @@ class LocalPlateDetector:
         return frame[max(0, cy - hh * 2 // 3):min(H, cy + hh // 3 + h), max(0, cx - hw):min(W, cx + hw)]
 
     def _has_vehicle(self, frame: np.ndarray) -> Tuple[bool, str, float]:
-        if self._vehicle_model is None:
+        if self._vehicle_detect is None:
             return True, "vehicle", 1.0
-        r = self._vehicle_model.predict(frame, verbose=False, imgsz=640, conf=0.35)
-        for b in (r[0].boxes if r and r[0].boxes is not None else []):
-            cid = int(b.cls.item())
-            if cid in VEHICLE_CLASS_IDS:
-                return True, VEHICLE_CLASS_IDS[cid], float(b.conf.item())
-        return False, "", 0.0
+        return self._vehicle_detect(frame)
 
     def _find_plates(self, frame: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int, int, int], float]]:
         """Every plate in the frame as (plate_crop, (x1,y1,x2,y2), confidence)."""
@@ -385,6 +394,8 @@ class LocalPlateDetector:
                     if det:
                         out.append(det)
 
+        out += self._no_plate_check(camera_id, frame, has_vehicle, bool(boxes), vclass, vconf, now)
+
         for track in list(tracks):
             if track.id not in matched:
                 track.missing += 1
@@ -398,6 +409,27 @@ class LocalPlateDetector:
             if gone:
                 tracks.remove(track)
         return out
+
+    def _no_plate_check(self, camera_id: str, frame: np.ndarray, has_vehicle: bool, any_plate: bool,
+                        vclass: str, vconf: float, now: float) -> List[LocalDetection]:
+        """Report a vehicle that stays in view without a readable plate — only with the vehicle gate."""
+        if self._vehicle_detect is None:
+            return []
+        st = self._no_plate[camera_id]
+        if not has_vehicle:
+            st["frames"], st["reported"] = 0, False
+            return []
+        if any_plate or self._tracks.get(camera_id):
+            st["frames"] = 0
+            return []
+        st["frames"] = int(st["frames"]) + 1
+        if st["reported"] or st["frames"] < NO_PLATE_FRAMES:
+            return []
+        st["reported"] = True
+        log.info("[DETECTOR] %s %s in view for %d frames without a readable plate", camera_id, vclass, st["frames"])
+        return [LocalDetection(plate="", confidence="none", crop_jpeg=self.encode_jpeg(frame, quality=78) or b"",
+                               plate_jpeg=b"", vehicle_class=vclass, vehicle_conf=vconf, reads=0, support=0.0,
+                               candidates=[], seen_at=now)]
 
     def process_jpeg(self, jpeg: bytes, camera_id: str = "CAM-01", now: Optional[float] = None) -> List[LocalDetection]:
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)

@@ -277,9 +277,10 @@ _PRIMARY_FIRST = {"awiros": ["awiros", "fastplate", "easyocr"], "fastplate": ["f
 class PlateReader:
     """Loads the best available OCR engine(s) and reads plate crops."""
 
-    def __init__(self, engine: str = OCR_ENGINE, ensemble: bool = OCR_ENSEMBLE) -> None:
-        order = _AUTO_ORDER if engine == "auto" else _PRIMARY_FIRST.get(engine, [engine])
-        self.engines = []
+    def __init__(self, engine: str = OCR_ENGINE, ensemble: bool = OCR_ENSEMBLE, engines=None) -> None:
+        """`engines`: ready engine objects (primary first) instead of loading the installed ones."""
+        order = [] if engines is not None else (_AUTO_ORDER if engine == "auto" else _PRIMARY_FIRST.get(engine, [engine]))
+        self.engines = list(engines or [])[: 2 if ensemble else 1]
         for key in order:
             try:
                 self.engines.append(_ENGINE_CLASSES[key]())
@@ -302,14 +303,14 @@ class PlateReader:
         if plate_bgr is None or plate_bgr.size == 0:
             return None
         first = self._safe(self.primary, plate_bgr)
-        plate1 = plate_rules.correct(first.text)[0] if first else None
+        plate1 = self._fixed(first)
         if plate1 and (not self.checker or first.conf >= OCR_SURE):
             return plate1, first.conf, first.engine          # confident & valid — no need to ask again
         if not self.checker:
             return None
 
         second = self._safe(self.checker, plate_bgr)
-        plate2 = plate_rules.correct(second.text)[0] if second else None
+        plate2 = self._fixed(second)
         if plate1 and plate2 and plate1 == plate2:
             # Two independent models agree — strongest evidence we can get offline.
             return plate1, min(1.0, max(first.conf, second.conf) * 0.6 + 0.4), f"{first.engine}+{second.engine} agree"
@@ -324,6 +325,16 @@ class PlateReader:
         if plate2:
             return plate2, second.conf * 0.7, second.engine
         return None
+
+    @staticmethod
+    def _fixed(read: Optional[OcrRead]) -> Optional[str]:
+        """Valid plate from a raw read; look-alike fixes lower read.conf (risky ones a lot)."""
+        if not read:
+            return None
+        plate, factor = plate_rules.correction_factor(read.text)
+        if plate:
+            read.conf *= factor
+        return plate
 
     @staticmethod
     def _safe(engine, img) -> Optional[OcrRead]:

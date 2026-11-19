@@ -119,7 +119,7 @@ async def _detect_camera(spec: CameraSpec, frames: FrameBuffer, detector, delive
                     cam_health["last_detect_ms"] = int((time.time() - t0) * 1000)
                     for det in dets:
                         now = time.time()
-                        last = recent.get(det.plate)
+                        last = recent.get(det.plate) if det.plate else None  # "" = no-plate vehicle
                         if last and (now - last) < repeat_window:
                             log.info("[DETECTOR] %s suppressed repeat plate=%s (%.0fs ago)", spec.id, det.plate, now - last)
                             continue

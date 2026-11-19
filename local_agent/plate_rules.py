@@ -19,6 +19,13 @@ position in an Indian plate is either *always a letter* or *always a digit*,
 we can correct those confusions by position — but only when the corrected
 string then passes full validation. Nothing is "guessed": if a string can't
 be made valid, it's rejected.
+
+Not all swaps are equally safe. O/0, I/1, Z/2, S/5, B/8, G/6 are classic
+look-alikes; A/4, T/7, D/0, U/0, J/1, L/1, Q/0 and 3/B are much more often a
+genuinely different character. `correct_detail` reports how many characters
+were changed (and how many of those were risky) so callers can lower their
+confidence — a plate that only became valid through risky swaps should be
+checked by a person rather than saved automatically.
 """
 from __future__ import annotations
 
@@ -36,6 +43,14 @@ STATE_CODES = {
 _TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "U": "0", "I": "1", "L": "1", "J": "1", "T": "7",
              "Z": "2", "S": "5", "B": "8", "G": "6", "A": "4"}
 _TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G", "4": "A", "7": "T", "3": "B"}
+
+# Swaps that are frequently a *different* character, not an OCR look-alike.
+RISKY_SWAPS = {("A", "4"), ("4", "A"), ("T", "7"), ("7", "T"), ("D", "0"), ("U", "0"), ("J", "1"),
+               ("L", "1"), ("Q", "0"), ("3", "B")}
+# Confidence multipliers per change (see correction_factor).
+SAFE_SWAP_FACTOR = 0.93
+RISKY_SWAP_FACTOR = 0.7
+TRIM_FACTOR = 0.9
 
 _STANDARD_RE = re.compile(r"^([A-Z]{2})(\d{1,2})([A-Z]{0,3})(\d{4})$")
 _BH_RE = re.compile(r"^(\d{2})BH(\d{4})([A-Z]{2})$")
@@ -135,6 +150,34 @@ def correct(raw: Optional[str]) -> Tuple[Optional[str], bool]:
             if fixed:
                 return fixed, fixed != s
     return None, False
+
+
+def correct_detail(raw: Optional[str]) -> Tuple[Optional[str], int, int, int]:
+    """Like correct(), but returns (plate, swaps, risky_swaps, trimmed_chars)."""
+    s = clean(raw)
+    plate, _ = correct(s)
+    if not plate:
+        return None, 0, 0, 0
+    if plate == s:
+        return plate, 0, 0, 0
+    # correct() only trims the IND prefix or one character at either end, then
+    # swaps characters in place — find which variant of the input it used.
+    for trimmed, source in ((0, s), (3, s[3:] if s.startswith("IND") else None), (1, s[1:]), (1, s[:-1])):
+        if source is not None and len(source) == len(plate):
+            pairs = [(a, b) for a, b in zip(source, plate) if a != b]
+            if all(_TO_DIGIT.get(a) == b or _TO_LETTER.get(a) == b for a, b in pairs):
+                risky = sum(1 for p in pairs if p in RISKY_SWAPS)
+                return plate, len(pairs), risky, trimmed
+    return plate, 0, 0, 0
+
+
+def correction_factor(raw: Optional[str]) -> Tuple[Optional[str], float]:
+    """(valid_plate, confidence multiplier ≤ 1) — 1.0 when the read needed no fixing."""
+    plate, swaps, risky, trimmed = correct_detail(raw)
+    if not plate:
+        return None, 0.0
+    factor = (SAFE_SWAP_FACTOR ** (swaps - risky)) * (RISKY_SWAP_FACTOR ** risky) * (TRIM_FACTOR if trimmed else 1.0)
+    return plate, round(factor, 4)
 
 
 def extract(text: Optional[str]) -> Tuple[Optional[str], bool]:

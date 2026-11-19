@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
-import api, { assetUrl, errorMessage } from "@/lib/api";
+import api, { assetUrl, downloadBlob, errorMessage } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -10,7 +11,7 @@ import VehiclePlate from "@/components/common/VehiclePlate";
 import { EmptyState, ErrorState } from "@/components/common/EmptyState";
 import useLiveEvents from "@/hooks/useLiveEvents";
 import { toast } from "sonner";
-import { ScanEye, Check, X, Camera, Clock, AlertTriangle, Loader2, ImageOff, CheckCheck } from "lucide-react";
+import { ScanEye, Check, X, Camera, Clock, AlertTriangle, Loader2, ImageOff, CheckCheck, Download } from "lucide-react";
 import { formatDateTime, relativeAgo } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
@@ -19,6 +20,8 @@ const CONF_TONE = { high: "success", medium: "warning", low: "danger", confirmed
 function ReviewCard({ review, onDone }) {
   const [plate, setPlate] = useState(review.plate || review.candidates?.[0] || "");
   const [busy, setBusy] = useState(null);
+  const [nonstandard, setNonstandard] = useState(false);
+  const noPlate = review.kind === "no_plate";
   const options = Array.from(new Set([...(review.suggestions || []), review.plate, ...(review.candidates || [])].filter(Boolean)));
 
   const accept = async (e) => {
@@ -26,7 +29,7 @@ function ReviewCard({ review, onDone }) {
     if (!plate.trim()) return;
     setBusy("accept");
     try {
-      const { data } = await api.post(`/plate-reviews/${review.id}/accept`, { plate: plate.trim() });
+      const { data } = await api.post(`/plate-reviews/${review.id}/accept`, { plate: plate.trim(), nonstandard });
       if (data.duplicate) toast.info(`${data.plate} confirmed`, { description: data.duplicate_reason || "Already recorded — no new entry created." });
       else toast.success(`${data.plate} — ${data.event === "exit" ? "exit" : "entry"} recorded`);
       onDone(review.id);
@@ -68,7 +71,9 @@ function ReviewCard({ review, onDone }) {
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span className="inline-flex items-center gap-1 font-mono"><Camera className="h-3.5 w-3.5" />{review.camera_id || "—"}</span>
             <span className="inline-flex items-center gap-1" title={formatDateTime(review.seen_at)}><Clock className="h-3.5 w-3.5" />{relativeAgo(review.seen_at)}</span>
-            <StatusBadge tone={CONF_TONE[review.confidence] || "neutral"}>{review.confidence || "unknown"} confidence</StatusBadge>
+            {noPlate
+              ? <StatusBadge tone="warning">No readable plate</StatusBadge>
+              : <StatusBadge tone={CONF_TONE[review.confidence] || "neutral"}>{review.confidence || "unknown"} confidence</StatusBadge>}
             {review.reads ? <span>{review.reads} read{review.reads === 1 ? "" : "s"}</span> : null}
           </div>
 
@@ -78,7 +83,9 @@ function ReviewCard({ review, onDone }) {
           </div>
 
           <div>
-            <label className="field-label">Number plate — check against the photo</label>
+            <label className="field-label">
+              {noPlate ? "Type the plate if you can see one (or the trade / temporary number)" : "Number plate — check against the photo"}
+            </label>
             <Input
               value={plate}
               onChange={(e) => setPlate(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
@@ -103,6 +110,10 @@ function ReviewCard({ review, onDone }) {
                 ))}
               </div>
             )}
+            <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={nonstandard} onChange={(e) => setNonstandard(e.target.checked)} className="h-3.5 w-3.5 accent-primary" />
+              Non-standard plate (trade, temporary or foreign) — save exactly as typed
+            </label>
           </div>
 
           <div className="mt-auto flex gap-2">
@@ -110,7 +121,7 @@ function ReviewCard({ review, onDone }) {
               {busy === "accept" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Confirm
             </Button>
             <Button type="button" variant="outline" onClick={reject} disabled={!!busy} data-testid="review-reject">
-              {busy === "reject" ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />} Not a plate
+              {busy === "reject" ? <Loader2 className="h-4 w-4 animate-spin" /> : <X className="h-4 w-4" />} {noPlate ? "Not a vehicle" : "Not a plate"}
             </Button>
           </div>
         </div>
@@ -145,7 +156,33 @@ function ResolvedTable({ rows }) {
   );
 }
 
+function ExportLabels() {
+  const [stats, setStats] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.get("/ocr-labels/stats").then(({ data }) => setStats(data)).catch(() => setStats(null));
+  }, []);
+  const download = async () => {
+    setBusy(true);
+    try {
+      const res = await api.get("/ocr-labels/export", { responseType: "blob" });
+      downloadBlob(res, `plate-labels-${new Date().toISOString().slice(0, 10)}.zip`);
+    } catch (err) {
+      toast.error("Export failed", { description: errorMessage(err) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Button variant="outline" onClick={download} disabled={busy || !stats?.total} title="Plate crops with the confirmed text — for measuring and retraining the reader">
+      {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+      Export training data{stats ? ` (${stats.total})` : ""}
+    </Button>
+  );
+}
+
 export default function Reviews() {
+  const { user } = useAuth();
   const [tab, setTab] = useState("pending");
   const [rows, setRows] = useState(null);
   const [error, setError] = useState(false);
@@ -180,12 +217,15 @@ export default function Reviews() {
         title="Plate review"
         description="Reads the system wasn't sure about. Check each one against the photo, correct it if needed, then confirm."
         actions={
-          <Tabs value={tab} onValueChange={setTab}>
-            <TabsList>
-              <TabsTrigger value="pending">Needs review{tab === "pending" && rows ? ` (${rows.length})` : ""}</TabsTrigger>
-              <TabsTrigger value="resolved">Resolved</TabsTrigger>
-            </TabsList>
-          </Tabs>
+          <div className="flex flex-wrap items-center gap-2">
+            {user?.role === "admin" && <ExportLabels />}
+            <Tabs value={tab} onValueChange={setTab}>
+              <TabsList>
+                <TabsTrigger value="pending">Needs review{tab === "pending" && rows ? ` (${rows.length})` : ""}</TabsTrigger>
+                <TabsTrigger value="resolved">Resolved</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </div>
         }
       />
 

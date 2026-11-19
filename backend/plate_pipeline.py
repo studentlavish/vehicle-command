@@ -484,7 +484,10 @@ async def long_open_sessions(db, hours: float) -> list:
 # ===================== Detection routing + Review queue =====================
 
 async def _known_plate(db, plate: str) -> bool:
+    """A vehicle we already trust: currently inside, on the known-plates list, or with a named owner."""
     if await db.visit_sessions.find_one({"vehicle_number": plate, "status": "active"}, {"_id": 1}):
+        return True
+    if await db.known_plates.find_one({"plate": plate}, {"_id": 1}):
         return True
     m = await db.vehicle_masters.find_one({"vehicle_number": plate}, {"owner_name": 1})
     return bool(m and (m.get("owner_name") or "Unknown Owner") != "Unknown Owner")
@@ -504,14 +507,17 @@ async def create_review(
     db, *, camera_id: str, plate: Optional[str], raw: str, confidence: str, reason: str,
     candidates: Optional[list] = None, suggestions: Optional[list] = None,
     jpeg_frame: bytes = b"", plate_jpeg: bytes = b"", reads: int = 0, support: float = 0.0,
-    seen_at: Optional[datetime] = None,
+    seen_at: Optional[datetime] = None, kind: str = "plate",
 ) -> Dict[str, Any]:
-    """Queue an uncertain read for a person to confirm, correct or reject."""
+    """Queue an uncertain read for a person to confirm, correct or reject.
+
+    kind: "plate" (an uncertain read) or "no_plate" (a vehicle without a readable plate)."""
     seen_at = seen_at or datetime.now(timezone.utc)
     label = plate or plate_rules.clean(raw) or "UNKNOWN"
     doc = {
         "id": str(uuid.uuid4()),
         "status": "pending",
+        "kind": kind,
         "camera_id": camera_id,
         "plate": plate,
         "raw": raw,
@@ -544,9 +550,26 @@ async def route_detection(
     `seen_at` is when the camera saw the car (the agent's timestamp), so a
     detection delivered late — after a network outage — keeps its real time."""
     seen_at = seen_at or datetime.now(timezone.utc)
-    plate, corrected = plate_rules.correct(raw_plate)
     common = dict(camera_id=camera_id, raw=raw_plate, confidence=confidence, candidates=candidates,
                   jpeg_frame=jpeg_frame, plate_jpeg=plate_jpeg, reads=reads, support=support, seen_at=seen_at)
+
+    if not plate_rules.clean(raw_plate):
+        review = await create_review(db, plate=None, kind="no_plate",
+                                     reason="Vehicle seen without a readable number plate (new, unregistered or covered)",
+                                     **common)
+        return {"queued_for_review": True, "review_id": review["id"]}
+
+    plate, swaps, risky, _ = plate_rules.correct_detail(raw_plate)
+    corrected = swaps > 0
+    if risky and confidence == "high":
+        # Only valid after a risky look-alike swap (A→4, T→7 …) — don't trust it fully.
+        confidence = "medium"
+        common["confidence"] = confidence
+    if not plate:
+        # Trade / temporary plates don't follow the standard format; accept them if registered.
+        cleaned = plate_rules.clean(raw_plate)
+        if await db.known_plates.find_one({"plate": cleaned}, {"_id": 1}):
+            plate = cleaned
 
     if not plate:
         review = await create_review(db, plate=None, reason="Doesn't match an Indian number-plate format", **common)
