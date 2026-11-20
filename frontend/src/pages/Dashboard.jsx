@@ -6,6 +6,7 @@ import StatCard from "@/components/StatCard";
 import VehicleDetailsDialog from "@/components/VehicleDetailsDialog";
 import AgentHealthCard from "@/components/AgentHealthCard";
 import LongOpenCard from "@/components/LongOpenCard";
+import TestDrivesCard from "@/components/TestDrivesCard";
 import LiveOccupancyChart from "@/components/LiveOccupancyChart";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
@@ -267,7 +268,10 @@ export default function Dashboard() {
             <AgentHealthCard />
           </div>
 
-          <LongOpenCard />
+          <div className="grid gap-6 lg:grid-cols-2">
+            <TestDrivesCard />
+            <LongOpenCard />
+          </div>
         </>
       )}
 

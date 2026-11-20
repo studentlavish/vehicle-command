@@ -11,7 +11,7 @@ import hmac
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -23,6 +23,10 @@ META_WABA_ID = os.environ.get("META_WABA_ID", "")
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 META_GRAPH_VERSION = os.environ.get("META_GRAPH_VERSION") or "v26.0"
+# Optional approved template for the daily digest: DOCUMENT header (the PDF) + 4 body
+# variables {{1}} date, {{2}} entries, {{3}} exits, {{4}} unique vehicles.
+META_DIGEST_TEMPLATE = os.environ.get("META_DIGEST_TEMPLATE", "").strip()
+META_DIGEST_TEMPLATE_LANG = os.environ.get("META_DIGEST_TEMPLATE_LANG", "en").strip() or "en"
 
 # Statuses worth a single automatic retry (transient Meta-side failures).
 _RETRYABLE = frozenset({429, 500, 502, 503, 504})
@@ -58,16 +62,73 @@ async def send_text(db, to: str, body: str, by: str = "system", context: str = "
     without persisting the access token. Retries once on transient 429/5xx.
     Raises WhatsAppMetaError on final failure.
     """
+    payload = {"type": "text", "text": {"preview_url": False, "body": body}}
+    return await _send_message(db, to, payload, log_body=body, by=by, context=context)
+
+
+async def send_document(db, to: str, media_id: str, filename: str, caption: str = "",
+                        by: str = "system", context: str = "manual") -> Dict[str, Any]:
+    """Send an uploaded document (see upload_media). Free-form, so it is only delivered inside
+    the 24-hour window after the recipient last messaged the business number."""
+    doc: Dict[str, Any] = {"id": media_id, "filename": filename}
+    if caption:
+        doc["caption"] = caption[:1024]
+    return await _send_message(db, to, {"type": "document", "document": doc},
+                               log_body=f"[document] {filename}", by=by, context=context)
+
+
+async def send_template(db, to: str, name: str, language: str = "en", body_params: Optional[List[str]] = None,
+                        header_document: Optional[Dict[str, str]] = None,
+                        by: str = "system", context: str = "manual") -> Dict[str, Any]:
+    """Send an approved message template — the only kind Meta delivers outside the 24-hour window.
+
+    `header_document` = {"id": media_id, "filename": ...} for templates whose header is a DOCUMENT."""
+    components: List[Dict[str, Any]] = []
+    if header_document:
+        components.append({"type": "header", "parameters": [{"type": "document", "document": header_document}]})
+    if body_params:
+        components.append({"type": "body", "parameters": [{"type": "text", "text": str(v)} for v in body_params]})
+    tpl: Dict[str, Any] = {"name": name, "language": {"code": language}}
+    if components:
+        tpl["components"] = components
+    return await _send_message(db, to, {"type": "template", "template": tpl},
+                               log_body=f"[template {name}] " + " | ".join(str(v) for v in body_params or []),
+                               by=by, context=context)
+
+
+async def upload_media(data: bytes, mime_type: str, filename: str) -> str:
+    """Upload a file to Meta and return its media id (valid for 30 days)."""
+    url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    last: Optional[Exception] = None
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, headers=headers,
+                                         data={"messaging_product": "whatsapp", "type": mime_type},
+                                         files={"file": (filename, data, mime_type)})
+        except httpx.HTTPError as e:
+            last = e
+            continue
+        if resp.status_code in _RETRYABLE and attempt == 1:
+            continue
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if resp.is_error or not body.get("id"):
+            err = (_sanitize_meta_response(body).get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+            raise WhatsAppMetaError(f"Meta media upload failed ({resp.status_code}): {err}")
+        return str(body["id"])
+    raise WhatsAppMetaError(f"Meta media upload failed: {type(last).__name__ if last else 'retry exhausted'}")
+
+
+async def _send_message(db, to: str, message: Dict[str, Any], *, log_body: str, by: str, context: str) -> Dict[str, Any]:
     # Auth travels in the header only — the URL contains no secret material.
     url = f"https://graph.facebook.com/{META_GRAPH_VERSION}/{META_PHONE_NUMBER_ID}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to,
-        "type": "text",
-        "text": {"preview_url": False, "body": body},
-    }
+    payload = {"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **message}
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    body = log_body
 
     last_net_error: Optional[Exception] = None
     for attempt in (1, 2):

@@ -19,6 +19,7 @@ Commands run on the server from `vehicle-command/deploy/` unless noted.
 | **Snapshot disk almost full** | `df -h` on the server | Use `STORAGE_BACKEND=s3`, or grow the disk |
 | **Last database backup failed / No backup for …** | `docker compose logs backend \| grep backup` | Fix the bucket credentials or space. It runs again the next night; to run it now set `WEBHOOK_CRON_SECRET` in `backend.env` and `curl -X POST https://<DOMAIN>/api/cron/backup -H "Authorization: Bearer <secret>"` |
 | **… cars recorded inside for a long time** | Dashboard → Long-open visits | If the car really left, its exit was missed: close the visit from Vehicle Records. If it happens often, check the exit camera |
+| **Test drive … has been out for … min** | Dashboard → Test drives (shows who is driving) | Call the driver. The limit is `TEST_DRIVE_MAX_MINUTES` (default 60). Tag demo cars as *Test drive* under Cameras → Known plates |
 
 ## Restart things
 
@@ -78,6 +79,7 @@ Showroom PC (Administrator prompt): `nssm restart VashuCameraAgent`.
 
 See docs/accuracy.md:
 
+0. Check Analytics → *Reader accuracy by camera*: a camera whose line drops, or whose correction share rises, needs its lens cleaned or angle checked first.
 1. Export training data.
 2. Run the benchmark.
 3. Fine-tune if there are enough new corrections.

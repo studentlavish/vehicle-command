@@ -9,7 +9,7 @@ const TONES = {
   sky: { tile: "bg-info/10 text-info", stroke: colors.info },
   green: { tile: "bg-success/10 text-success", stroke: colors.success },
   amber: { tile: "bg-warning/10 text-warning", stroke: colors.warning },
-  violet: { tile: "bg-violet-50 text-violet-600", stroke: colors.violet },
+  violet: { tile: "bg-violet-50 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300", stroke: colors.violet },
 };
 
 export default function StatCard({ label, value, change, trend, icon: Icon, accent = "blue", testId, compareLabel = "vs yesterday" }) {

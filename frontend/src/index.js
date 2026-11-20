@@ -14,6 +14,13 @@ const queryClient = new QueryClient({
 });
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
+// Installable app (PWA) — production builds only, so development never serves stale bundles.
+if (process.env.NODE_ENV === "production" && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register(`${process.env.PUBLIC_URL || ""}/sw.js`).catch(() => {});
+  });
+}
+
 root.render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>

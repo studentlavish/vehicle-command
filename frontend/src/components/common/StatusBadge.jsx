@@ -7,7 +7,7 @@ const TONES = {
   danger: "bg-destructive/10 text-destructive border-destructive/20",
   info: "bg-info/10 text-info border-info/20",
   primary: "bg-primary/10 text-primary border-primary/20",
-  violet: "bg-violet-50 text-violet-700 border-violet-200",
+  violet: "bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-500/15 dark:text-violet-300 dark:border-violet-500/30",
   neutral: "bg-muted text-muted-foreground border-border",
 };
 

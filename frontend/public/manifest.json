@@ -1,0 +1,23 @@
+{
+  "name": "Vashu Hyundai — Vehicle Management",
+  "short_name": "Vashu Gate",
+  "description": "Showroom gate log: live cameras, number plate recognition and plate review.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F5F7FA",
+  "theme_color": "#2563EB",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Plate review — gate view", "short_name": "Gate view", "url": "/reviews?view=gate",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Live monitoring", "short_name": "Live", "url": "/live",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

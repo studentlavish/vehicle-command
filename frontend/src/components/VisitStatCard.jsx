@@ -5,7 +5,7 @@ const TONES = {
   blue: "bg-primary/10 text-primary",
   sky: "bg-info/10 text-info",
   emerald: "bg-success/10 text-success",
-  violet: "bg-violet-50 text-violet-600",
+  violet: "bg-violet-50 text-violet-600 dark:bg-violet-500/15 dark:text-violet-300",
   amber: "bg-warning/10 text-warning",
 };
 
