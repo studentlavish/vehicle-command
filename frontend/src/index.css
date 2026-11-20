@@ -56,7 +56,63 @@
     --chart-4: 35 92% 50%;
     --chart-5: 262 83% 58%;
 
+    /* Categorical series (per-camera lines). Fixed order; validated with the dataviz
+       palette validator for CVD separation + contrast on the card surface. Status
+       colours (success/warning/destructive) are never used as series. */
+    --series-1: #2563EB;
+    --series-2: #C2410C;
+    --series-3: #7C3AED;
+    --series-4: #0891B2;
+
     --radius: 0.75rem;
+    color-scheme: light;
+  }
+
+  /* Dark theme — same token names, so every component switches with no extra classes.
+     Toggled by next-themes adding `class="dark"` to <html> (see components/ThemeToggle.jsx). */
+  .dark {
+    --background: 222 47% 6%;         /* #080D1A */
+    --foreground: 210 40% 96%;
+    --card: 222 41% 9%;               /* #0E1424 */
+    --card-foreground: 210 40% 96%;
+    --popover: 222 39% 11%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 217 91% 60%;           /* #3B82F6 — a touch brighter for contrast on dark */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 217 33% 15%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 217 33% 14%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 45% 18%;
+    --accent-foreground: 213 94% 82%;
+
+    --success: 142 64% 45%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 52%;
+    --warning-foreground: 0 0% 100%;
+    --destructive: 0 78% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --info: 199 89% 55%;
+    --info-foreground: 0 0% 100%;
+
+    --border: 217 30% 18%;
+    --input: 217 30% 22%;
+    --ring: 217 91% 60%;
+
+    --sidebar: 222 44% 8%;
+    --sidebar-border: 217 30% 15%;
+
+    --chart-1: 217 91% 60%;
+    --chart-2: 199 89% 55%;
+    --chart-3: 142 64% 45%;
+    --chart-4: 38 92% 55%;
+    --chart-5: 262 83% 68%;
+    --series-1: #3B82F6;
+    --series-2: #EA580C;
+    --series-3: #8B5CF6;
+    --series-4: #0891B2;
+    color-scheme: dark;
   }
 }
 
@@ -100,9 +156,9 @@
     @apply text-[11px] font-semibold uppercase tracking-wider text-muted-foreground;
   }
 
-  /* Indian number-plate chip */
+  /* Indian number-plate chip — stays white in dark mode, like the real plate */
   .plate {
-    @apply inline-flex items-center rounded-md border border-slate-300 bg-white px-2 py-0.5 font-mono text-[13px] font-semibold tracking-wider text-slate-900 shadow-sm;
+    @apply inline-flex items-center rounded-md border border-slate-300 bg-white px-2 py-0.5 font-mono text-[13px] font-semibold tracking-wider text-slate-900 shadow-sm dark:border-slate-500;
   }
 
   /* Data tables */

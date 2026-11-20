@@ -1,30 +1,47 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/context/AuthContext";
+import { I18nProvider } from "@/lib/i18n";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
-import LiveMonitoring from "@/pages/LiveMonitoring";
-import VehicleRecords from "@/pages/VehicleRecords";
-import EntryHistory from "@/pages/EntryHistory";
-import ExitHistory from "@/pages/ExitHistory";
-import Reports from "@/pages/Reports";
-import Analytics from "@/pages/Analytics";
-import SettingsPage from "@/pages/Settings";
-import CamerasPage from "@/pages/Cameras";
-import UsersPage from "@/pages/Users";
-import VehicleDetail from "@/pages/VehicleDetail";
-import SearchResults from "@/pages/SearchResults";
-import NotFound from "@/pages/NotFound";
-import Reviews from "@/pages/Reviews";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Toaster } from "@/components/ui/sonner";
 import "@/App.css";
+
+// Login and the dashboard ship in the main bundle (nearly every visit needs them);
+// every other page — and heavy libraries like the Recharts-based Analytics — load on demand.
+const LiveMonitoring = lazy(() => import("@/pages/LiveMonitoring"));
+const VehicleRecords = lazy(() => import("@/pages/VehicleRecords"));
+const EntryHistory = lazy(() => import("@/pages/EntryHistory"));
+const ExitHistory = lazy(() => import("@/pages/ExitHistory"));
+const Reports = lazy(() => import("@/pages/Reports"));
+const Analytics = lazy(() => import("@/pages/Analytics"));
+const SettingsPage = lazy(() => import("@/pages/Settings"));
+const CamerasPage = lazy(() => import("@/pages/Cameras"));
+const UsersPage = lazy(() => import("@/pages/Users"));
+const VehicleDetail = lazy(() => import("@/pages/VehicleDetail"));
+const SearchResults = lazy(() => import("@/pages/SearchResults"));
+const NotFound = lazy(() => import("@/pages/NotFound"));
+const Reviews = lazy(() => import("@/pages/Reviews"));
+
+function PageFallback() {
+  return (
+    <div className="space-y-6" data-testid="page-loading">
+      <Skeleton className="h-10 w-64" />
+      <Skeleton className="h-64 w-full rounded-xl" />
+    </div>
+  );
+}
 
 function Guarded({ children }) {
   return (
     <ProtectedRoute>
-      <Layout>{children}</Layout>
+      <Layout>
+        <Suspense fallback={<PageFallback />}>{children}</Suspense>
+      </Layout>
     </ProtectedRoute>
   );
 }
@@ -42,7 +59,7 @@ function AppRouter() {
       <Route path="/reports" element={<Guarded><Reports /></Guarded>} />
       <Route path="/analytics" element={<Guarded><Analytics /></Guarded>} />
       <Route path="/cameras" element={<Guarded><CamerasPage /></Guarded>} />
-      <Route path="/settings"element={<Guarded><SettingsPage /></Guarded>} />
+      <Route path="/settings" element={<Guarded><SettingsPage /></Guarded>} />
       <Route path="/users" element={<Guarded><UsersPage /></Guarded>} />
       <Route path="/search" element={<Guarded><SearchResults /></Guarded>} />
       <Route path="/vehicle/:vehicleNumber" element={<Guarded><VehicleDetail /></Guarded>} />
@@ -53,11 +70,15 @@ function AppRouter() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <AppRouter />
-      </BrowserRouter>
-      <Toaster richColors closeButton position="top-right" />
-    </AuthProvider>
+    <ThemeProvider attribute="class" defaultTheme="system" enableSystem storageKey="vc-theme" disableTransitionOnChange>
+      <I18nProvider>
+        <AuthProvider>
+          <BrowserRouter>
+            <AppRouter />
+          </BrowserRouter>
+          <Toaster richColors closeButton position="top-right" />
+        </AuthProvider>
+      </I18nProvider>
+    </ThemeProvider>
   );
 }

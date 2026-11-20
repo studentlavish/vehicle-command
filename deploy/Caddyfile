@@ -21,6 +21,9 @@
 		@assets path /static/*
 		header @assets Cache-Control "public, max-age=31536000, immutable"
 		header /index.html Cache-Control "no-cache"
+		# Installable app: browsers must re-check the service worker and manifest on every visit.
+		header /sw.js Cache-Control "no-cache"
+		header /manifest.json Cache-Control "no-cache"
 		try_files {path} /index.html
 		file_server
 	}

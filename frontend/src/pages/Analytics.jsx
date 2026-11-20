@@ -9,6 +9,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
 import VisitStatCard from "@/components/VisitStatCard";
+import AnalyticsInsights from "@/components/AnalyticsInsights";
 import { ErrorState, EmptyState } from "@/components/common/EmptyState";
 import { CardSkeleton } from "@/components/common/Loaders";
 import { BarChart3, Clock, TrendingUp, TrendingDown, Activity, PieChart as PieIcon, LineChart as LineIcon } from "lucide-react";
@@ -147,6 +148,8 @@ export default function Analytics() {
           <CompareBars data={data.monthly} height={260} />
         </SectionCard>
       </div>
+
+      <AnalyticsInsights />
     </div>
   );
 }

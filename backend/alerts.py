@@ -10,6 +10,7 @@ Rules (thresholds via env):
     storage_low      the snapshot disk is below SNAPSHOT_MIN_FREE_MB
     backup_failed    the last backup failed, or none succeeded in BACKUP_MAX_AGE_HOURS (36)
     long_open        cars recorded inside for longer than MAX_VISIT_HOURS
+    test_drive_overdue  a test-drive car has been out longer than TEST_DRIVE_MAX_MINUTES (60)
 
 Each alert is stored in `alerts` and notified when it starts firing, again every
 ALERT_REPEAT_HOURS (6) while it keeps firing, and once when it resolves.
@@ -73,8 +74,10 @@ def _ago(seconds: float) -> str:
 
 
 async def evaluate(db, now: datetime, *, cameras: Dict[str, Dict[str, Any]], disk: Dict[str, Any],
-                   started_at: datetime, backups_enabled: bool, long_open: List[dict]) -> List[Finding]:
-    """Current problems. `cameras` is camera_manager.list(); `disk` is snapshot_disk_stats()."""
+                   started_at: datetime, backups_enabled: bool, long_open: List[dict],
+                   test_drives_out: Optional[List[dict]] = None) -> List[Finding]:
+    """Current problems. `cameras` is camera_manager.list(); `disk` is snapshot_disk_stats();
+    `test_drives_out` is test_drives.current_status()["out"]."""
     out: List[Finding] = []
     warm = (now - started_at).total_seconds() >= STARTUP_GRACE_SECONDS  # let agents reconnect after a restart
 
@@ -140,6 +143,14 @@ async def evaluate(db, now: datetime, *, cameras: Dict[str, Dict[str, Any]], dis
         out.append(Finding("long_open", "long_open", "warning",
                            f"{len(long_open)} car{'s' if len(long_open) != 1 else ''} recorded inside for a long time "
                            f"(missed exit?): {plates}"))
+
+    for t in test_drives_out or []:
+        if not t.get("overdue"):
+            continue
+        who = f" with {t['driver']}" if t.get("driver") else ""
+        out.append(Finding(f"test_drive_overdue:{t['plate']}", "test_drive_overdue", "warning",
+                           f"Test drive {t['plate']}{(' (' + t['label'] + ')') if t.get('label') else ''} "
+                           f"has been out for {t['minutes_out']} min{who}"))
     return out
 
 

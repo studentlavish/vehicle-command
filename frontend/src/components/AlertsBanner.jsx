@@ -5,7 +5,7 @@ import { AlertOctagon, AlertTriangle } from "lucide-react";
 import { relativeAgo } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
-/** Problems the system has detected (camera offline, backup failed …) — shown on every page. */
+/** Problems the system has detected (camera offline, backup failed …) — shown on Live monitoring and Cameras (see Layout). */
 export default function AlertsBanner() {
   const [firing, setFiring] = useState([]);
 

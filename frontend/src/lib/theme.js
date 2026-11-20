@@ -1,6 +1,8 @@
 /**
  * JS mirror of the design tokens in index.css — for libraries (Recharts,
- * canvas, inline SVG) that need literal colour strings.
+ * inline SVG) that need colour strings. Neutral colours point at the CSS
+ * variables so charts follow the light / dark theme automatically; brand and
+ * status colours are literal (they read well on both backgrounds).
  */
 export const colors = {
   primary: "#2563EB",
@@ -10,10 +12,10 @@ export const colors = {
   warning: "#D97706",
   danger: "#DC2626",
   violet: "#7C3AED",
-  text: "#0F172A",
-  muted: "#64748B",
-  grid: "#E2E8F0",
-  surface: "#FFFFFF",
+  text: "hsl(var(--foreground))",
+  muted: "hsl(var(--muted-foreground))",
+  grid: "hsl(var(--border))",
+  surface: "hsl(var(--popover))",
 };
 
 export const chartPalette = [colors.primary, colors.info, colors.success, colors.warning, colors.violet];
@@ -21,7 +23,7 @@ export const chartPalette = [colors.primary, colors.info, colors.success, colors
 /** Shared Recharts styling so every chart looks the same. */
 export const chartTheme = {
   grid: { stroke: colors.grid, strokeDasharray: "3 3", vertical: false },
-  axis: { stroke: colors.muted, fontSize: 12, tickLine: false, axisLine: false },
+  axis: { stroke: colors.muted, fontSize: 12, tickLine: false, axisLine: false, tick: { fill: colors.muted } },
   tooltip: {
     contentStyle: {
       background: colors.surface,
@@ -32,7 +34,8 @@ export const chartTheme = {
       fontSize: 12,
     },
     labelStyle: { color: colors.muted, fontWeight: 500, marginBottom: 4 },
-    cursor: { fill: "rgba(37,99,235,0.06)" },
+    itemStyle: { color: colors.text },
+    cursor: { fill: "hsl(var(--primary) / 0.06)" },
   },
   legend: { wrapperStyle: { fontSize: 12, color: colors.muted, paddingTop: 8 } },
 };

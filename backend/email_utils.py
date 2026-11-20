@@ -14,6 +14,7 @@ userinfo, and link text must match the real host (G3).
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import logging
 import os
@@ -120,9 +121,17 @@ def _assert_safe_email(subject: str, html: str) -> None:
                 raise ValueError(f"Anchor text {m.group(1)!r} != real link host {real!r} (G3)")
 
 
-async def send_email(*, to: str, subject: str, html: str, reply_to: str | None = None) -> str | None:
+def supports_attachments() -> bool:
+    """Resend and SMTP can carry files and inline (cid:) images; the legacy Emergent sender can't."""
+    return provider() in ("resend", "smtp")
+
+
+async def send_email(*, to: str, subject: str, html: str, reply_to: str | None = None,
+                     attachments: list[dict] | None = None) -> str | None:
     """Send one transactional email. Returns the provider message id (or None).
 
+    `attachments`: [{"filename", "content": bytes, "content_type", "cid"?}] — with a `cid` the file
+    is an inline image the HTML shows as <img src="cid:...">. Ignored when not supports_attachments().
     Raises RuntimeError when email is not configured and on hard failures.
     """
     p = provider()
@@ -130,10 +139,11 @@ async def send_email(*, to: str, subject: str, html: str, reply_to: str | None =
         raise RuntimeError("Email is not configured (set EMAIL_PROVIDER)")
     _assert_safe_email(subject, html)
     reply = reply_to or EMAIL_REPLY_TO
+    files = attachments or []
     if p == "resend":
-        return await _send_resend(to, subject, html, reply)
+        return await _send_resend(to, subject, html, reply, files)
     if p == "smtp":
-        return await asyncio.to_thread(_send_smtp, to, subject, html, reply)
+        return await asyncio.to_thread(_send_smtp, to, subject, html, reply, files)
     return await _send_emergent(to, subject, html, reply)
 
 
@@ -150,18 +160,23 @@ async def _post_json(url: str, headers: dict, payload: dict) -> dict:
     return resp.json()
 
 
-async def _send_resend(to: str, subject: str, html: str, reply: str | None) -> str | None:
+async def _send_resend(to: str, subject: str, html: str, reply: str | None, files: list[dict] = ()) -> str | None:
     key = os.environ.get("RESEND_API_KEY", "").strip()
     if not key:
         raise RuntimeError("RESEND_API_KEY is not set")
     payload = {"from": _from_header(), "to": [to], "subject": subject, "html": html}
     if reply:
         payload["reply_to"] = reply
+    if files:
+        payload["attachments"] = [
+            {"filename": f["filename"], "content": base64.b64encode(f["content"]).decode("ascii"),
+             **({"content_id": f["cid"]} if f.get("cid") else {})}
+            for f in files]
     data = await _post_json(RESEND_URL, {"Authorization": f"Bearer {key}"}, payload)
     return data.get("id")
 
 
-def _send_smtp(to: str, subject: str, html: str, reply: str | None) -> str | None:
+def _send_smtp(to: str, subject: str, html: str, reply: str | None, files: list[dict] = ()) -> str | None:
     host = os.environ.get("SMTP_HOST", "").strip()
     if not host:
         raise RuntimeError("SMTP_HOST is not set")
@@ -176,6 +191,14 @@ def _send_smtp(to: str, subject: str, html: str, reply: str | None) -> str | Non
         msg["Reply-To"] = reply
     msg.set_content("This message needs an HTML-capable email client.")
     msg.add_alternative(html, subtype="html")
+    html_part = msg.get_payload()[-1]
+    for f in files:
+        maintype, _, subtype = (f.get("content_type") or "application/octet-stream").partition("/")
+        if f.get("cid"):
+            html_part.add_related(f["content"], maintype=maintype, subtype=subtype, cid=f"<{f['cid']}>",
+                                  filename=f["filename"])
+        else:
+            msg.add_attachment(f["content"], maintype=maintype, subtype=subtype, filename=f["filename"])
     cls = smtplib.SMTP_SSL if mode == "ssl" else smtplib.SMTP
     with cls(host, port, timeout=30) as smtp:
         if mode == "starttls":
