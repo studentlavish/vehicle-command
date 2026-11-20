@@ -35,7 +35,7 @@ Wi-Fi.
 - **Angle:** at most 30° sideways and 30° downward. Flatter angles distort the
   characters.
 - **One direction per camera.** The entry camera faces cars coming in, the exit
-  camera faces cars going out. Set the roles in **Settings → Cameras**.
+  camera faces cars going out. Set the roles on the **Cameras** page.
 - **Avoid:** pointing into the sun at opening or closing times, reflective
   walls behind the plate, and trees or flags in the view (they trigger motion
   constantly).
@@ -52,18 +52,15 @@ Wi-Fi.
 - Turn off the camera's own on-screen text in the plate area (time stamps,
   names).
 
-In the agent's `.env` (per camera in `AGENT_CAMERAS_JSON`):
-
-```json
-[{"id": "GATE-IN",  "name": "Entry lane", "source": "rtsp://user:pass@192.168.1.21:554/Streaming/Channels/101",
-  "width": 1920, "height": 1080, "fps": 10, "roi": [0.15, 0.35, 0.85, 1.0]},
- {"id": "GATE-OUT", "name": "Exit lane",  "source": "rtsp://user:pass@192.168.1.22:554/Streaming/Channels/101",
-  "width": 1920, "height": 1080, "fps": 10, "roi": [0.15, 0.35, 0.85, 1.0]}]
-```
+Add each camera on the portal's Cameras page (e.g. `GATE-IN` →
+`rtsp://user:pass@192.168.1.21:554/Streaming/Channels/101`, `GATE-OUT` → `…22…`)
+and switch on **Use for records** for the showroom PC's agent. Capture size and
+rate come from the agent's `.env` (`FRAME_WIDTH=1920`, `FRAME_HEIGHT=1080`, `AGENT_FPS=10`).
 
 `roi` is the part of the picture searched for plates, as fractions of the width
 and height (x1, y1, x2, y2). Limit it to the lane, so parked cars and the road
-behind are ignored.
+behind are ignored. There is no dashboard field for it yet; set it on the camera's
+`camera_config` document, e.g. `{"roi": [0.15, 0.35, 0.85, 1.0]}`.
 
 ## Check each camera before the shadow run
 

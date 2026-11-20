@@ -1,9 +1,10 @@
 """Vashu Local Camera Agent — Windows edition.
 
-Runs on the showroom PC. Reads one or many local cameras (USB, HTTP MJPEG,
-RTSP), pushes JPEG frames outbound over a single WSS connection to the Vashu
-cloud backend and — with ENABLE_LOCAL_DETECTION=true — reads number plates
-locally and delivers each detection through a durable outbox (see outbox.py).
+Runs on the showroom PC. Keeps one outbound WSS connection to the Vashu
+backend. The cameras it reads plates from are the portal cameras with
+"Use for records" switched on for this agent (sent by the server while they
+are online). With ENABLE_LOCAL_DETECTION=true it reads number plates locally
+and delivers each detection through a durable outbox (see outbox.py).
 """
 from __future__ import annotations
 
@@ -17,11 +18,11 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 from config import AgentConfig, CameraSpec
 from camera import CameraCapture
-from connection import CloudConnection, pack_binary_frame
+from connection import CloudConnection
 from edge import Delivery, FrameBuffer, MotionGate, crop_roi
 from outbox import Outbox
 
@@ -52,12 +53,12 @@ def setup_logging() -> None:
             log.warning("SENTRY_DSN is set but sentry-sdk is not installed")
 
 
-async def _stream_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyncio.Event,
-                         frames: FrameBuffer) -> None:
-    """Capture → shared FrameBuffer (for detection) → JPEG → cloud (live view)."""
+async def _capture_camera(spec: CameraSpec, stop_evt: asyncio.Event, frames: FrameBuffer) -> None:
+    """Capture → shared FrameBuffer for detection. The portal keeps its own live view of
+    this camera, so nothing is streamed back (and no camera_status is sent — that would
+    make the backend hand the camera over to the agent)."""
     cam = CameraCapture(spec.source, width=spec.width, height=spec.height, target_fps=spec.fps)
     interval = 1.0 / max(1, spec.fps)
-    seq = 0
     last_status: Optional[str] = None
     try:
         while not stop_evt.is_set():
@@ -68,27 +69,14 @@ async def _stream_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
             except Exception as e:
                 log.warning("[CAMERA] %s grab error: %s", spec.id, e)
 
-            now = time.time()
             if frame is not None:
-                frames.put(spec.id, frame, now)
+                frames.put(spec.id, frame, time.time())
                 if last_status != "online":
                     log.info("[CAMERA] %s online", spec.id)
-                    await conn.safe_send({"type": "camera_status", "camera_id": spec.id,
-                                          "name": spec.name, "status": "online"})
                     last_status = "online"
-                if conn.connected:
-                    jpeg = await asyncio.to_thread(CameraCapture.encode, frame, spec.jpeg_quality)
-                    if jpeg:
-                        seq += 1
-                        header = {"type": "frame", "camera_id": spec.id, "name": spec.name, "seq": seq, "ts": now}
-                        await conn.safe_send_binary(pack_binary_frame(header, jpeg))
-                        if seq % (spec.fps * 30 or 1) == 0:
-                            log.info("[STREAM] %s frames=%d bytes=%d fps=%.1f", spec.id, seq, len(jpeg), frames.fps(spec.id))
             else:
                 if last_status != "offline":
-                    log.warning("[CAMERA] %s offline", spec.id)
-                    await conn.safe_send({"type": "camera_status", "camera_id": spec.id, "name": spec.name,
-                                          "status": "offline", "error": "capture failed"})
+                    log.warning("[CAMERA] %s offline (capture failed) — retrying", spec.id)
                     last_status = "offline"
                 await asyncio.sleep(1.0)
 
@@ -96,7 +84,73 @@ async def _stream_camera(spec: CameraSpec, conn: CloudConnection, stop_evt: asyn
             if delay > 0:
                 await asyncio.sleep(delay)
     finally:
-        cam.release()
+        await asyncio.to_thread(cam.release)
+
+
+class CameraSupervisor:
+    """Runs capture + detection for the cameras the portal assigns to this agent.
+
+    The server sends the full list on every (re)connect and whenever it changes
+    (toggle switched, camera went online/offline). Cameras keep running while the
+    agent is disconnected; detections wait in the outbox.
+    """
+
+    def __init__(self, cfg: AgentConfig, frames: FrameBuffer, detector, delivery: Delivery,
+                 health: dict, stop_evt: asyncio.Event) -> None:
+        self.cfg, self.frames, self.detector, self.delivery = cfg, frames, detector, delivery
+        self.health, self.stop_evt = health, stop_evt
+        self._running: Dict[str, Tuple[CameraSpec, asyncio.Event, List[asyncio.Task]]] = {}
+
+    @property
+    def camera_ids(self) -> List[str]:
+        return sorted(self._running)
+
+    def apply(self, items: list) -> None:
+        wanted: Dict[str, CameraSpec] = {}
+        for it in items:
+            try:
+                spec = self.cfg.camera_spec(it)
+            except Exception as e:
+                log.warning("[CAMERAS] ignoring bad assignment %r: %s", {k: v for k, v in it.items() if k != "source"}, e)
+                continue
+            wanted[spec.id] = spec
+        for cid in list(self._running):
+            spec = self._running[cid][0]
+            new = wanted.get(cid)
+            if new is None or (new.source, new.roi) != (spec.source, spec.roi):
+                self._stop(cid)
+        for cid, spec in wanted.items():
+            if cid in self._running:
+                self._running[cid] = (spec, *self._running[cid][1:])  # name change only
+            else:
+                self._start(spec)
+        log.info("[CAMERAS] using %d camera(s) from the portal: %s", len(self._running),
+                 ", ".join(self.camera_ids) or "none")
+
+    def _start(self, spec: CameraSpec) -> None:
+        cam_stop = asyncio.Event()
+        log.info("[CAMERAS] start %s (%s) source=%s @ %dx%d/%dfps roi=%s", spec.id, spec.name, _redact(spec.source),
+                 spec.width, spec.height, spec.fps, spec.roi or "full frame")
+        tasks = [
+            asyncio.create_task(_capture_camera(spec, cam_stop, self.frames)),
+            asyncio.create_task(_detect_camera(spec, self.frames, self.detector, self.delivery, cam_stop,
+                                               self.cfg.detection_fps, self.health)),
+        ]
+        self._running[spec.id] = (spec, cam_stop, tasks)
+
+    def _stop(self, camera_id: str) -> None:
+        _, cam_stop, _tasks = self._running.pop(camera_id)
+        cam_stop.set()  # loops finish their current step and release the camera
+        self.frames.drop(camera_id)
+        self.health.get("cameras", {}).pop(camera_id, None)
+        log.info("[CAMERAS] stop %s", camera_id)
+
+    async def run_until_stopped(self) -> None:
+        await self.stop_evt.wait()
+        for cid in list(self._running):
+            tasks = self._running[cid][2]
+            self._stop(cid)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _detect_camera(spec: CameraSpec, frames: FrameBuffer, detector, delivery: Delivery,
@@ -170,20 +224,13 @@ async def _heartbeat_loop(conn: CloudConnection, stop_evt: asyncio.Event, health
 
 
 async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
-    log.info("[AGENT] starting version=%s agent_id=%s host=%s cameras=%d local_detection=%s",
-             AGENT_VERSION, cfg.agent_id, socket.gethostname(), len(cfg.cameras),
-             "ON" if cfg.enable_local_detection else "off")
-    for c in cfg.cameras:
-        log.info("[AGENT]  · %s (%s) source=%s @ %dx%d/%dfps q%d roi=%s",
-                 c.id, c.name, _redact(c.source), c.width, c.height, c.fps, c.jpeg_quality, c.roi or "full frame")
+    log.info("[AGENT] starting version=%s agent_id=%s host=%s local_detection=%s",
+             AGENT_VERSION, cfg.agent_id, socket.gethostname(), "ON" if cfg.enable_local_detection else "off")
 
     conn = CloudConnection(cfg.ws_url, cfg.agent_id, cfg.agent_secret)
 
     if test_mode:
-        # Test with first camera only
-        first = cfg.cameras[0]
-        cam = CameraCapture(first.source, width=first.width, height=first.height, target_fps=first.fps)
-        return await _test_mode(cfg, first, cam, conn)
+        return await _test_mode(cfg, conn)
 
     stop_evt = asyncio.Event()
     frames = FrameBuffer()
@@ -191,6 +238,7 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
 
     detector = None
     delivery: Optional[Delivery] = None
+    supervisor: Optional[CameraSupervisor] = None
     if cfg.enable_local_detection:
         try:
             from plate_detector import get_detector
@@ -201,9 +249,18 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
             delivery = Delivery(Outbox(cfg.outbox_path))
             conn.on_message = delivery.handle
             conn.on_connect = delivery.on_reconnect
-            pending = delivery.outbox.depth()
-            log.info("[DETECTOR] local detection ENABLED on %d camera(s) at up to %.1f fps; outbox=%s (%d pending)",
-                     len(cfg.cameras), cfg.detection_fps, cfg.outbox_path, pending)
+            supervisor = CameraSupervisor(cfg, frames, detector, delivery, health, stop_evt)
+            conn.on_assignments = supervisor.apply
+            log.info("[DETECTOR] local detection ENABLED at up to %.1f fps per camera; outbox=%s (%d pending)",
+                     cfg.detection_fps, cfg.outbox_path, delivery.outbox.depth())
+            log.info("[CAMERAS] waiting for camera assignments from the portal "
+                     "(Cameras page → \"Use for records\")")
+    if supervisor is None:
+        def _ignore(cams: list) -> None:
+            if cams:
+                log.warning("[CAMERAS] portal assigned %d camera(s) but local detection is off — "
+                            "set ENABLE_LOCAL_DETECTION=true", len(cams))
+        conn.on_assignments = _ignore
 
     async def connection_loop():
         while not stop_evt.is_set():
@@ -224,11 +281,8 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
             await asyncio.sleep(wait)
 
     tasks = [connection_loop(), _heartbeat_loop(conn, stop_evt, health, delivery, detector)]
-    tasks += [_stream_camera(spec, conn, stop_evt, frames) for spec in cfg.cameras]
-    if detector is not None and delivery is not None:
-        tasks += [_detect_camera(spec, frames, detector, delivery, stop_evt, cfg.detection_fps, health)
-                  for spec in cfg.cameras]
-        tasks.append(_deliver_loop(conn, delivery, stop_evt))
+    if supervisor is not None and delivery is not None:
+        tasks += [supervisor.run_until_stopped(), _deliver_loop(conn, delivery, stop_evt)]
 
     try:
         await asyncio.gather(*tasks)
@@ -243,42 +297,15 @@ async def run(cfg: AgentConfig, test_mode: bool = False) -> int:
     return 0
 
 
-async def _test_mode(cfg: AgentConfig, spec: CameraSpec, cam: CameraCapture, conn: CloudConnection) -> int:
+async def _test_mode(cfg: AgentConfig, conn: CloudConnection) -> int:
+    """Check the cloud connection. Cameras come from the portal, so they are checked there."""
     ok = True
-
-    print("[TEST] 1. Camera connectivity ...", end=" ")
-    if cam.probe():
-        print("PASS")
-    else:
-        print("FAIL"); ok = False
-
-    print("[TEST] 2. Frame capture ...", end=" ")
-    f = cam.grab_jpeg(spec.jpeg_quality)
-    if f:
-        print(f"PASS ({len(f)} bytes)")
-    else:
-        print("FAIL"); ok = False
-
-    print("[TEST] 3. JPEG encoding ...", end=" ")
-    print("PASS" if f and f[:3] == b"\xff\xd8\xff" else "FAIL")
-    if not (f and f[:3] == b"\xff\xd8\xff"):
-        ok = False
-
-    print("[TEST] 4-6. Cloud WSS + auth + heartbeat ...", end=" ")
+    print("[TEST] Cloud WSS + auth + heartbeat ...", end=" ")
     try:
         await conn.probe(agent_id=cfg.agent_id)
         print("PASS")
     except Exception as e:
         print(f"FAIL ({e})"); ok = False
-
-    print("[TEST] 7. Frame transmission ...", end=" ")
-    try:
-        await conn.probe_send_frame(spec.id, spec.name, f or b"\xff\xd8\xff\x00")
-        print("PASS")
-    except Exception as e:
-        print(f"FAIL ({e})"); ok = False
-
-    cam.release()
     await conn.close()
     print("\nRESULT:", "ALL PASS" if ok else "FAILED — see logs above")
     return 0 if ok else 1

@@ -24,10 +24,12 @@ Edit `.env` and set at minimum:
 VASHU_AGENT_WS_URL=wss://vehicle-command-17.emergent.host/api/agent/ws
 VASHU_AGENT_ID=showroom-pc-01
 VASHU_AGENT_SECRET=<the secret set on the cloud backend>
-CAMERA_ID=CAM-01
-CAMERA_NAME=Phone Camera
-CAMERA_SOURCE=http://10.94.184.228:8080/video
 ```
+
+Cameras are not set in `.env`. Add them on the portal's **Cameras** page
+(Add camera → camera URL), then switch on **Use for records** and pick this
+agent. The agent starts reading plates from a camera while the portal shows it
+online, and stops when it goes offline or the switch is turned off.
 
 ## Start
 
@@ -70,7 +72,7 @@ on a UPS and wired Ethernet.
 
 ## Agent ID and secret
 
-Register the agent in the dashboard (**Settings → Camera agents → Register
+Register the agent in the dashboard (**Cameras → Camera agents → Register
 agent**). Copy the ID and the secret shown once into `.env`
 (`VASHU_AGENT_ID`, `VASHU_AGENT_SECRET`). Unregistered IDs or a wrong secret are
 rejected (WS close code 4401). The credentials are sent in request headers,
@@ -111,7 +113,8 @@ secret) are never logged.
 | Symptom                                | Fix                                                              |
 |----------------------------------------|------------------------------------------------------------------|
 | `unauthorized` on connect              | `VASHU_AGENT_SECRET` mismatch — check both sides                 |
-| Camera not opening                     | Verify `CAMERA_SOURCE` in a browser / VLC first                  |
+| Camera not opening                     | Verify the camera URL (Cameras page) in a browser / VLC first    |
+| Agent reads no camera                  | Cameras page: camera online, **Use for records** on, this agent picked, `ENABLE_LOCAL_DETECTION=true` |
 | Reconnect loop every 5-30 s            | Cloud backend or laptop internet down — agent will recover       |
 | High CPU                               | Lower `AGENT_FPS` / `FRAME_WIDTH` / `FRAME_HEIGHT` / `JPEG_QUALITY` |
 

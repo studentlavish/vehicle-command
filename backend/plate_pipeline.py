@@ -205,7 +205,7 @@ async def camera_settings(db, camera_id: str) -> Dict[str, Any]:
     if not doc:
         if cid and cid not in _warned_unknown_cameras:
             _warned_unknown_cameras.add(cid)
-            logger.warning("[camera %s] no role configured — treating as entry+exit (set it in Settings → Cameras)", cid)
+            logger.warning("[camera %s] no role configured — treating as entry+exit (set it on the Cameras page)", cid)
         return {"camera_id": cid, "role": "both", "enabled": True, "configured": False}
     return {"camera_id": cid, "role": doc.get("role", "both"), "enabled": doc.get("enabled", True), "configured": True}
 

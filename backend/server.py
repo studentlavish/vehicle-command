@@ -1783,6 +1783,34 @@ class CameraConnectIn(BaseModel):
     camera_id: str
     source: str  # int-as-string for USB, or http/rtsp URL
     label: Optional[str] = ""
+    # Optional setup in the same step (role is applied for admins only).
+    role: Optional[Literal["entry", "exit", "both"]] = None
+    gate: Optional[str] = None
+
+
+_URL_CREDS_RE = re.compile(r"(//[^:/@]+:)[^@/]+@")
+
+
+def _mask_source(source: Any) -> str:
+    """Hide the password in rtsp://user:pass@host URLs before showing them in the UI."""
+    return _URL_CREDS_RE.sub(r"\1***@", str(source or ""))
+
+
+def _source_type(source: str) -> str:
+    s = (source or "").strip().lower()
+    if s.startswith("agent:"):
+        return "agent"
+    if s.startswith("rtsp"):
+        return "rtsp"
+    if s.startswith("http"):
+        return "http"
+    if s.isdigit() or s.startswith("usb:"):
+        return "usb"
+    return "unknown" if s else "none"
+
+
+async def _camera_configs() -> Dict[str, dict]:
+    return {d["camera_id"]: d async for d in db.camera_config.find({}, {"_id": 0})}
 
 
 @api.get("/cameras")
@@ -1790,7 +1818,62 @@ async def list_cameras(user: dict = Depends(require_roles(*ROLE_ALL))):
     # Hide fully-removed / stopped cameras from the UI so the card disappears
     # when an admin disconnects an obsolete direct-URL camera.
     all_cams = camera_manager.list()
-    return {cid: st for cid, st in all_cams.items() if st.get("status") != "stopped"}
+    configs = await _camera_configs()
+    out = {}
+    for cid, st in all_cams.items():
+        if st.get("status") == "stopped":
+            continue
+        cfg = configs.get(cid) or {}
+        st = {**st, "source": _mask_source(st.get("source")),
+              "role": cfg.get("role", "both"), "enabled": cfg.get("enabled", True),
+              "configured": bool(cfg), "gate": cfg.get("gate", "")}
+        if cfg.get("name"):
+            st["label"] = cfg["name"]
+        out[cid] = st
+    return out
+
+
+@api.get("/cameras/overview")
+async def cameras_overview(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
+    """One row per camera — live status, config (role / name / gate / active) and
+    where its video comes from — for the central Cameras page."""
+    configs = await _camera_configs()
+    live = camera_manager.list()
+    agent_of: Dict[str, str] = {}
+    async for a in db.agents.find({}, {"agent_id": 1, "cameras": 1}):
+        for c in a.get("cameras", []) or []:
+            if c:
+                agent_of[c.strip().upper()] = a.get("agent_id", "")
+    rows = []
+    for cid in sorted(set(configs) | set(live) | set(agent_of)):
+        cfg = configs.get(cid) or {}
+        st = live.get(cid) or {}
+        live_source = st.get("source", "") if st.get("status") != "stopped" else ""
+        if live_source.startswith("agent:"):
+            source, agent_id = "", live_source.split(":", 1)[1]
+        else:
+            source, agent_id = live_source or cfg.get("source", ""), ""
+        agent_id = agent_id or agent_of.get(cid, "")
+        stype = "agent" if agent_id and not source else _source_type(source)
+        rows.append({
+            "camera_id": cid,
+            "name": cfg.get("name") or (st.get("label") if st.get("label") != cid else "") or "",
+            "role": cfg.get("role", "both"),
+            "gate": cfg.get("gate", ""),
+            "enabled": cfg.get("enabled", True),
+            "configured": bool(cfg.get("role")),
+            "use_for_records": bool(cfg.get("use_for_records")),
+            "record_agent_id": cfg.get("record_agent_id", ""),
+            "source_type": stype,
+            "source": _mask_source(source),
+            "agent_id": agent_id,
+            "status": st.get("status") if st and st.get("status") != "stopped" else "offline",
+            "error": st.get("error"),
+            "last_frame_at": st.get("last_frame_at"),
+            "frames_captured": st.get("frames_captured", 0),
+            "live": bool(st) and st.get("status") != "stopped",
+        })
+    return rows
 
 
 # ---------- Camera roles (entry / exit / both) ----------
@@ -1804,7 +1887,7 @@ class CameraConfigIn(BaseModel):
 @api.get("/camera-config")
 async def list_camera_config(user: dict = Depends(require_roles(*ROLE_ADMIN_MANAGER))):
     """Configured cameras plus any live/recent camera that has no role yet."""
-    configured = {d["camera_id"]: d async for d in db.camera_config.find({}, {"_id": 0})}
+    configured = {cid: d for cid, d in (await _camera_configs()).items() if d.get("role")}
     seen = set(camera_manager.list().keys())
     async for a in db.agents.find({}, {"cameras": 1}):
         seen.update(c.strip().upper() for c in a.get("cameras", []) if c)
@@ -1824,16 +1907,27 @@ async def put_camera_config(camera_id: str, payload: CameraConfigIn, user: dict 
     doc = {"camera_id": cid, **payload.model_dump(), "updated_at": now_utc().isoformat()}
     await db.camera_config.update_one({"camera_id": cid}, {"$set": doc}, upsert=True)
     await security.audit(db, user, "camera.config", cid, role=payload.role, enabled=payload.enabled)
+    # Keep the live tile's label in sync with the saved name.
+    state = camera_manager.get(cid)
+    if state and payload.name:
+        state.label = payload.name
     doc.pop("_id", None)
     return {**doc, "configured": True}
 
 
 @api.delete("/camera-config/{camera_id}")
 async def delete_camera_config(camera_id: str, user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
-    r = await db.camera_config.delete_one({"camera_id": camera_id.strip().upper()})
-    if r.deleted_count == 0:
+    """Forget a camera: delete its config and stop any direct-URL stream.
+    Agent-fed cameras reappear (without a role) if the agent keeps streaming them."""
+    cid = camera_id.strip().upper()
+    r = await db.camera_config.delete_one({"camera_id": cid})
+    removed = camera_manager.remove(cid)
+    # Agent-reported cameras (e.g. an offline agent camera with no role yet) are
+    # listed from db.agents.cameras, so forget them there too.
+    a = await db.agents.update_many({"cameras": cid}, {"$pull": {"cameras": cid}})
+    if r.deleted_count == 0 and not removed and a.modified_count == 0:
         raise HTTPException(status_code=404, detail="Camera not configured")
-    await security.audit(db, user, "camera.config_delete", camera_id.strip().upper())
+    await security.audit(db, user, "camera.config_delete", cid)
     return {"ok": True}
 
 
@@ -1850,9 +1944,24 @@ async def connect_camera(payload: CameraConnectIn, user: dict = Depends(require_
     # Refuse to overlay a direct-URL capture on top of an agent-fed camera.
     # The local agent is the authoritative source for its camera IDs — otherwise
     # the cloud would try to reach the phone's private LAN IP (e.g. 192.168.x.x).
+    cid = payload.camera_id.strip().upper()
+    if not cid:
+        raise HTTPException(status_code=400, detail="camera_id required")
     try:
-        info = camera_manager.connect(payload.camera_id, payload.source, payload.label or "")
-        return info
+        cfg = await db.camera_config.find_one({"camera_id": cid}, {"_id": 0}) or {}
+        label = (payload.label or "").strip() or cfg.get("name", "")
+        info = camera_manager.connect(cid, payload.source, label)
+        # Persist the source so the camera reconnects after a backend restart.
+        fields: Dict[str, Any] = {"camera_id": cid, "source": payload.source.strip(), "updated_at": now_utc().isoformat()}
+        if (payload.label or "").strip():
+            fields["name"] = payload.label.strip()
+        if payload.gate is not None:
+            fields["gate"] = payload.gate.strip()
+        if payload.role and user.get("role") == "admin":
+            fields["role"] = payload.role
+        await db.camera_config.update_one({"camera_id": cid}, {"$set": fields}, upsert=True)
+        await security.audit(db, user, "camera.connect", cid, source=_mask_source(payload.source))
+        return {**info, "source": _mask_source(info.get("source"))}
     except CameraSourceConflict as ce:
         raise HTTPException(status_code=409, detail=str(ce))
     except ValueError as ve:
@@ -1869,7 +1978,119 @@ async def delete_camera(camera_id: str, user: dict = Depends(require_roles(*ROLE
     ok = camera_manager.remove(camera_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Camera not found")
+    await _forget_camera_source(camera_id)
     return {"ok": True, "camera_id": camera_id.strip().upper()}
+
+
+async def _forget_camera_source(camera_id: str) -> None:
+    """Stop a disconnected direct-URL camera from coming back on restart (role/name are kept)."""
+    await db.camera_config.update_one({"camera_id": camera_id.strip().upper()}, {"$unset": {"source": ""}})
+
+
+async def restore_direct_cameras() -> int:
+    """Reconnect direct-URL cameras (RTSP / IP Webcam / USB) saved from the Cameras page."""
+    n = 0
+    async for d in db.camera_config.find({"source": {"$nin": [None, ""]}}, {"_id": 0}):
+        try:
+            camera_manager.connect(d["camera_id"], d["source"], d.get("name", ""))
+            n += 1
+        except Exception as e:
+            logger.warning("[CAMERA] restore failed camera_id=%s: %s", d.get("camera_id"), e)
+    if n:
+        logger.info("[CAMERA] restored %d direct-URL camera(s)", n)
+    return n
+
+
+# ---------- Portal cameras the local agent reads plates from ("Use for records") ----------
+# The backend keeps its own capture for the live view; the assigned agent opens the
+# same source separately for detection only. A camera is handed to its agent only
+# while it is online here, and taken back when it goes offline or the toggle is off.
+_agent_sockets: Dict[str, WebSocket] = {}
+_agent_assignments_sent: Dict[str, list] = {}
+ASSIGNMENT_CHECK_SECONDS = float(os.environ.get("ASSIGNMENT_CHECK_SECONDS", "5"))
+
+
+class CameraRecordsIn(BaseModel):
+    use_for_records: bool
+    agent_id: Optional[str] = None
+
+
+async def _assignments_for(agent_id: str) -> list:
+    out = []
+    query = {"use_for_records": True, "record_agent_id": agent_id, "source": {"$nin": [None, ""]}}
+    async for d in db.camera_config.find(query, {"_id": 0}).sort("camera_id", 1):
+        if d.get("enabled") is False:
+            continue
+        state = camera_manager.get(d["camera_id"])
+        if not state or state.status != "online" or _is_agent_fed_state(state):
+            continue
+        item = {"camera_id": d["camera_id"], "name": d.get("name") or d["camera_id"], "source": d["source"]}
+        if d.get("roi"):
+            item["roi"] = d["roi"]
+        out.append(item)
+    return out
+
+
+def _is_agent_fed_state(state) -> bool:
+    return isinstance(state.source, str) and state.source.startswith("agent:")
+
+
+async def _push_assignments(agent_id: str, force: bool = False) -> None:
+    """Send the agent its camera list if it changed (or always, with force)."""
+    ws = _agent_sockets.get(agent_id)
+    if ws is None:
+        return
+    cams = await _assignments_for(agent_id)
+    if not force and _agent_assignments_sent.get(agent_id) == cams:
+        return
+    try:
+        await ws.send_json({"type": "camera_assignments", "cameras": cams})
+        _agent_assignments_sent[agent_id] = cams
+        logger.info("[agent %s] camera assignments → %s", agent_id, [c["camera_id"] for c in cams] or "none")
+    except Exception as e:
+        logger.info("[agent %s] could not send camera assignments: %s", agent_id, e)
+
+
+async def _assignment_loop() -> None:
+    """Follow cameras going online/offline and config changes for every registered agent."""
+    while True:
+        await asyncio.sleep(ASSIGNMENT_CHECK_SECONDS)
+        for agent_id in list(_agent_assignments_sent):
+            try:
+                await _push_assignments(agent_id)
+            except Exception as e:
+                logger.warning("[agent %s] assignment check failed: %s", agent_id, e)
+
+
+@api.put("/camera-config/{camera_id}/records")
+async def set_camera_records(camera_id: str, payload: CameraRecordsIn,
+                             user: dict = Depends(require_roles(*ROLE_ADMIN_ONLY))):
+    """Turn "Use for records" on/off: an agent reads plates from this portal camera."""
+    cid = camera_id.strip().upper()
+    cfg = await db.camera_config.find_one({"camera_id": cid}, {"_id": 0}) or {}
+    fields: Dict[str, Any] = {"use_for_records": payload.use_for_records, "updated_at": now_utc().isoformat()}
+    previous_agent = cfg.get("record_agent_id") or ""
+    if payload.use_for_records:
+        if not cfg.get("source"):
+            raise HTTPException(status_code=400, detail="Only cameras added on this page (with a camera URL) can be used for records")
+        agent_id = (payload.agent_id or "").strip()
+        if agent_id:
+            if not await db.agents.find_one({"agent_id": agent_id}, {"_id": 1}):
+                raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
+        else:
+            online = [a["agent_id"] async for a in db.agents.find({"status": "online"}, {"agent_id": 1})]
+            if len(online) != 1:
+                raise HTTPException(status_code=400, detail="Choose which camera agent should use this camera"
+                                    if online else "No camera agent is online — start the agent first")
+            agent_id = online[0]
+        fields["record_agent_id"] = agent_id
+    await db.camera_config.update_one({"camera_id": cid}, {"$set": fields}, upsert=True)
+    await security.audit(db, user, "camera.records", cid, use_for_records=payload.use_for_records,
+                         agent_id=fields.get("record_agent_id", previous_agent))
+    for a in {previous_agent, fields.get("record_agent_id", "")} - {""}:
+        await _push_assignments(a)
+    return {"ok": True, "camera_id": cid, "use_for_records": payload.use_for_records,
+            "record_agent_id": fields.get("record_agent_id", previous_agent)}
 
 
 @api.post("/cameras/{camera_id}/disconnect")
@@ -1883,6 +2104,7 @@ async def disconnect_camera(camera_id: str, user: dict = Depends(require_roles(*
     """
     if not camera_manager.remove(camera_id):
         raise HTTPException(status_code=404, detail="Camera not found")
+    await _forget_camera_source(camera_id)
     logger.info("[CAMERA] disconnected + removed camera_id=%s by user=%s", camera_id.strip().upper(), user.get("email"))
     return {"ok": True, "camera_id": camera_id.strip().upper()}
 
@@ -1934,7 +2156,7 @@ async def _authorize_agent(agent_id: Optional[str], secret: Optional[str]) -> bo
         if agent_id not in _warned_shared_secret:
             _warned_shared_secret.add(agent_id)
             logger.warning("[agent %s] authenticated with the shared VASHU_AGENT_SECRET — give it its own secret "
-                           "(Settings → Camera agents → Rotate secret)", agent_id)
+                           "(Cameras → Camera agents → Rotate secret)", agent_id)
         return True
     return False
 
@@ -2080,6 +2302,7 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
 
     await websocket.send_json({"type": "hello", "ok": True})
     logger.info("[agent %s] connected", active_agent_id or "?")
+    _agent_sockets[active_agent_id] = websocket
 
     import base64 as _b64
     import struct as _struct
@@ -2145,6 +2368,7 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
                     "status": "online", "connected_at": now_utc().isoformat(), "last_heartbeat": now_utc().isoformat(),
                 }})
                 await websocket.send_json({"type": "registered", "agent_id": active_agent_id})
+                await _push_assignments(active_agent_id, force=True)
 
             elif mtype == "camera_status":
                 cam_id_raw = msg.get("camera_id")
@@ -2256,6 +2480,9 @@ async def ws_agent(websocket: WebSocket, agent_id: Optional[str] = Query(default
     except Exception as e:
         logger.info("[agent %s] ws error: %s", active_agent_id or "?", e)
     finally:
+        if _agent_sockets.get(active_agent_id) is websocket:
+            _agent_sockets.pop(active_agent_id, None)
+            _agent_assignments_sent.pop(active_agent_id, None)
         if active_agent_id:
             await db.agents.update_one({"agent_id": active_agent_id}, {"$set": {"status": "offline"}})
         for cam_id in cameras_registered:
@@ -2726,6 +2953,8 @@ async def startup():
     await seed_admin()
     await seed_google_admin()
     await seed_bootstrap_agent()
+    await restore_direct_cameras()
+    app.state.assignments = asyncio.create_task(_assignment_loop())
     # Daily jobs (digest, backup, retention) — see scheduler.py.
     if SCHEDULER_ENABLED:
         app.state.scheduler = asyncio.create_task(scheduler.run_forever(db, _scheduled_jobs()))

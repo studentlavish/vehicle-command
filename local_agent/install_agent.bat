@@ -32,8 +32,9 @@ if not exist "logs" mkdir logs
 echo.
 echo === Installation complete ===
 echo Next steps:
-echo   1. Edit .env  (set VASHU_AGENT_SECRET and CAMERA_SOURCE)
+echo   1. Edit .env  (set VASHU_AGENT_SECRET)
 echo   2. Run start_agent.bat
+echo   3. Portal: Cameras - add cameras, switch on "Use for records" for this agent
 exit /b 0
 
 :err

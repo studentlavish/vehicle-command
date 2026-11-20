@@ -40,6 +40,8 @@ class CloudConnection:
         # for server replies such as plate_ack / plate_nack.
         self.on_connect: Optional[Callable[[], None]] = None
         self.on_message: Optional[Callable[[Dict[str, Any]], None]] = None
+        # on_assignments(cameras) — the portal cameras this agent should read plates from.
+        self.on_assignments: Optional[Callable[[list], None]] = None
 
     @property
     def connected(self) -> bool:
@@ -90,6 +92,9 @@ class CloudConnection:
                         log.info("[AGENT] registered agent_id=%s", msg.get("agent_id"))
                     elif mtype == "pong":
                         log.debug("[PONG] app-level")
+                    elif mtype == "camera_assignments":
+                        if self.on_assignments:
+                            self.on_assignments(msg.get("cameras") or [])
                     elif mtype in ("plate_ack", "plate_nack") and self.on_message:
                         self.on_message(msg)
             finally:

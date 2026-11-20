@@ -7,8 +7,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import PageHeader from "@/components/common/PageHeader";
 import SectionCard from "@/components/common/SectionCard";
-import AgentManager from "@/components/AgentManager";
-import CameraRoles from "@/components/CameraRoles";
+import { Link } from "react-router-dom";
 import KnownPlates from "@/components/KnownPlates";
 import { ErrorState } from "@/components/common/EmptyState";
 import {
@@ -54,7 +53,7 @@ export default function SettingsPage() {
     <PageHeader
       icon={SettingsIcon}
       title="Settings"
-      description="Company details, cameras, integrations and data policies."
+      description="Company details, integrations and data policies."
       actions={data && (
         <>
           {dirty && (
@@ -93,10 +92,10 @@ export default function SettingsPage() {
         </div>
       </SectionCard>
 
-      <SectionCard icon={Camera} title="Camera" description="Default camera stream">
-        <div className="grid gap-4 md:grid-cols-2">
-          <TextField label="RTSP / HTTP camera URL" value={data.camera_url} onChange={(v) => update("camera_url", v)} test="setting-camera-url" placeholder="rtsp://user:pass@192.168.1.10:554/..." mono />
-          <ToggleField label="Camera enabled" description="Capture frames from this URL" checked={!!data.camera_enabled} onChange={(v) => update("camera_enabled", v)} test="setting-camera-enabled" />
+      <SectionCard icon={Camera} title="Cameras & agents" description="Moved to their own page">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-muted-foreground">Add cameras, set entry / exit roles and manage camera agents on the Cameras page.</p>
+          <Button variant="outline" asChild><Link to="/cameras"><Camera className="h-4 w-4" /> Open Cameras</Link></Button>
         </div>
       </SectionCard>
 
@@ -119,11 +118,7 @@ export default function SettingsPage() {
         <WhatsAppTester dirty={dirty} />
       </SectionCard>
 
-      <CameraRoles />
-
       <KnownPlates />
-
-      <AgentManager />
 
       <SectionCard icon={HardDrive} title="Backup">
         <ToggleField label="Automatic daily backup" description="Database snapshot every night" checked={!!data.backup_enabled} onChange={(v) => update("backup_enabled", v)} test="setting-backup-enabled" />

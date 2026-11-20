@@ -23,9 +23,7 @@ services:
       VASHU_AGENT_WS_URL: ws://backend:8001/api/agent/ws
       VASHU_AGENT_ID: docker-agent-01
       VASHU_AGENT_SECRET: ${AGENT_SECRET}
-      CAMERA_ID: ${CAMERA_ID:-GATE-01}
-      CAMERA_NAME: ${CAMERA_NAME:-Front Gate}
-      CAMERA_SOURCE: ${CAMERA_SOURCE:?set CAMERA_SOURCE in deploy/.env}
+      # Cameras come from the dashboard (Cameras → "Use for records" → docker-agent-01).
     volumes:
       - agent-data:/data
     depends_on:

@@ -42,7 +42,7 @@ keep it `true` (the default) in production behind HTTPS.
 
 ### Camera agents
 
-Each showroom PC is registered in **Settings → Camera agents**, which shows its
+Each showroom PC is registered in **Cameras → Camera agents**, which shows its
 secret once. Put it in that PC's `local_agent/.env` as `VASHU_AGENT_SECRET`
 (with the same `VASHU_AGENT_ID`). Unregistered agent IDs are refused. Agents
 registered before this existed keep using the shared `VASHU_AGENT_SECRET` until
@@ -67,15 +67,15 @@ cd backend
 |------|---------|
 | `backend/.env` | Mongo URL, DB name, JWT secret (randomly generated), admin creds, CORS, agent secret, optional integration keys |
 | `frontend/.env` | `REACT_APP_BACKEND_URL=http://localhost:8001` |
-| `local_agent/.env` | Agent → `ws://localhost:8001/api/agent/ws`, camera source (`0` = webcam), same `VASHU_AGENT_SECRET` as backend |
+| `local_agent/.env` | Agent → `ws://localhost:8001/api/agent/ws`, same `VASHU_AGENT_SECRET` as backend |
 
 `setup.sh` builds each `.env` from its `.env.example` with fresh random secrets, and never overwrites an existing `.env`.
 
 ## 5. Camera agent
 
-- Webcam: `CAMERA_SOURCE=0` (macOS will ask for camera permission for Terminal the first time).
-- Phone (IP Webcam app): `CAMERA_SOURCE=http://<phone-ip>:8080/video`
-- RTSP: `CAMERA_SOURCE=rtsp://user:pass@192.168.1.10:554/...`
+- Cameras are added in the dashboard, not in `.env`: **Cameras → Add camera** with
+  `http://<phone-ip>:8080/video` (IP Webcam app), `rtsp://user:pass@192.168.1.10:554/...` or `0` (webcam),
+  then switch on **Use for records** for the agent. The agent uses a camera only while it shows online.
 - Self-test: `local_agent/start_agent.sh --test`
 - On-device number-plate detection (large download, ~2 GB with PyTorch):
   `local_agent/.venv/bin/pip install -r local_agent/requirements-detection.txt` then set `ENABLE_LOCAL_DETECTION=true`.
@@ -129,7 +129,7 @@ cd backend && .venv/bin/pytest tests -q
 
 ## Camera roles (entry / exit)
 
-In **Settings → Cameras** set each camera to **Entry**, **Exit** or **Entry + exit**:
+On the **Cameras** page set each camera to **Entry**, **Exit** or **Entry + exit**:
 
 - An **entry** camera only opens visits. If the car still has an open visit
   (its exit was never seen), that visit is marked *Exit not seen*.

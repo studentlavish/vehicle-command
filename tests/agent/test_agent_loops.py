@@ -133,3 +133,61 @@ def test_region_of_interest(tmp_path):
     asyncio.run(go())
     assert det.frames[0][1].shape == (240, 640, 3)  # only the lane was searched
     delivery.outbox.close()
+
+
+# ---------- Cameras assigned from the portal ----------
+class FakeCapture:
+    opened = []
+
+    def __init__(self, source, **kw):
+        self.source = source
+        FakeCapture.opened.append(source)
+
+    def grab_frame(self):
+        return np.zeros((48, 64, 3), dtype=np.uint8)
+
+    def release(self):
+        FakeCapture.opened.remove(self.source)
+
+
+def _cfg():
+    from config import AgentConfig
+    return AgentConfig(ws_url="ws://x", agent_id="pc", agent_secret="s", enable_local_detection=True, detection_fps=5)
+
+
+def test_supervisor_follows_portal_assignments(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent, "CameraCapture", FakeCapture)
+    FakeCapture.opened = []
+    frames, health, stop = FrameBuffer(), {}, asyncio.Event()
+    sup = agent.CameraSupervisor(_cfg(), frames, FakeDetector(), Delivery(Outbox(tmp_path / "o.db")), health, stop)
+
+    async def go():
+        run = asyncio.create_task(sup.run_until_stopped())
+        sup.apply([{"camera_id": "cam-a", "name": "Gate in", "source": "http://a"},
+                   {"camera_id": "CAM-B", "source": "http://b"}])
+        await asyncio.sleep(0.3)
+        assert sup.camera_ids == ["CAM-A", "CAM-B"]          # ids normalised
+        assert sorted(FakeCapture.opened) == ["http://a", "http://b"]
+        assert frames.get("CAM-A") is not None
+
+        sup.apply([{"camera_id": "CAM-A", "source": "http://a2"}])  # B removed, A's URL changed
+        await asyncio.sleep(0.3)
+        assert sup.camera_ids == ["CAM-A"]
+        assert FakeCapture.opened == ["http://a2"]
+        assert sup._running["CAM-A"][0].source == "http://a2"
+
+        sup.apply([])                                        # camera offline / toggle off
+        await asyncio.sleep(0.3)
+        assert sup.camera_ids == [] and FakeCapture.opened == [] and frames.get("CAM-A") is None
+        stop.set()
+        await run
+
+    asyncio.run(go())
+
+
+def test_bad_assignment_is_skipped(tmp_path):
+    sup = agent.CameraSupervisor(_cfg(), FrameBuffer(), FakeDetector(), Delivery(Outbox(tmp_path / "o.db")), {},
+                                 asyncio.Event())
+    sup._start = lambda spec: sup._running.__setitem__(spec.id, (spec, asyncio.Event(), []))
+    sup.apply([{"name": "no id"}, {"camera_id": "OK", "source": "0", "roi": "bad"}])
+    assert sup.camera_ids == ["OK"] and sup._running["OK"][0].roi is None

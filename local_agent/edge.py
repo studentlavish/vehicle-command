@@ -50,6 +50,11 @@ class FrameBuffer:
         with self._lock:
             return self._latest.get(camera_id)
 
+    def drop(self, camera_id: str) -> None:
+        with self._lock:
+            self._latest.pop(camera_id, None)
+            self._times.pop(camera_id, None)
+
     def fps(self, camera_id: str, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
         with self._lock:

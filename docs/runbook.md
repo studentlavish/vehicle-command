@@ -34,16 +34,16 @@ Showroom PC (Administrator prompt): `nssm restart VashuCameraAgent`.
 
 1. Mount and aim the new camera as in docs/hardware.md, with the same position
    and zoom.
-2. Put its RTSP URL in `local_agent\.env` (`AGENT_CAMERAS_JSON`), **keeping the
-   same `id`** so its role (entry/exit) stays.
-3. `nssm restart VashuCameraAgent` and check Live Monitoring.
+2. Cameras page → pencil (Change source) on the old camera's row → new RTSP URL.
+   Keeping the same camera ID keeps its role (entry/exit) and **Use for records**.
+3. Check Live Monitoring; the agent picks up the new URL within a few seconds.
 4. Drive one car in and out to confirm.
 
 ## Replace the showroom PC
 
 1. Install the agent (`install_agent.bat`, `install_ocr.sh` or the Windows
    steps in `local_agent/README.md`).
-2. Copy `.env` from the old PC, or register a new agent in **Settings → Camera
+2. Copy `.env` from the old PC, or register a new agent in **Cameras → Camera
    agents** and use its secret.
 3. `install_service.bat`. If the old PC still has `data\outbox.sqlite3` with
    pending detections, copy it over first.
@@ -69,7 +69,7 @@ Showroom PC (Administrator prompt): `nssm restart VashuCameraAgent`.
 | Secret | How |
 |---|---|
 | Admin passwords | User menu → Change password; Users page → Reset password for others |
-| Agent secret | Settings → Camera agents → Rotate secret, put it in the PC's `.env`, restart the service |
+| Agent secret | Cameras → Camera agents → Rotate secret, put it in the PC's `.env`, restart the service |
 | `JWT_SECRET` | New value in `backend.env`, `docker compose up -d backend`. Everyone signs in again |
 | MongoDB password | Change it in mongo (`db.changeUserPassword`), then in `deploy/.env`, then `docker compose up -d` |
 | Bucket / email / Google / WhatsApp keys | Rotate at the provider, update `backend.env`, `docker compose up -d backend` |

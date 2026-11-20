@@ -12,6 +12,7 @@ import ExitHistory from "@/pages/ExitHistory";
 import Reports from "@/pages/Reports";
 import Analytics from "@/pages/Analytics";
 import SettingsPage from "@/pages/Settings";
+import CamerasPage from "@/pages/Cameras";
 import UsersPage from "@/pages/Users";
 import VehicleDetail from "@/pages/VehicleDetail";
 import SearchResults from "@/pages/SearchResults";
@@ -40,7 +41,8 @@ function AppRouter() {
       <Route path="/exit-history" element={<Guarded><ExitHistory /></Guarded>} />
       <Route path="/reports" element={<Guarded><Reports /></Guarded>} />
       <Route path="/analytics" element={<Guarded><Analytics /></Guarded>} />
-      <Route path="/settings" element={<Guarded><SettingsPage /></Guarded>} />
+      <Route path="/cameras" element={<Guarded><CamerasPage /></Guarded>} />
+      <Route path="/settings"element={<Guarded><SettingsPage /></Guarded>} />
       <Route path="/users" element={<Guarded><UsersPage /></Guarded>} />
       <Route path="/search" element={<Guarded><SearchResults /></Guarded>} />
       <Route path="/vehicle/:vehicleNumber" element={<Guarded><VehicleDetail /></Guarded>} />

@@ -12,7 +12,7 @@ import {
 import {
   LayoutDashboard, Radio, Car, LogIn as LogInIcon, LogOut, BarChart3, FileBarChart,
   Settings as SettingsIcon, Users as UsersIcon, Search, Bell, Menu, ChevronDown,
-  ShieldCheck, CarFront, CheckCheck, ScanEye, KeyRound,
+  ShieldCheck, CarFront, CheckCheck, ScanEye, KeyRound, Video,
 } from "lucide-react";
 import ChangePasswordDialog from "@/components/ChangePasswordDialog";
 import AlertsBanner from "@/components/AlertsBanner";
@@ -54,6 +54,7 @@ const NAV_GROUPS = [
   {
     label: "Administration",
     items: [
+      { to: "/cameras", icon: Video, label: "Cameras", roles: MGMT },
       { to: "/users", icon: UsersIcon, label: "Users", roles: MGMT },
       { to: "/settings", icon: SettingsIcon, label: "Settings", roles: ["admin"] },
     ],

@@ -75,7 +75,7 @@ visit, which can take up to a minute.
 
 ## 5. Connect the showroom PC
 
-1. In the dashboard, go to **Settings → Camera agents → Register agent** (for
+1. In the dashboard, go to **Cameras → Camera agents → Register agent** (for
    example `showroom-pc-01`) and copy the secret it shows.
 2. On the PC, put these in `local_agent/.env`:
    ```
@@ -85,7 +85,7 @@ visit, which can take up to a minute.
    ```
 3. Run `start_agent.bat --test` (every check should pass). Then install the
    service with `install_service.bat` (see `local_agent/README.md`).
-4. In **Settings → Cameras**, set each camera to **Entry** or **Exit**.
+4. On the **Cameras** page, set each camera to **Entry** or **Exit**.
 
 ## 6. Moving from the Emergent deployment
 
@@ -115,7 +115,7 @@ visit, which can take up to a minute.
 - [ ] Live Monitoring shows the showroom cameras.
 - [ ] A test car driven through the entry lane appears as **Entry** with a
       snapshot, and through the exit lane as **Exit** on the same visit.
-- [ ] **Settings → Camera agents** shows the PC online with outbox depth 0.
+- [ ] **Cameras → Camera agents** shows the PC online with outbox depth 0.
 - [ ] The next morning: the digest email arrived and the backups list shows
       last night's backup.
 
