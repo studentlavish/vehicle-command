@@ -18,7 +18,6 @@ import CommandPalette from "@/components/CommandPalette";
 import ThemeToggle from "@/components/ThemeToggle";
 import { navForRole } from "@/lib/nav";
 import { useT } from "@/lib/i18n";
-import AlertsBanner from "@/components/AlertsBanner";
 import Logo from "@/components/common/Logo";
 import StatusBadge from "@/components/common/StatusBadge";
 import useLiveEvents from "@/hooks/useLiveEvents";
@@ -309,14 +308,12 @@ export default function Layout({ children }) {
 
         <main className="flex-1 px-4 py-6 md:px-6 lg:px-8 lg:py-8">
           <div key={location.pathname} className="mx-auto w-full max-w-[1440px] animate-fade-in">
-            {(user?.role === "admin" || user?.role === "manager") &&
-              ["/live", "/cameras"].includes(location.pathname) && <AlertsBanner />}
             {children}
           </div>
         </main>
 
         <footer className="border-t px-4 py-4 text-center text-xs text-muted-foreground md:px-8">
-          © {new Date().getFullYear()} Vashu Hyundai · Vehicle Management System
+          © {new Date().getFullYear()} Vasu Hyundai · Vehicle Management System
         </footer>
       </div>
     </div>

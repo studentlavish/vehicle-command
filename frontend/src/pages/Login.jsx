@@ -76,7 +76,7 @@ export default function Login() {
             <ScanLine className="h-5 w-5" />
           </div>
           <div className="leading-tight">
-            <div className="font-semibold">Vashu Hyundai</div>
+            <div className="font-semibold">Vasu Hyundai</div>
             <div className="text-xs text-white/70">Vehicle Management System</div>
           </div>
         </div>

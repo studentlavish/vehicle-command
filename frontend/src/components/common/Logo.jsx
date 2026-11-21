@@ -12,7 +12,7 @@ export default function Logo({ size = "md", showText = true, className }) {
       </div>
       {showText && (
         <div className="leading-tight">
-          <div className={cn("font-semibold text-foreground", size === "lg" ? "text-base" : "text-sm")}>Vashu Hyundai</div>
+          <div className={cn("font-semibold text-foreground", size === "lg" ? "text-base" : "text-sm")}>Vasu Hyundai</div>
           <div className="text-[11px] text-muted-foreground">Vehicle Management</div>
         </div>
       )}

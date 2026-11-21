@@ -43,7 +43,7 @@ export default function Reports() {
     setBusy(`${period}-${fmt}`);
     try {
       const res = await api.get("/reports/export", { params: { period, format: fmt }, responseType: "blob" });
-      downloadBlob(res, `vashu_${period}_report_${toISODate(new Date())}.${fmt}`);
+      downloadBlob(res, `vasu_${period}_report_${toISODate(new Date())}.${fmt}`);
       toast.success("Report downloaded", { description: `${period[0].toUpperCase() + period.slice(1)} report · ${fmt.toUpperCase()}` });
     } catch (e) {
       toast.error("Export failed", { description: errorMessage(e) });

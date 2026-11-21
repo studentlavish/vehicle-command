@@ -1,4 +1,4 @@
-/* Vashu Gate service worker — makes the dashboard installable and lets the app
+/* Vasu Gate service worker — makes the dashboard installable and lets the app
  * shell open instantly on the gate tablet. It never caches API calls, live
  * events or snapshots: visit data always comes fresh from the server. */
 const VERSION = "vc-shell-v1";

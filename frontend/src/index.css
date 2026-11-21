@@ -5,7 +5,7 @@
 @tailwind utilities;
 
 /* =====================================================================
-   Vashu Hyundai — central design tokens (light theme)
+   Vasu Hyundai — central design tokens (light theme)
    Every colour in the app comes from here. Change a value once and it
    updates buttons, cards, tables, charts and badges everywhere.
    Values are HSL triplets so Tailwind can apply opacity: bg-primary/10
